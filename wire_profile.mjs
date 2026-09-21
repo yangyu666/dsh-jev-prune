@@ -11,7 +11,7 @@
  * 代价：偏离官方支持路径（`dsh plugin add`），所以升级 DSH 后要重新跑一次。
  *
  * 用法：
- *   node wire_profile.mjs <DSH_HOME> [profile名] [--plugin <插件目录>]
+ *   node wire_profile.mjs <DSH_HOME> <profile名> [--plugin <插件目录>]
  *   --plugin 省略时默认为**本脚本所在目录**（即插件仓库根）。
  * 例：
  *   node wire_profile.mjs ../../_dshhome jevtest
@@ -19,6 +19,7 @@
  */
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -51,9 +52,18 @@ for (let i = 0; i < args.length; i += 1) {
 const pluginSrc = resolve(pluginDir ?? here)
 const packageName = JSON.parse(readFileSync(join(pluginSrc, 'package.json'), 'utf8')).name
 
-if (!dshHome) {
-  console.error('用法: node wire_profile.mjs <DSH_HOME> [profile名] [--plugin <插件目录>]')
+// issue #12：profile 名此前在用法行写"可选"，实际 join() 会拿到 undefined 抛原始 TypeError——
+// 要么给默认要么明确必填，这里选择明确必填 + 友好报错
+if (!dshHome || !profileName) {
+  console.error('用法: node wire_profile.mjs <DSH_HOME> <profile名> [--plugin <插件目录>]')
+  if (!dshHome) console.error('  缺少 <DSH_HOME>（DSH 的主目录，含 profiles/ 的那个）')
+  if (!profileName) console.error('  缺少 <profile名>（dsh --profile <名字> 用的那个名字，必填）')
   process.exit(2)
+}
+
+// issue #12：Node 的 path.resolve 不展开 ~，示例却写着 ~/.dsh —— 先展开
+if (dshHome === '~' || dshHome.startsWith('~/') || dshHome.startsWith('~\\')) {
+  dshHome = join(homedir(), dshHome.slice(1).replace(/^[\\/]/, ''))
 }
 
 const profileDir = join(resolve(dshHome), 'profiles', profileName)
@@ -83,7 +93,8 @@ if (missing.length > 0) {
   process.exit(1)
 }
 // 顺带守住另一类漂移：代码里的相对 import 必须都能落到实际文件上
-const srcFiles = files.filter((f) => f.endsWith('.js'))
+// （issue #13：此前只扫 .js，4 个 .mjs 的相对 import 全部漏检）
+const srcFiles = files.filter((f) => f.endsWith('.js') || f.endsWith('.mjs'))
 const brokenImports = []
 for (const f of srcFiles) {
   const text = readFileSync(join(pluginSrc, f), 'utf8')
@@ -154,6 +165,4 @@ console.log(`\n--- ${patchPath} ---\n${next}`)
 console.log('下一步：')
 console.log(`  1. 确认进了配置树：`)
 console.log(`     DSH_HOME=${resolve(dshHome)} dsh --profile ${profileName} --dump-config | grep -A1 jev-prune`)
-console.log(`  2. 校验模块可加载（在该 profile 目录下跑）：`)
-console.log(`     cd ${profileDir} && node verify_load.mjs`)
-console.log(`  3. 真实跑一次会话，用 jev_probe_shapes 工具校正事件字段名`)
+console.log(`  2. 真实跑一次会话，用 jev_probe_shapes 工具校正事件字段名`)

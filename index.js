@@ -185,7 +185,8 @@ export const Config = z.object({
   /**
    * 门控模式：relative（默认）| absolute。
    * **Jev 必须用 relative** —— 实测它的两轴概率都落在 0.05~0.37 的窄带里，
-   * 固定阈值 0.5 会把全部候选判成"可丢"（见 probe_effect.js 与 README）。
+   * 固定阈值 0.5 会把全部候选判成"可丢"（开发期实测，数据未随仓库提交；
+   * 结论见 README 的设计说明。issue #13：此前出处写作 probe_effect.js，该文件不存在）。
    * absolute 只留给换判断后端（例如本地分类器）时用。
    */
   compactMode: z.string().default('relative'),
@@ -196,14 +197,16 @@ export const Config = z.object({
   /** absolute 模式用的阈值 */
   compactThreshold: z.number().default(0.5),
   /**
-   * 允许整对移出的工具（白名单）。**默认空 = 不设白名单，只用黑名单。**
+   * 允许整对移出的工具（白名单）。**默认 = `DSH_READONLY_TOOLS`（只读工具集），即默认就带白名单。**
    *
-   * 为什么默认不用白名单（实测教训）：我最初把 `Read`/`Grep`/`Bash` 这套 PascalCase 名字当默认白名单，
+   * 为什么默认是"只读白名单"而不是空：白名单失效的后果是"功能静默死亡"（加载成功、
+   * 接管成功、判定在跑，只是什么都不做），所以宁可让它默认就窄；黑名单只用来额外
+   * 保护改写型调用。实测教训：最初把 Claude Code 风格的 PascalCase 名字当默认白名单，
    * 而真实 DSH 的工具名是 **`pwsh` / `read` / `glob`**（全小写、shell 叫 pwsh）——
-   * **命中 0/11，第二层静默地永不触发**（加载成功、接管成功、判定在跑，只是什么都没做）。
-   * 白名单失效的后果是"功能静默死亡"，黑名单失效的后果只是"少保护"（还有副作用轴/证据守卫/最近区兜着）。
-   * 想收紧就配上 `DSH_READONLY_TOOLS`（已从会话日志取证的真实名字）或你自己的名字。
+   * **命中 0/11，第二层静默地永不触发**。
    * 比较时做归一化（小写 + 去掉 `_`/`-`），所以 `MultiEdit` 与 `multi_edit` 等价。
+   * 想放宽就配成 `[]`（只受 neverCompactTools 约束）——那是显式 opt-in 的不安全模式，
+   * shell 调用也会被整对移出。
    */
   compactTools: z.array(z.string()).default(DEFAULT_COMPACT_TOOLS),
   /** 永不整对移出的工具（改写型调用是承重信息） */
@@ -268,6 +271,16 @@ export function resolveConfig(config = {}) {
     dryRun: config.dryRun ?? false,
     wording: config.wording ?? 'goal',
     minHistoryLines: config.minHistoryLines ?? 8,
+    // issue #4：这 6 个键此前只在 Config schema 里有 default，resolveConfig 漏了——
+    // config 未经 schemastery 归一化时（冒烟测试的 PLUGIN_CFG、被 patch 直接注入的对象），
+    // abridge 拿到 undefined → head+tail+40 是 NaN → 同一段文本输出两遍、state 带 "NaN"。
+    // 维护约定：Config schema 的每个 default 都必须在这里有对应兜底。
+    textHead: config.textHead ?? 400,
+    textTail: config.textTail ?? 150,
+    inputChars: config.inputChars ?? 300,
+    maxStateTokens: config.maxStateTokens ?? 25000,
+    maxRequestTokens: config.maxRequestTokens ?? 30000,
+    judgeTimeoutMs: config.judgeTimeoutMs ?? 60000,
     heartbeatFile: config.heartbeatFile ?? '',
     logLevel: config.logLevel ?? 'info',
   }
@@ -309,7 +322,10 @@ export function apply(ctx, config, deps = {}) {
     prunedByJev: 0,
     prunedByVolume: 0,
     savedChars: 0,
+    // keep 的三个来源分开计数（issue #8）：keptByJev 此前混入了最近区/黑名单保护
     keptByJev: 0,
+    keptByTail: 0,
+    keptByBlacklist: 0,
     skipped: 0,
     errors: 0,
     lastNote: '',
@@ -425,7 +441,7 @@ export function apply(ctx, config, deps = {}) {
     }
   }
 
-  async function judgePass(agent) {
+  async function judgePass(agent, signal) {
     const session = agent?.session
     if (session?.surface?.nodes == null || judge.ready === false) return
 
@@ -485,7 +501,7 @@ export function apply(ctx, config, deps = {}) {
 
     const startRequests = judge.requests
     for (const batch of batches) {
-      const answers = await judge.ask(state, batch)
+      const answers = await judge.ask(state, batch, { signal })
       for (const candidate of fresh) {
         const prob = answers[`result_s${candidate.seq}`]
         const effectProb = answers[`effect_s${candidate.seq}`]
@@ -861,7 +877,8 @@ export function apply(ctx, config, deps = {}) {
       return next()
     }
     try {
-      await judgePass(agent)
+      // signal 透传（issue #9）：中断后判定请求要能被取消，而不是继续占连接/计费
+      await judgePass(agent, signal)
     } catch (error) {
       stats.errors += 1
       stats.lastNote = `判定失败：${error?.message ?? String(error)}`
@@ -898,7 +915,9 @@ export function apply(ctx, config, deps = {}) {
           ? '  ⚠️ 版本系列不匹配——事件字段可能已变，请先跑一次 jev_probe_shapes 核对'
           : ''),
       `第一层 阈值 keep≥${cfg.keepThreshold}   preserveRecent=${cfg.preserveRecent}   minChars=${cfg.minCharsToPrune}`,
-      `第一层：判定 ${stats.judged} 次 / 请求 ${stats.requests} 次   Jev 保留 ${stats.keptByJev} / Jev 裁掉 ${stats.prunedByJev} / 按体积兜底裁 ${stats.prunedByVolume}`,
+      `第一层：判定 ${stats.judged} 次 / 请求 ${stats.requests} 次   `
+        + `Jev 保留 ${stats.keptByJev} / Jev 裁掉 ${stats.prunedByJev} / 按体积兜底裁 ${stats.prunedByVolume}`
+        + `（最近区保护 ${stats.keptByTail} / 黑名单保护 ${stats.keptByBlacklist} 不计入 Jev）`,
       `第一层：累计省下 ${stats.savedChars} 字符   压力门控跳过 ${stats.skipped} 次   错误 ${stats.errors} 次`,
       `第二层：summarize=${summaryHook.installed ? '已接管' : `未接管(${summaryHook.reason || '未尝试'})`}   `
         + `compactOn=${cfg.compactOn}   ${cfg.compactMode}${cfg.compactMode === 'relative' ? `(quantile=${cfg.compactQuantile})` : `(<${cfg.compactThreshold})`}`,
@@ -1007,7 +1026,10 @@ export function apply(ctx, config, deps = {}) {
         const pruner = ctx.get('toolResultPruner') ?? ctx.toolResultPruner
         if (pruner == null) return 'ctx.toolResultPruner 不可用'
         const cache = decisions.get(session) ?? new Map()
-        const judgedSeqs = [...cache.entries()].map(([seq, v]) => `s${seq}:${v.keep ? '保留' : '裁'}(${v.prob.toFixed(2)})`)
+        // prob 可能是 null（Jev 只回了两轴之一，judgePass 容忍这种情况）——
+        // 此前直接 .toFixed() 抛 TypeError，而裁剪其实已经执行完了（issue #3）
+        const judgedSeqs = [...cache.entries()].map(([seq, v]) =>
+          `s${seq}:${v.keep ? '保留' : '裁'}(${typeof v.prob === 'number' ? v.prob.toFixed(2) : 'n/a'})`)
         let out
         try {
           out = pruner.pruneSession(session)

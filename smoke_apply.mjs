@@ -236,6 +236,12 @@ try {
   ok('import dsh-jev-prune')
 } catch (error) {
   bad('import dsh-jev-prune', error?.message ?? String(error))
+  // issue #18：README 的冒烟配方在干净目录里必失败（缺 peer 依赖）——报错要说清缺什么、怎么装
+  if (/Cannot find package/.test(error?.message ?? '')) {
+    console.error('\n提示：缺少 peer 依赖。在本目录执行：')
+    console.error('  npm install @deepseek-ai/schemastery @deepseek-ai/dsh-tools')
+    console.error('（或直接用 npm pack 产出的 tarball 安装本包）\n')
+  }
   for (const r of results) console.log(`${r.ok ? '  ✅' : '  ❌'} ${r.name}${r.detail ? `  — ${r.detail}` : ''}`)
   process.exit(1)
 }

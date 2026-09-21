@@ -62,11 +62,14 @@ export class JevClient {
    * 一次请求问完一批 noul 问题。
    * @param {string} state 会话状态文本
    * @param {Record<string,string>} questions 问题 id → 待判定陈述
+   * @param {{signal?:AbortSignal}} [options] 外部中断信号（issue #9：此前判定请求
+   *   不接收 agent 的 signal，宿主/用户中断后请求继续占连接、可能继续计费）
    * @returns {Promise<Record<string, number>>} 问题 id → P(陈述成立)
    */
-  async ask(state, questions) {
+  async ask(state, questions, options = {}) {
     const ids = Object.keys(questions)
     if (!this.ready || ids.length === 0) return {}
+    if (options.signal?.aborted) throw new JevError('判定已被中断（signal 已 abort）')
     const payload = {
       model: this.model,
       state,
@@ -74,6 +77,8 @@ export class JevClient {
     }
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), this.timeoutMs)
+    const onAbort = () => controller.abort()
+    options.signal?.addEventListener('abort', onAbort, { once: true })
     let body
     try {
       const response = await this.fetchImpl(this.baseUrl, {
@@ -90,6 +95,7 @@ export class JevClient {
       body = JSON.parse(text)
     } finally {
       clearTimeout(timer)
+      options.signal?.removeEventListener('abort', onAbort)
     }
     this.requests += 1
     const usage = body?.usage ?? {}

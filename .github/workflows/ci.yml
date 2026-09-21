@@ -7,6 +7,8 @@ on:
 
 jobs:
   # 快速冒烟：只装两个静态 peer 依赖（几秒），跑全部纯函数自检 + 假 ctx 冒烟测试
+  # 用 npm ci + 提交的 lockfile 精确复现测试条件（issue #19：peer "*" + 浮动安装
+  # 曾解析到 0.0.1-rc.1，"针对 0.1.5-rc.2 测试"无法复现）
   unit:
     runs-on: ubuntu-latest
     steps:
@@ -14,8 +16,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Install peer dependencies
-        run: npm install --no-audit --no-fund
+      - name: Install dependencies (locked)
+        run: npm ci --no-audit --no-fund
+      - name: Assert peer versions match testedAgainst
+        run: |
+          echo "dsh-tools = $(node -p "require('@deepseek-ai/dsh-tools/package.json').version")"
+          node -e "const v = require('@deepseek-ai/dsh-tools/package.json').version; if (!/^0\.1\.5-rc/.test(v)) { console.error('dsh-tools 应在 0.1.5-rc 线，实际 ' + v); process.exit(1) }"
       - name: Make plugin resolvable as its package name
         run: |
           mkdir -p node_modules/dsh-jev-prune
@@ -25,7 +31,9 @@ jobs:
       - name: Smoke test (fake ctx, real apply)
         run: node smoke_apply.mjs
 
-  # 集成：装完整 DSH 依赖树，确认在真实宿主依赖环境下测试仍然全过
+  # 集成：装完整 DSH 依赖树。issue #20：此前该作业跑的两个脚本都不 import 任何 DSH 包，
+  # "在真实宿主依赖环境下验证"名不副实——现在至少真实加载一次插件模块与 dsh-llm，
+  # 并对随包发布的工具脚本做语法检查。
   integration:
     runs-on: ubuntu-latest
     steps:
@@ -35,12 +43,31 @@ jobs:
           node-version: 22
       - name: Install full DSH dependency tree
         run: |
-          npm install --no-audit --no-fund
-          npm install --no-save --no-audit --no-fund @deepseek-ai/dsh
+          npm ci --no-audit --no-fund
+          npm install --no-save --no-audit --no-fund @deepseek-ai/dsh@next
       - name: Make plugin resolvable as its package name
         run: |
           mkdir -p node_modules/dsh-jev-prune
           cp index.js jev.js state.js prune.js receipt.js package.json cordis.patch.yml node_modules/dsh-jev-prune/
+      - name: Syntax-check shipped tools
+        run: |
+          node --check check.js
+          node --check smoke_apply.mjs
+          node --check inspect_session.mjs
+          node --check verify_real_shapes.mjs
+          node --check wire_profile.mjs
+      - name: Real-host smoke (dynamic imports & version probe)
+        run: |
+          node --input-type=module -e "
+            const m = await import('@deepseek-ai/dsh-llm');
+            if (typeof m.freezeMessage !== 'function') { console.error('freezeMessage 不可用'); process.exit(1); }
+            console.log('freezeMessage ok');
+          "
+          node --input-type=module -e "
+            const m = await import('./index.js');
+            if (m?.name !== 'jev-prune') { console.error('插件模块加载异常'); process.exit(1); }
+            console.log('plugin module loads against real DSH tree');
+          "
       - name: Checks against real DSH tree
         run: |
           node check.js
