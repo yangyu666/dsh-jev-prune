@@ -1,0 +1,118 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="330" viewBox="0 0 1200 330" role="img" aria-label="The two layers: tool-result trimming keeps head/tail verbatim, receipt compaction replaces a spent read-only pair with a code-computed receipt">
+  <defs>
+    <linearGradient id="rule" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4CC9F0" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#F0A868" stop-opacity="0.55"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="1200" height="330" rx="14" fill="#0B1220"/>
+  <rect x="0.5" y="0.5" width="1199" height="329" rx="13.5" fill="none" stroke="#1E2A38"/>
+  <rect x="28" y="0" width="300" height="3" rx="1.5" fill="url(#rule)"/>
+
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">
+
+    <!-- 行标题 -->
+    <g font-size="14" fill="#7D8B9A" text-anchor="end">
+      <text x="176" y="60">surface</text>
+      <text x="176" y="148">after layer 1</text>
+      <text x="176" y="236">after layer 2</text>
+    </g>
+
+    <!-- 受保护的写类调用 -->
+    <text x="641" y="22" font-size="12" fill="#F0BE8A">write-type → never compacted</text>
+    <line x1="625" y1="27" x2="848" y2="27" stroke="#F0A868" stroke-opacity="0.45" stroke-dasharray="4 4"/>
+
+    <!-- 第一行：完整 surface -->
+    <g>
+      <rect x="192" y="32" width="86" height="44" rx="8" fill="#16212E" stroke="#24313F"/>
+      <text x="235" y="59" font-size="15" fill="#B6C2CF" text-anchor="middle">user</text>
+
+      <rect x="285" y="32" width="118" height="44" rx="8" fill="#16212E" stroke="#24313F"/>
+      <text x="344" y="59" font-size="15" fill="#B6C2CF" text-anchor="middle">call · read</text>
+
+      <rect x="410" y="32" width="208" height="44" rx="8" fill="#4CC9F0" fill-opacity="0.08" stroke="#4CC9F0" stroke-opacity="0.38"/>
+      <text x="514" y="59" font-size="15" fill="#9FDCF2" text-anchor="middle">16489 chars out</text>
+
+      <rect x="625" y="32" width="112" height="44" rx="8" fill="#16212E" stroke="#24313F"/>
+      <text x="681" y="59" font-size="15" fill="#B6C2CF" text-anchor="middle">call · edit</text>
+
+      <rect x="744" y="32" width="104" height="44" rx="8" fill="#16212E" stroke="#24313F"/>
+      <text x="796" y="59" font-size="15" fill="#B6C2CF" text-anchor="middle">applied</text>
+
+      <rect x="855" y="32" width="118" height="44" rx="8" fill="#16212E" stroke="#24313F"/>
+      <text x="914" y="59" font-size="15" fill="#B6C2CF" text-anchor="middle">call · read</text>
+
+      <rect x="980" y="32" width="196" height="44" rx="8" fill="#16212E" stroke="#24313F"/>
+      <text x="1078" y="59" font-size="15" fill="#B6C2CF" text-anchor="middle">3200 chars out</text>
+    </g>
+
+    <!-- 箭头 1 -->
+    <g stroke="#4CC9F0" stroke-opacity="0.75" stroke-width="1.6" fill="none">
+      <path d="M514 82 L514 106"/>
+      <path d="M509 101 L514 107 L519 101"/>
+    </g>
+    <text x="536" y="100" font-size="13" fill="#7FD9F5">layer 1 · result trimming — middle cut; head 600 / tail 200 kept verbatim</text>
+
+    <!-- 第二行：裁中间之后 -->
+    <g>
+      <rect x="192" y="120" width="86" height="44" rx="8" fill="#16212E" stroke="#24313F"/>
+      <text x="235" y="147" font-size="15" fill="#B6C2CF" text-anchor="middle">user</text>
+
+      <rect x="285" y="120" width="118" height="44" rx="8" fill="#16212E" stroke="#24313F"/>
+      <text x="344" y="147" font-size="15" fill="#B6C2CF" text-anchor="middle">call · read</text>
+
+      <g>
+        <rect x="410" y="120" width="208" height="44" rx="8" fill="#16212E" stroke="#24313F"/>
+        <rect x="472" y="124" width="84" height="36" rx="5" fill="#F0A868" fill-opacity="0.10" stroke="#F0A868" stroke-opacity="0.40" stroke-dasharray="4 3"/>
+        <line x1="472" y1="122" x2="472" y2="162" stroke="#5C6B7A" stroke-dasharray="3 3"/>
+        <line x1="556" y1="122" x2="556" y2="162" stroke="#5C6B7A" stroke-dasharray="3 3"/>
+        <text x="441" y="147" font-size="12" fill="#B6C2CF" text-anchor="middle">head</text>
+        <text x="514" y="147" font-size="12" fill="#F0BE8A" text-anchor="middle">trimmed</text>
+        <text x="587" y="147" font-size="12" fill="#B6C2CF" text-anchor="middle">tail</text>
+      </g>
+
+      <rect x="625" y="120" width="112" height="44" rx="8" fill="#16212E" stroke="#24313F"/>
+      <text x="681" y="147" font-size="15" fill="#B6C2CF" text-anchor="middle">call · edit</text>
+
+      <rect x="744" y="120" width="104" height="44" rx="8" fill="#16212E" stroke="#24313F"/>
+      <text x="796" y="147" font-size="15" fill="#B6C2CF" text-anchor="middle">applied</text>
+
+      <rect x="855" y="120" width="118" height="44" rx="8" fill="#16212E" stroke="#24313F"/>
+      <text x="914" y="147" font-size="15" fill="#B6C2CF" text-anchor="middle">call · read</text>
+
+      <rect x="980" y="120" width="196" height="44" rx="8" fill="#16212E" stroke="#24313F"/>
+      <text x="1078" y="147" font-size="15" fill="#B6C2CF" text-anchor="middle">3200 chars out</text>
+    </g>
+
+    <!-- 箭头 2 -->
+    <g stroke="#F0A868" stroke-opacity="0.75" stroke-width="1.6" fill="none">
+      <path d="M514 170 L514 194"/>
+      <path d="M509 189 L514 195 L519 189"/>
+    </g>
+    <text x="536" y="188" font-size="13" fill="#F0BE8A">layer 2 · receipt compaction — spent read-only pair replaced by a receipt</text>
+
+    <!-- 第三行：整对移出，换回执 -->
+    <g>
+      <rect x="192" y="208" width="86" height="44" rx="8" fill="#16212E" stroke="#24313F"/>
+      <text x="235" y="235" font-size="15" fill="#B6C2CF" text-anchor="middle">user</text>
+
+      <rect x="285" y="208" width="233" height="44" rx="8" fill="#F0A868" fill-opacity="0.09" stroke="#F0A868" stroke-opacity="0.55" stroke-dasharray="6 4"/>
+      <text x="401" y="235" font-size="13" fill="#F0BE8A" text-anchor="middle">receipt · read → 16489 chars</text>
+
+      <rect x="525" y="208" width="112" height="44" rx="8" fill="#16212E" stroke="#24313F"/>
+      <text x="581" y="235" font-size="15" fill="#B6C2CF" text-anchor="middle">call · edit</text>
+
+      <rect x="644" y="208" width="104" height="44" rx="8" fill="#16212E" stroke="#24313F"/>
+      <text x="696" y="235" font-size="15" fill="#B6C2CF" text-anchor="middle">applied</text>
+
+      <rect x="755" y="208" width="118" height="44" rx="8" fill="#16212E" stroke="#24313F"/>
+      <text x="814" y="235" font-size="15" fill="#B6C2CF" text-anchor="middle">call · read</text>
+
+      <rect x="880" y="208" width="196" height="44" rx="8" fill="#16212E" stroke="#24313F"/>
+      <text x="978" y="235" font-size="15" fill="#B6C2CF" text-anchor="middle">3200 chars out</text>
+    </g>
+
+    <text x="192" y="298" font-size="12" fill="#5C6B7A">every receipt line is computed by code — tool name, command, path, output characters, seq. No model inference.</text>
+  </g>
+</svg>

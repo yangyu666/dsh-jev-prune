@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-label="dsh-jev-prune — Jev-judged context compaction for DeepSeek Harness">
+  <defs>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4CC9F0"/>
+      <stop offset="0.55" stop-color="#6EE7C8"/>
+      <stop offset="1" stop-color="#F0A868"/>
+    </linearGradient>
+    <radialGradient id="glowCyan" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#4CC9F0" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#4CC9F0" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowAmber" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#F0A868" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#F0A868" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1280" height="320" fill="#0B1220"/>
+  <ellipse cx="150" cy="40" rx="470" ry="300" fill="url(#glowCyan)"/>
+  <ellipse cx="1230" cy="300" rx="360" ry="260" fill="url(#glowAmber)"/>
+  <rect x="0" y="0" width="1280" height="3" fill="url(#accent)"/>
+
+  <!-- 左：字标 -->
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">
+    <text x="72" y="108" font-size="12.5" letter-spacing="2.8" fill="#4CC9F0" fill-opacity="0.92">DEEPSEEK HARNESS PLUGIN</text>
+    <text x="72" y="168" font-size="54" font-weight="700" letter-spacing="-1">
+      <tspan fill="#E6EDF3">dsh-</tspan><tspan fill="#4CC9F0">jev</tspan><tspan fill="#E6EDF3">-prune</tspan>
+    </text>
+    <text x="72" y="206" font-size="17" fill="#B6C2CF">Jev-judged context compaction for DeepSeek Harness.</text>
+    <text x="72" y="230" font-size="17" fill="#7D8B9A">Deterministic receipts instead of model-written summaries.</text>
+
+    <g>
+      <rect x="72" y="256" width="250" height="30" rx="15" fill="#4CC9F0" fill-opacity="0.10" stroke="#4CC9F0" stroke-opacity="0.45"/>
+      <text x="197" y="276" font-size="12" letter-spacing="1.1" fill="#7FD9F5" text-anchor="middle">LAYER 1 · TOOL-RESULT TRIMMING</text>
+      <rect x="334" y="256" width="160" height="30" rx="15" fill="#F0A868" fill-opacity="0.10" stroke="#F0A868" stroke-opacity="0.45"/>
+      <text x="414" y="276" font-size="12" letter-spacing="1.1" fill="#F0BE8A" text-anchor="middle">LAYER 2 · RECEIPTS</text>
+    </g>
+  </g>
+
+  <!-- 右：上下文表面收缩为回执（8 列栅格：x=720..1210，列宽 56，间距 6） -->
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">
+    <text x="720" y="100" font-size="12.5" letter-spacing="1.6" fill="#7D8B9A">CONTEXT SURFACE · 8 NODES</text>
+    <g fill="#4CC9F0" fill-opacity="0.22" stroke="#4CC9F0" stroke-opacity="0.50">
+      <rect x="720" y="112" width="56" height="16" rx="4"/>
+      <rect x="782" y="112" width="56" height="16" rx="4"/>
+      <rect x="844" y="112" width="56" height="16" rx="4"/>
+      <rect x="906" y="112" width="56" height="16" rx="4"/>
+      <rect x="968" y="112" width="56" height="16" rx="4"/>
+      <rect x="1030" y="112" width="56" height="16" rx="4"/>
+      <rect x="1092" y="112" width="56" height="16" rx="4"/>
+      <rect x="1154" y="112" width="56" height="16" rx="4"/>
+    </g>
+
+    <g stroke="#5C6B7A" stroke-width="1.6" fill="none">
+      <path d="M965 140 L965 160"/>
+      <path d="M960 155 L965 161 L970 155"/>
+    </g>
+    <text x="979" y="157" font-size="12.5" fill="#7D8B9A">layer 1 + layer 2</text>
+
+    <text x="720" y="188" font-size="12.5" letter-spacing="1.6" fill="#7D8B9A">AFTER COMPACTION</text>
+    <g fill="#4CC9F0" fill-opacity="0.22" stroke="#4CC9F0" stroke-opacity="0.50">
+      <rect x="720" y="200" width="56" height="22" rx="4"/>
+      <rect x="782" y="200" width="56" height="22" rx="4"/>
+      <rect x="844" y="200" width="56" height="22" rx="4"/>
+    </g>
+    <g>
+      <rect x="906" y="200" width="304" height="22" rx="4" fill="#F0A868" fill-opacity="0.09" stroke="#F0A868" stroke-opacity="0.55" stroke-dasharray="5 4"/>
+      <text x="1058" y="215" font-size="13" fill="#F0BE8A" text-anchor="middle">receipt · s27 read → 16489 chars</text>
+    </g>
+  </g>
+
+  <rect x="0" y="317" width="1280" height="1" fill="#FFFFFF" fill-opacity="0.07"/>
+</svg>
