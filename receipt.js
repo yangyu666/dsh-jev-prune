@@ -70,6 +70,7 @@ export const DEFAULT_NEVER_COMPACT_TOOLS = [
  * 证据守卫的默认词表。命中即**不整对删除**（仍允许第一层截断，那是有损但可逆的）。
  * 方向性说明：这里宁可误守（少省一点）也不能漏守（丢证据）。
  * 命中数量会如实上报到状态里，如果发现守得过宽可以直接改配置。
+ * 匹配口径见 scanEvidence —— 要求命中落在标识符段开头，所以 `bug` 不会被 `debug` 触发。
  */
 export const DEFAULT_EVIDENCE_PATTERNS = [
   'error', 'exception', 'traceback', 'stack trace', 'assertion',
@@ -217,15 +218,28 @@ function clip(text, maxChars) {
 
 /**
  * 找出文本命中的证据词。
+ *
+ * 匹配口径：命中必须落在**一个标识符段的开头** —— 串首、非字母数字之后，
+ * 或者驼峰分界（小写字母之后的大写开头）。这样：
+ *   · `TypeError` 里的 `error` 命中（真证据）
+ *   · `debug` / `__debug__` / `this.debug` 里的 `bug` **不**命中（子串误报）
+ * 为什么不是"整词匹配"（词首词尾都要求边界）：那会让 `errors`、`bugfix`、
+ * `failures` 这类真证据一起漏掉，而本守卫的方向性是宁可误守也不能漏守。
+ * 代价是 `myerror` 这种无分隔符的复合标识符不再命中 —— 与 `debug` 同类，属于有意取舍。
+ *
  * @returns {{hit:boolean, matches:string[]}}
  */
 export function scanEvidence(text, patterns) {
-  const haystack = String(text ?? '').toLowerCase()
+  const haystack = String(text ?? '') // 保持原始大小写：驼峰分界只能对原文判定
   const matches = []
   for (const pattern of patterns ?? []) {
     const needle = String(pattern).toLowerCase()
     if (needle.length === 0) continue
-    if (haystack.includes(needle)) matches.push(needle)
+    const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const atSegmentStart = new RegExp(`(?<=^|[^A-Za-z0-9])${escaped}`, 'i')
+    const camelFirst = escaped.charAt(0).toUpperCase() + escaped.slice(1)
+    const atCamelBoundary = new RegExp(`(?<=[a-z])${camelFirst}`)
+    if (atSegmentStart.test(haystack) || atCamelBoundary.test(haystack)) matches.push(needle)
   }
   return { hit: matches.length > 0, matches }
 }

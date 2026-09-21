@@ -3,7 +3,7 @@
 **Jev-judged context compaction for DeepSeek Harness.**
 用 [TypeSafe Jev](https://typesafe.ai) 的结构化判断驱动 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的两层上下文压缩。压缩算法不改动，判断后端可插拔（Jev / 规则 / 自托管模型）。
 
-![license](https://img.shields.io/badge/license-MIT-blue) ![node](https://img.shields.io/badge/node%20%3E%3D22.19-339933) ![dsh](https://img.shields.io/badge/DSH-0.1.x--rc-orange)
+![license](https://img.shields.io/badge/license-MIT-blue) ![node](https://img.shields.io/badge/node%20%3E%3D22.19-339933) ![dsh](https://img.shields.io/badge/DSH-0.1.x--rc-orange) [![CI](https://github.com/yangyu666/dsh-jev-prune/actions/workflows/ci.yml/badge.svg)](https://github.com/yangyu666/dsh-jev-prune/actions/workflows/ci.yml)
 
 ## 它解决什么问题
 
@@ -82,7 +82,7 @@ node wire_profile.mjs <DSH_HOME> <profile名>
 | `compactMode` | `relative` | `relative`（推荐）或 `absolute`（配 `compactThreshold`） |
 | `compactQuantile` | `0.34` | 两轴各取尾部的比例，取交集 |
 | `neverCompactTools` | 改写类工具 | 永不移出；比较时归一化（`Edit` 与 `edit` 等价） |
-| `compactTools` | `[]` | 可选白名单，进一步收紧 |
+| `compactTools` | 只读工具集 | 白名单，**默认非空**（`DSH_READONLY_TOOLS`：`read`/`glob`/`grep`/`list`/`fetch`…，含 PowerShell 的 `getchilditem`/`selectstring` 等只读命令）；配成 `[]` 会放宽为只受黑名单约束——shell 调用也会被整对移出，属显式 opt-in 的不安全模式 |
 | `evidenceGuard` / `evidencePatterns` | `true` / 内置词表 | 证据守卫 |
 | `compactMinChars` / `receiptMaxRatio` | `2000` / `0.5` | 第二层经济性下限 |
 | `dryRun` | `false` | 两层都只判定记账、不动手 |

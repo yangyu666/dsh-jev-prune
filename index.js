@@ -171,8 +171,8 @@ export const Config = z.object({
   /** state 历史最少保留的行数（避免为了塞进预算把上下文丢空） */
   minHistoryLines: z.number().default(8),
   /** 结果永不裁剪的工具 */
-  // 两层用同一份黑名单（含 str_replace_editor 等别名）；比较在 decideAction 里归一化，
-  // 所以这里写 PascalCase 或小写都等价——外部审查回归后与第二层统一
+  // 两层用同一份黑名单（含 str_replace_editor 等别名）；比较在 decideAction 与
+  // selectCandidates 里都归一化（isToolIn），所以这里写 PascalCase 或小写都等价
   neverPruneTools: z.array(z.string()).default(DEFAULT_NEVER_COMPACT_TOOLS),
 
   // ---------------------------------------------------------------- 第二层：回执压缩
@@ -196,14 +196,15 @@ export const Config = z.object({
   /** absolute 模式用的阈值 */
   compactThreshold: z.number().default(0.5),
   /**
-   * 允许整对移出的工具（白名单）。**默认空 = 不设白名单，只用黑名单。**
+   * 允许整对移出的工具（白名单）。**默认 = `DSH_READONLY_TOOLS`（只读工具集），即默认就带白名单。**
    *
-   * 为什么默认不用白名单（实测教训）：我最初把 `Read`/`Grep`/`Bash` 这套 PascalCase 名字当默认白名单，
-   * 而真实 DSH 的工具名是 **`pwsh` / `read` / `glob`**（全小写、shell 叫 pwsh）——
-   * **命中 0/11，第二层静默地永不触发**（加载成功、接管成功、判定在跑，只是什么都没做）。
-   * 白名单失效的后果是"功能静默死亡"，黑名单失效的后果只是"少保护"（还有副作用轴/证据守卫/最近区兜着）。
-   * 想收紧就配上 `DSH_READONLY_TOOLS`（已从会话日志取证的真实名字）或你自己的名字。
+   * 为什么默认是"只读白名单"而不是空：白名单失效的后果是"功能静默死亡"（加载成功、接管成功、
+   * 判定在跑，只是什么都不做），所以宁可让它默认就窄；黑名单只用来额外保护改写型调用。
+   * 实测教训：最初把 `Read`/`Grep`/`Bash` 这套 PascalCase 名字当默认白名单，而真实 DSH 的
+   * 工具名是 **`pwsh` / `read` / `glob`**（全小写、shell 叫 pwsh）——**命中 0/11**。
    * 比较时做归一化（小写 + 去掉 `_`/`-`），所以 `MultiEdit` 与 `multi_edit` 等价。
+   * 想放宽就配成 `[]`（只受 neverCompactTools 约束）——那是显式 opt-in 的不安全模式，
+   * shell 调用也会被整对移出。
    */
   compactTools: z.array(z.string()).default(DEFAULT_COMPACT_TOOLS),
   /** 永不整对移出的工具（改写型调用是承重信息） */

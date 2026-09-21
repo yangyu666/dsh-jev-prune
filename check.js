@@ -114,7 +114,9 @@ const candidates = selectCandidates({
   eventAt,
   events,
   preserveRecent: 2, // 排除 s9 / s10
-  neverPruneTools: ['Edit', 'Write'],
+  // 故意用小写：默认黑名单是 PascalCase，而真实 DSH 的工具名是全小写 —— 字面 includes
+  // 会让这条排除静默失效（回归用例；比较必须走 isToolIn 的归一化）
+  neverPruneTools: ['edit', 'write'],
   marker: '已裁剪',
   nameByCallId: nameIndex,
 })
@@ -122,7 +124,7 @@ const seqs = candidates.map((c) => c.seq)
 assert.deepEqual(seqs, [3, 5], `候选应为 [3,5]，实际 ${JSON.stringify(seqs)}`)
 assert.equal(candidates[0].tool, 'Read')
 assert.equal(candidates[0].chars, 5000)
-// s7 是 Edit 结果 → 被 neverPruneTools 排除
+// s7 是 Edit 结果 → 被 neverPruneTools 排除（'Edit' 必须能匹配小写黑名单 'edit'）
 assert.equal(seqs.includes(7), false, 'Edit 结果不应进候选')
 // s9 是 Bash 且落在最近 2 个节点里 → 排除
 assert.equal(seqs.includes(9), false, '最近区不应进候选')
@@ -678,6 +680,20 @@ const run = ({ events, cache, cfg, threshold }) => {
   assert.equal(scanEvidence('all good', ['error', 'fail']).hit, false)
   assert.deepEqual(scanEvidence('failed and error', ['error', 'fail']).matches, ['error', 'fail'])
   assert.equal(scanEvidence('', []).hit, false)
+  // 命中必须落在标识符段开头：压掉子串误报，同时保住真证据
+  assert.equal(scanEvidence('debugging the parser', ['bug']).hit, false, 'bug 不应被 debug 触发')
+  assert.equal(scanEvidence('__debug__', ['bug']).hit, false, '下划线包裹的复合标识符也不该触发')
+  assert.equal(scanEvidence('this.debug = 1', ['bug']).hit, false)
+  assert.equal(scanEvidence('bugs found', ['bug']).hit, true)
+  assert.equal(scanEvidence('bugfix applied', ['bug']).hit, true)
+  assert.equal(scanEvidence('errors: 3', ['error']).hit, true, '复数形式仍是证据')
+  assert.equal(scanEvidence('getError()', ['error']).hit, true, '驼峰分界算段首')
+  assert.equal(scanEvidence('myerror', ['error']).hit, false, '无分隔符的复合标识符不算段首')
+  assert.equal(scanEvidence('TODOs left', ['todo']).hit, true)
+  assert.equal(scanEvidence('pseudotodo', ['todo']).hit, false)
+  assert.equal(scanEvidence('default: x', ['fail:']).hit, false, 'fail: 不应被 default: 触发')
+  assert.equal(scanEvidence('stack trace follows', ['stack trace']).hit, true)
+  assert.equal(scanEvidence('mystack trace', ['stack trace']).hit, false)
 
   // 入参渲染只接 tool-call **块**（不是裸 args）—— 契约写在测试里
   assert.equal(renderCallArgs({ arguments: { file_path: 'a/b.ts' } }), 'a/b.ts')

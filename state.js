@@ -14,6 +14,8 @@
  */
 
 import { estimateTokens } from './jev.js'
+// 工具名黑名单必须与两层裁决用同一套归一化比较（prune.js 是依赖链最底层）
+import { isToolIn } from './prune.js'
 
 export const STATE_CONTEXT =
   '一个编码助手的对话正被压缩以释放上下文。history 是当前模型可见的全部历史（surface），' +
@@ -202,7 +204,9 @@ export function selectCandidates({ surface, eventAt, events, preserveRecent, nev
     if (event?.type !== 'tool/result') continue
     if (looksPruned(event, marker)) continue
     const tool = toolNameOf(event, nameByCallId)
-    if (neverPruneTools.includes(tool)) continue
+    // 归一化比较：默认黑名单是 PascalCase（Edit/Write），真实工具名是全小写（edit/write），
+    // 字面 includes 会让"改写类不参与判定"这条承诺静默失效
+    if (isToolIn(neverPruneTools, tool)) continue
     out.push({ seq, index, chars: resultChars(event), callId: callIdOf(event), tool })
   }
   return out

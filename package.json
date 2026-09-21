@@ -36,16 +36,16 @@
   },
   "license": "MIT",
   "author": {
-    "name": "your-handle"
+    "name": "yangyu666"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/your-handle/dsh-jev-prune.git"
+    "url": "git+https://github.com/yangyu666/dsh-jev-prune.git"
   },
   "bugs": {
-    "url": "https://github.com/your-handle/dsh-jev-prune/issues"
+    "url": "https://github.com/yangyu666/dsh-jev-prune/issues"
   },
-  "homepage": "https://github.com/your-handle/dsh-jev-prune#readme",
+  "homepage": "https://github.com/yangyu666/dsh-jev-prune#readme",
   "keywords": [
     "deepseek-harness",
     "dsh",
