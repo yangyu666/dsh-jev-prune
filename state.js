@@ -14,6 +14,10 @@
  */
 
 import { estimateTokens } from './jev.js'
+// 工具名黑名单必须与两层裁决用同一套归一化比较（prune.js 是依赖链最底层）。
+// 外部审查（issue #2）：selectCandidates 此前用字面 includes，默认 PascalCase 黑名单
+// 对真实小写工具名（edit/write）静默失效——改写类节点照进候选、照花判定钱。
+import { isToolIn } from './prune.js'
 
 export const STATE_CONTEXT =
   '一个编码助手的对话正被压缩以释放上下文。history 是当前模型可见的全部历史（surface），' +
@@ -202,7 +206,8 @@ export function selectCandidates({ surface, eventAt, events, preserveRecent, nev
     if (event?.type !== 'tool/result') continue
     if (looksPruned(event, marker)) continue
     const tool = toolNameOf(event, nameByCallId)
-    if (neverPruneTools.includes(tool)) continue
+    // 归一化比较（issue #1/#2）：字面 includes 对小写工具名永远不命中
+    if (isToolIn(neverPruneTools, tool)) continue
     out.push({ seq, index, chars: resultChars(event), callId: callIdOf(event), tool })
   }
   return out
@@ -337,10 +342,23 @@ export function buildJevState({ surface, eventAt, goal, context = STATE_CONTEXT,
   return { state, lines: all.length, omitted, fitted: stateTokens <= maxStateTokens, stateTokens }
 }
 
+/**
+ * 按 **Unicode 码点**切片截断（issue #4/#5）。
+ *
+ * 两个此前都真实存在的坑：
+ *   · head/tail 为 undefined（config 未经 schemastery 归一化时）→ `head + tail + 40` 是
+ *     NaN、比较恒假、slice 返回整段原文 —— 同一段文本输出两遍、state 里带 "NaN" 字面量。
+ *     这里做数值兜底，但根因是 resolveConfig 漏键（见 index.js）。
+ *   · 用 UTF-16 的 .length/.slice 会把代理对劈成半个字符 —— 与 README「按码点切片」的
+ *     承诺相反，也与 prune.js 的口径不一致。统一改为码点数组。
+ */
 function abridge(text, head, tail) {
-  const value = String(text ?? '')
-  if (value.length <= head + tail + 40) return value
-  return `${value.slice(0, head)}\n… ${value.length - head - tail} 字符省略 …\n${value.slice(-tail)}`
+  const headChars = Number.isFinite(head) ? head : 400
+  const tailChars = Number.isFinite(tail) ? tail : 150
+  const points = Array.from(String(text ?? ''))
+  if (points.length <= headChars + tailChars + 40) return points.join('')
+  const omitted = points.length - headChars - tailChars
+  return `${points.slice(0, headChars).join('')}\n… ${omitted} 字符省略 …\n${points.slice(-tailChars).join('')}`
 }
 
 /**

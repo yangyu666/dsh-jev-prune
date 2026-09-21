@@ -103,14 +103,6 @@ export function parseLimit(raw) {
   return { kind: 'tokens', value }
 }
 
-/** 压力分级：none / soft / hard。 */
-export function pressureLevel(used, minTokens, maxTokens) {
-  if (minTokens == null) return 'none'
-  if (maxTokens != null && used >= maxTokens) return 'hard'
-  if (used >= minTokens) return 'soft'
-  return 'none'
-}
-
 /**
  * 单个节点的裁决。抽成纯函数是为了能穷举测试——这是全插件最容易写错的地方，
  * 四个分支的优先级错了就会误删承重内容。
@@ -173,6 +165,15 @@ export function pruneSessionWithJev({ pruner, session, cache, cfg, stats, freeze
       minCharsToPrune: cfg.minCharsToPrune,
     })
 
+    // keep 的三个来源分开计数（issue #8）：此前落在最近区/黑名单保护的节点
+    // 都被记进 keptByJev——"Jev 保留"虚高，而真正的硬规则保护在统计里完全不可见，
+    // 用户拿这行数字判断"Jev 的判断在起作用吗"会得出错误结论。
+    if (action === 'keep') {
+      if (index > lastAllowed) stats.keptByTail += 1
+      else if (isToolIn(cfg.neverPruneTools, tool)) stats.keptByBlacklist += 1
+      else if (verdict?.keep) stats.keptByJev += 1
+    }
+
     let content = null
     if (action === 'prune') {
       content = sliceWithBudget(blocks, cfg.headChars, cfg.tailChars, cfg.marker ?? JEV_PRUNE_MARKER)
@@ -180,8 +181,6 @@ export function pruneSessionWithJev({ pruner, session, cache, cfg, stats, freeze
     } else if (action === 'fallback') {
       content = pruner.pruneContent(blocks)
       if (content != null) stats.prunedByVolume += 1
-    } else if (verdict?.keep) {
-      stats.keptByJev += 1
     }
 
     if (content == null) continue

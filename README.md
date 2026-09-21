@@ -3,7 +3,7 @@
 **Jev-judged context compaction for DeepSeek Harness.**
 用 [TypeSafe Jev](https://typesafe.ai) 的结构化判断驱动 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的两层上下文压缩。压缩算法不改动，判断后端可插拔（Jev / 规则 / 自托管模型）。
 
-![license](https://img.shields.io/badge/license-MIT-blue) ![node](https://img.shields.io/badge/node%20%3E%3D22.19-339933) ![dsh](https://img.shields.io/badge/DSH-0.1.x--rc-orange)
+![license](https://img.shields.io/badge/license-MIT-blue) ![node](https://img.shields.io/badge/node%20%3E%3D22.19-339933) ![dsh](https://img.shields.io/badge/DSH-0.1.x--rc-orange) [![CI](https://github.com/yangyu666/dsh-jev-prune/actions/workflows/ci.yml/badge.svg)](https://github.com/yangyu666/dsh-jev-prune/actions/workflows/ci.yml)
 
 ## 它解决什么问题
 
@@ -17,7 +17,7 @@ DSH 自带的上下文回收是**纯体积**的：工具结果超过阈值就掐
 
 | 层 | 接管点 | DSH 默认行为 | 本插件 |
 |---|---|---|---|
-| **1 · 结果裁剪** | `ctx.toolResultPruner.pruneSession` | 超过 `thresholdChars` 掐中间 | Jev 判定每个工具结果「接下来还要不要」，要的**再大也不裁**，过期的**再小也裁**；无判定时退回 DSH 原生行为 |
+| **1 · 结果裁剪** | `ctx.toolResultPruner.pruneSession` | 超过 `thresholdChars` 掐中间 | Jev 判定每个工具结果「接下来还要不要」，要的**再大也不裁**，过期的**再小也裁**（短于 `minCharsToPrune` 的除外）；无判定时退回 DSH 原生行为 |
 | **2 · 回执压缩** | `ctx.compaction.summarize` + `compactRegion` | 模型读原历史、写摘要 | 把已花掉的只读探查（整对 `tool-call` + `tool/result`）移出 surface，注入**确定性回执**：工具名、命令、路径、字符数、seq 全由代码算出 |
 
 第二层的回执长这样：
@@ -47,7 +47,10 @@ DSH 自带的上下文回收是**纯体积**的：工具结果超过阈值就掐
 - Node `^22.19.0 || >=24.0.0`
 - `dsh`（`@deepseek-ai/dsh`），profile 中已加载 base bundle（`tool-result-pruner` 与 `compaction-basic` 默认包含）
 - TypeSafe API key（`TYPESAFE_API_KEY` 环境变量）
-- 运行时 peer 依赖：`@deepseek-ai/schemastery`、`@deepseek-ai/dsh-tools`（随宿主提供；npm 7+ 安装本包时会自动带上）
+- 运行时 peer 依赖：`@deepseek-ai/schemastery`、`@deepseek-ai/dsh-tools`（随宿主提供）
+- 可选动态依赖：`@deepseek-ai/dsh-llm` 的 `freezeMessage`（缺失时退化为浅拷贝，插件照常工作）
+
+**版本对齐**：`@deepseek-ai/dsh-tools` 的 peer 范围为 `^0.1.5-rc.2`——测试版本 `0.1.5-rc.2` 在 npm 的 `next` 标签上而非 `latest`，仓库内提交了 lockfile（devDependencies 钉住实测版本），`npm ci` 可精确复现测试条件。
 
 **兼容性**：针对 `@deepseek-ai/dsh@0.1.5-rc.2` 测试。DSH 0.1.x 为预发布版本，事件形状与服务名在小版本间可能变动；升级 DSH 后请重跑 `npm run check` 与冒烟测试，并在真实会话里调用一次 `jev_probe_shapes` 校对字段。
 
@@ -82,7 +85,7 @@ node wire_profile.mjs <DSH_HOME> <profile名>
 | `compactMode` | `relative` | `relative`（推荐）或 `absolute`（配 `compactThreshold`） |
 | `compactQuantile` | `0.34` | 两轴各取尾部的比例，取交集 |
 | `neverCompactTools` | 改写类工具 | 永不移出；比较时归一化（`Edit` 与 `edit` 等价） |
-| `compactTools` | `[]` | 可选白名单，进一步收紧 |
+| `compactTools` | 只读工具集 | 白名单，**默认非空**（`DSH_READONLY_TOOLS`：`read`/`glob`/`grep`/`list`/`fetch`…，含 PowerShell 的 `getchilditem`/`selectstring` 等只读命令）；配成 `[]` 会**放宽**为只受黑名单约束——shell 调用也会被整对移出，属显式 opt-in 的不安全模式 |
 | `evidenceGuard` / `evidencePatterns` | `true` / 内置词表 | 证据守卫 |
 | `compactMinChars` / `receiptMaxRatio` | `2000` / `0.5` | 第二层经济性下限 |
 | `dryRun` | `false` | 两层都只判定记账、不动手 |
@@ -111,13 +114,15 @@ node wire_profile.mjs <DSH_HOME> <profile名>
 ## 测试
 
 ```bash
-npm install   # 拉取 peer 依赖
+npm install   # 拉取 peer 依赖（lockfile 已提交，CI 用 npm ci 精确复现）
 npm run check # 纯函数自检：token 估算 / state 组装 / 候选筛选 / 两层裁决 / 打包完整性
 ```
 
-冒烟测试（不依赖完整 DSH 依赖树，4 秒跑完）：
+冒烟测试（不依赖完整 DSH 依赖树，4 秒跑完）。注意：插件入口静态 import 两个 peer，
+干净目录请先补装（报错里也有同样提示）：
 
 ```bash
+npm install @deepseek-ai/schemastery @deepseek-ai/dsh-tools
 cp {index,jev,state,prune,receipt}.js package.json <某目录>/node_modules/dsh-jev-prune/
 cp smoke_apply.mjs <某目录>/ && cd <某目录> && node smoke_apply.mjs
 ```
@@ -125,6 +130,8 @@ cp smoke_apply.mjs <某目录>/ && cd <某目录> && node smoke_apply.mjs
 测试脚本与辅助工具（`check.js` / `smoke_apply.mjs` / `inspect_session.mjs` / `verify_real_shapes.mjs` / `wire_profile.mjs`）都随 npm 包发布，装好的包内可直接 `npm run check`。CI（`.github/workflows/ci.yml`）跑两组作业：仅 peer 依赖的快速冒烟 + 完整 DSH 依赖树的集成验证。
 
 覆盖：两个接入点的接管、两层完整裁决路径、append 协议、回执注入、门控分支（含反事实对照）、**shell 类工具默认排除**（`pwsh Remove-Item` 回归用例）。
+
+**测试边界**（哪些是 CI 真正验证过的，issue #20）：纯函数逻辑、假 ctx 下的接管与 append 协议、以及 integration 作业里的"真实依赖树下模块可加载 + freezeMessage 可用"。**没有**被 CI 覆盖的：真实 DSH 宿主内的服务接管、rc 版本间的事件形状漂移——这些只能在真实会话里用 `jev_probe_shapes` 校对。
 
 ## 目录结构
 

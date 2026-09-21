@@ -13,7 +13,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { estimateTokens } from './jev.js'
-import { countChars, decideAction, parseLimit, pressureLevel, pruneSessionWithJev, sliceWithBudget } from './prune.js'
+import { countChars, decideAction, parseLimit, pruneSessionWithJev, sliceWithBudget } from './prune.js'
 import {
   DEFAULT_COMPACT_TOOLS,
   DEFAULT_EVIDENCE_PATTERNS,
@@ -114,7 +114,9 @@ const candidates = selectCandidates({
   eventAt,
   events,
   preserveRecent: 2, // 排除 s9 / s10
-  neverPruneTools: ['Edit', 'Write'],
+  // 故意用小写（issue #1/#2）：默认黑名单是 PascalCase，真实 DSH 工具名是全小写——
+  // 字面 includes 会让这条排除静默失效。比较必须走 isToolIn 的归一化。
+  neverPruneTools: ['edit', 'write'],
   marker: '已裁剪',
   nameByCallId: nameIndex,
 })
@@ -122,7 +124,7 @@ const seqs = candidates.map((c) => c.seq)
 assert.deepEqual(seqs, [3, 5], `候选应为 [3,5]，实际 ${JSON.stringify(seqs)}`)
 assert.equal(candidates[0].tool, 'Read')
 assert.equal(candidates[0].chars, 5000)
-// s7 是 Edit 结果 → 被 neverPruneTools 排除
+// s7 是 Edit 结果 → 被 neverPruneTools 排除（'Edit' 必须能匹配小写黑名单 'edit'）
 assert.equal(seqs.includes(7), false, 'Edit 结果不应进候选')
 // s9 是 Bash 且落在最近 2 个节点里 → 排除
 assert.equal(seqs.includes(9), false, '最近区不应进候选')
@@ -186,6 +188,34 @@ assert.ok(squeezed.lines >= 8, `行数不应低于地板 8，实际 ${squeezed.l
 assert.ok(squeezed.lines < surface.length, '确实丢了行')
 assert.equal(typeof squeezed.fitted, 'boolean')
 assert.equal(squeezed.stateTokens > 0, true)
+
+// abridge 的两个回归（issue #4/#5）：
+// ① head/tail undefined（config 未经 schemastery 归一化）→ 不得产生 NaN 或重复原文
+// ② 按 Unicode 码点切片，不得劈开代理对（README 的承诺在 state 侧同样成立）
+{
+  const evs2 = [userEvent(1, 'a'.repeat(600))] // 600 码点 > 400+150+40 → 必须触发截断
+  const built2 = buildJevState({
+    surface: [1],
+    eventAt: (s) => evs2.find((e) => e.seq === s),
+    goal: '',
+    options: {},
+  })
+  assert.equal(built2.state.includes('NaN'), false, '缺 textHead/textTail 时不得产生 NaN')
+  // NaN 路径下 slice(0,undefined) 会返回整段原文 → 600 个 a 出现两遍；
+  // 正常路径只有头部 400 个 a + 尾部 150 个 a，"400 连 a"恰好出现 1 次
+  assert.equal(built2.state.split('a'.repeat(400)).length - 1, 1, '同一段文本不得被输出两遍')
+
+  const emojiText = 'a'.repeat(399) + '😀' + 'b'.repeat(400)
+  const evs3 = [userEvent(1, emojiText)]
+  const built3 = buildJevState({
+    surface: [1],
+    eventAt: (s) => evs3.find((e) => e.seq === s),
+    goal: '',
+    options: { textHead: 400, textTail: 150 },
+  })
+  const lonely = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(built3.state)
+  assert.equal(lonely, false, 'state 不得包含孤立代理项（abridge 必须按码点切）')
+}
 
 // ---------------------------------------------------------------- 裁剪机制（prune.js）
 // 这段逻辑以前困在 index.js 里（要 import DSH 的包 → 在 DSH 外跑不起来），
@@ -253,13 +283,9 @@ assert.equal(sliceWithBudget(null, 600, 200, marker), null, '非数组返回 nul
   }
 }
 
-// parseLimit / pressureLevel
+// parseLimit（pressureLevel 已删除：有测试无调用的死代码，issue #14）
 assert.deepEqual(parseLimit('55%'), { kind: 'ratio', value: 0.55 })
 assert.deepEqual(parseLimit('154000'), { kind: 'tokens', value: 154000 })
-assert.equal(pressureLevel(100, 600, 700), 'none')
-assert.equal(pressureLevel(650, 600, 700), 'soft')
-assert.equal(pressureLevel(700, 600, 700), 'hard')
-assert.equal(pressureLevel(700, null, null), 'none', '算不出窗口时不应误判压力')
 
 // ---------------------------------------------------------------- 逐节点裁决（含 append 协议）
 // 用假的 pruner / session 复刻 DSH 的接口形状（形状取自 DSH 源码，不是猜的）：
@@ -314,7 +340,8 @@ const baseCfg = {
 }
 const freshStats = () => ({
   judged: 0, requests: 0, prunedByJev: 0, prunedByVolume: 0,
-  savedChars: 0, keptByJev: 0, skipped: 0, errors: 0, lastNote: '',
+  savedChars: 0, keptByJev: 0, keptByTail: 0, keptByBlacklist: 0,
+  skipped: 0, errors: 0, lastNote: '',
 })
 const run = ({ events, cache, cfg, threshold }) => {
   const session = fakeSession(events)
@@ -376,21 +403,27 @@ const run = ({ events, cache, cfg, threshold }) => {
 // ④ 落在最近区 → 一律不碰（哪怕 Jev 说过期）
 {
   const events = [resultEvent(14, 'c5', 'e'.repeat(5000))]
-  const { out, session } = run({
+  const { out, session, stats } = run({
     events, cache: new Map([[14, { keep: false, prob: 0.05 }]]), cfg: { preserveRecent: 1 },
   })
   assert.equal(out.pruned.length, 0, '最近区不该被裁')
   assert.equal(session.appended.length, 0)
+  // issue #8：最近区保护此前被记成"Jev 保留"——三个 keep 来源必须分开计数
+  assert.equal(stats.keptByTail, 1, '最近区保护应记入 keptByTail')
+  assert.equal(stats.keptByJev, 0, '最近区保护不应记入 keptByJev')
 }
 
 // ⑤ 永不裁剪工具 → 不碰
 {
   const events = [resultEvent(15, 'c6', 'f'.repeat(5000))]
-  const { out } = run({
+  const { out, stats } = run({
     events, cache: new Map([[15, { keep: false, prob: 0.05 }]]),
     cfg: { neverPruneTools: ['Bash'] }, // toolNameOf 固定返回 Bash
   })
   assert.equal(out.pruned.length, 0, 'neverPruneTools 里的工具不该被裁')
+  // issue #8：黑名单保护此前在统计里完全不可见（三个计数器全 0）
+  assert.equal(stats.keptByBlacklist, 1, '黑名单保护应记入 keptByBlacklist')
+  assert.equal(stats.keptByJev, 0)
 }
 
 // ⑤b 外部审查回归：第一层黑名单必须**归一化**比较。
@@ -523,6 +556,18 @@ const run = ({ events, cache, cfg, threshold }) => {
     Array.from({ length: 6 }, (_, i) => ({ seq: i + 1, prob: 0.1 })),
     { quantile: 0.5, minCandidates: 4 },
   ).size, 0, '缺 effectProb 的判定不能用于第二层')
+
+  // quantile 非法必须 fail loud（issue #6）：此前 NaN/undefined 静默返回空集，
+  // 第二层"功能静默死亡"且报错文案被误读成"样本不够"
+  for (const bad of [undefined, NaN, -0.1, 1.5, '0.34']) {
+    assert.throws(
+      () => computeEligibleSeqs(verdicts, { quantile: bad, minCandidates: 4 }),
+      (e) => /compactQuantile 非法/.test(e.message),
+      `quantile=${String(bad)} 应抛错`,
+    )
+  }
+  // quantile=0 的语义是字面意义"一条不取"（此前 Math.max(1,…) 反而取 1 条）
+  assert.equal(computeEligibleSeqs(verdicts, { quantile: 0, minCandidates: 4 }).size, 0)
 }
 
 // ---------------------------------------------------------------- 范围选择
@@ -624,6 +669,51 @@ const run = ({ events, cache, cfg, threshold }) => {
   assert.equal(tiny.stats.skippedShort, 1)
 }
 
+// ---------------------------------------------------------------- blockedToolNames 诊断口径
+// issue #7：多调用步骤此前把**所有**调用名都记进 blockedToolNames，通过白名单的也中招——
+// 用户会按 jev_probe_shapes 的提示去"补配"一个本来就在白名单里的名字。
+{
+  const evs = []
+  let seq = 0
+  // 一个 assistant 消息同时带两个 tool-call：read（在白名单）+ pwsh（不在）
+  evs.push({
+    seq: (seq += 1),
+    type: 'assistant/message',
+    data: { message: { content: [
+      { type: 'tool-call', id: 'ca', name: 'read', arguments: '{}' },
+      { type: 'tool-call', id: 'cb', name: 'pwsh', arguments: '{}' },
+    ] } },
+  })
+  evs.push({ seq: (seq += 1), type: 'tool/result', data: { message: { source: { callId: 'ca' }, content: [{ type: 'tool-result', content: [{ type: 'text', text: 'x'.repeat(2000) }] }] } } })
+  evs.push({ seq: (seq += 1), type: 'tool/result', data: { message: { source: { callId: 'cb' }, content: [{ type: 'tool-result', content: [{ type: 'text', text: 'y'.repeat(2000) }] }] } } })
+
+  const at = (s) => evs.find((e) => e.seq === s)
+  const cache = new Map()
+  for (const e of evs) {
+    if (e.type !== 'tool/result') continue
+    cache.set(e.seq, { keep: false, prob: 0.1, effectProb: 0.05, chars: 2000, tool: 'read' })
+  }
+  const { stats } = selectReceiptRanges({
+    surface: evs.map((e) => e.seq),
+    eventAt: at,
+    cache,
+    dropVerdict: () => true,
+    cfg: {
+      preserveRecent: 0,
+      compactTools: ['read', 'glob'],
+      neverCompactTools: DEFAULT_NEVER_COMPACT_TOOLS,
+      evidenceGuard: false,
+      evidencePatterns: DEFAULT_EVIDENCE_PATTERNS,
+      maxStepTextChars: 240,
+      compactMinChars: 100,
+    },
+  })
+  assert.equal(stats.skippedTool, 1)
+  assert.deepEqual(Object.keys(stats.blockedToolNames).sort(), ['pwsh'],
+    `blockedToolNames 只应含真正违规的名字，实际 ${JSON.stringify(stats.blockedToolNames)}`)
+  assert.equal(stats.blockedToolNames.read, undefined, '通过白名单的名字不应被记为 blocked')
+}
+
 // ---------------------------------------------------------------- 回执渲染
 {
   const evs = [
@@ -678,6 +768,21 @@ const run = ({ events, cache, cfg, threshold }) => {
   assert.equal(scanEvidence('all good', ['error', 'fail']).hit, false)
   assert.deepEqual(scanEvidence('failed and error', ['error', 'fail']).matches, ['error', 'fail'])
   assert.equal(scanEvidence('', []).hit, false)
+
+  // 段首匹配（issue #1）：命中必须落在标识符段开头 —— 压掉子串误报、保住真证据
+  assert.equal(scanEvidence('debugging the parser', ['bug']).hit, false, 'bug 不应被 debug 触发')
+  assert.equal(scanEvidence('__debug__', ['bug']).hit, false, '下划线包裹的复合标识符也不该触发')
+  assert.equal(scanEvidence('this.debug = 1', ['bug']).hit, false)
+  assert.equal(scanEvidence('bugs found', ['bug']).hit, true, '复数形式仍是证据')
+  assert.equal(scanEvidence('bugfix applied', ['bug']).hit, true)
+  assert.equal(scanEvidence('errors: 3', ['error']).hit, true, '复数形式仍是证据')
+  assert.equal(scanEvidence('getError()', ['error']).hit, true, '驼峰分界算段首')
+  assert.equal(scanEvidence('myerror', ['error']).hit, false, '无分隔符的复合标识符不算段首')
+  assert.equal(scanEvidence('TODOs left', ['todo']).hit, true)
+  assert.equal(scanEvidence('pseudotodo', ['todo']).hit, false)
+  assert.equal(scanEvidence('default: x', ['fail:']).hit, false, 'fail: 不应被 default: 触发')
+  assert.equal(scanEvidence('stack trace follows', ['stack trace']).hit, true)
+  assert.equal(scanEvidence('mystack trace', ['stack trace']).hit, false)
 
   // 入参渲染只接 tool-call **块**（不是裸 args）—— 契约写在测试里
   assert.equal(renderCallArgs({ arguments: { file_path: 'a/b.ts' } }), 'a/b.ts')
@@ -924,8 +1029,10 @@ const run = ({ events, cache, cfg, threshold }) => {
 {
   const pkg = JSON.parse(readFileSync(join(here, 'package.json'), 'utf8'))
   const declared = new Set([...(pkg.files ?? []), 'package.json'])
-  const srcFiles = [...declared].filter((f) => f.endsWith('.js'))
-  assert.ok(srcFiles.length >= 4, `package.json.files 应声明至少 4 个 js 文件，实际 ${srcFiles.length}`)
+  // issue #13：此前只对 .js 做存在性与 import 检查，package.json.files 里的
+  // 4 个 .mjs 全部漏检（verify_real_shapes.mjs 恰好有真实的相对 import）
+  const srcFiles = [...declared].filter((f) => f.endsWith('.js') || f.endsWith('.mjs'))
+  assert.ok(srcFiles.length >= 8, `package.json.files 应声明至少 8 个源文件，实际 ${srcFiles.length}`)
   for (const file of srcFiles) {
     assert.ok(existsSync(join(here, file)), `package.json.files 声明了 ${file} 但它不存在`)
   }
@@ -941,8 +1048,10 @@ const run = ({ events, cache, cfg, threshold }) => {
 
   // 不在 files 里（不随包分发）但必须存在于仓库的脚本，也要检查其相对 import 能落地。
   // 这类文件是"忘了同步"的高发区：改了源码文件名却忘了改脚本的 import。
-  for (const file of ['smoke_apply.mjs', 'check.js', 'wire_profile.mjs', 'probe_effect.js', 'e2e_jev.js']) {
-    if (!existsSync(join(here, file))) continue
+  // issue #13：名单里曾有 probe_effect.js / e2e_jev.js —— 从未存在过，静默 continue
+  // 让这道存在性检查永远空转；现改为缺失即断言失败，并补上真正存在的两个工具。
+  for (const file of ['smoke_apply.mjs', 'check.js', 'wire_profile.mjs', 'inspect_session.mjs', 'verify_real_shapes.mjs']) {
+    assert.ok(existsSync(join(here, file)), `辅助脚本 ${file} 必须存在于仓库（若已改名请同步这份名单）`)
     const text = readFileSync(join(here, file), 'utf8')
     for (const m of text.matchAll(/from\s+'\.\/([^']+)'/g)) {
       assert.ok(existsSync(join(here, m[1])), `${file} 里 ./${m[1]} 指向不存在的文件`)

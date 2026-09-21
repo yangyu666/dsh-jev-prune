@@ -11,7 +11,7 @@
  *   "Unknown frame descriptor"）。所以这里自己按 zstd 帧格式切帧后逐帧解压。
  *
  * 用法：
- *   node inspect_session.mjs <会话目录 | session.v3.jsonl.zstd> [--dump-blocks]
+ *   node inspect_session.mjs <会话目录 | session.v3.jsonl.zstd>
  */
 
 import { readFileSync, readdirSync, statSync } from 'node:fs'
@@ -130,7 +130,10 @@ function blocksOf(event) {
 // ---------------------------------------------------------------- CLI
 
 const isMain = process.argv[1] != null && import.meta.url.endsWith(process.argv[1].replace(/\\/g, '/').split('/').pop())
-if (isMain || process.argv[2] != null) {
+// issue #10：CLI 触发条件此前是 `isMain || process.argv[2] != null`——任何 importer
+// 只要命令行带了第二个参数（例如 verify_real_shapes.mjs 的正常用法），import 求值时
+// 就会替它跑 CLI、把进程带崩。CLI 入口只留给直接执行本文件的场景。
+if (isMain) {
   const target = process.argv[2]
   if (target == null) {
     console.error('用法: node inspect_session.mjs <会话目录 | session.v3.jsonl.zstd>')
@@ -138,7 +141,12 @@ if (isMain || process.argv[2] != null) {
   }
   const { file, header, events } = readSessionEvents(target)
   console.log(`文件: ${file}`)
-  if (header != null) console.log(`会话: ${header.id}  cwd=${header.cwd}  ${new Date(header.createdAt).toISOString()}`)
+  // issue #11：createdAt 缺失/非法时此前直接 RangeError 整个工具退出——
+  // 而取证工具存在的意义恰恰是查"日志为什么不对"，头部字段缺失是常见病因
+  const createdAt = header?.createdAt != null && Number.isFinite(new Date(header.createdAt).getTime())
+    ? new Date(header.createdAt).toISOString()
+    : 'unknown'
+  if (header != null) console.log(`会话: ${header.id}  cwd=${header.cwd}  ${createdAt}`)
   console.log(`事件数: ${events.length}\n`)
 
   const byType = {}
