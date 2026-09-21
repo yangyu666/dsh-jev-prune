@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # 快速冒烟：只装两个静态 peer 依赖（几秒），跑全部纯函数自检 + 假 ctx 冒烟测试
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install peer dependencies
+        run: npm install --no-audit --no-fund
+      - name: Make plugin resolvable as its package name
+        run: |
+          mkdir -p node_modules/dsh-jev-prune
+          cp index.js jev.js state.js prune.js receipt.js package.json cordis.patch.yml node_modules/dsh-jev-prune/
+      - name: Pure-function checks
+        run: node check.js
+      - name: Smoke test (fake ctx, real apply)
+        run: node smoke_apply.mjs
+
+  # 集成：装完整 DSH 依赖树，确认在真实宿主依赖环境下测试仍然全过
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install full DSH dependency tree
+        run: |
+          npm install --no-audit --no-fund
+          npm install --no-save --no-audit --no-fund @deepseek-ai/dsh
+      - name: Make plugin resolvable as its package name
+        run: |
+          mkdir -p node_modules/dsh-jev-prune
+          cp index.js jev.js state.js prune.js receipt.js package.json cordis.patch.yml node_modules/dsh-jev-prune/
+      - name: Checks against real DSH tree
+        run: |
+          node check.js
+          node smoke_apply.mjs

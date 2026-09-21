@@ -1,0 +1,68 @@
+{
+  "name": "dsh-jev-prune",
+  "version": "0.1.0",
+  "description": "Jev-judged context compaction for DeepSeek Harness. Two layers: prune stale tool results (semantic instead of size-only), and replace spent tool-call ranges with a deterministic receipt instead of a model-written summary.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./*.js": "./*.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "jev.js",
+    "state.js",
+    "prune.js",
+    "receipt.js",
+    "check.js",
+    "smoke_apply.mjs",
+    "wire_profile.mjs",
+    "inspect_session.mjs",
+    "verify_real_shapes.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "check": "node check.js"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/schemastery": "*"
+  },
+  "license": "MIT",
+  "author": {
+    "name": "yangyu666"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yangyu666/dsh-jev-prune.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yangyu666/dsh-jev-prune/issues"
+  },
+  "homepage": "https://github.com/yangyu666/dsh-jev-prune#readme",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "compaction",
+    "context",
+    "jev",
+    "typesafe"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "compatibility": {
+      "testedAgainst": "@deepseek-ai/dsh@0.1.5-rc.2",
+      "note": "DSH 0.1.x is a pre-release line; plugin-facing surfaces (event shapes, service names) may change between rc versions. After upgrading DSH, run `node check.js` and the smoke test, and use the `jev_probe_shapes` tool once in a real session."
+    }
+  }
+}
