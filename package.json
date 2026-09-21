@@ -21,7 +21,9 @@
     "inspect_session.mjs",
     "verify_real_shapes.mjs",
     "cordis.patch.yml",
+    "assets",
     "README.md",
+    "README_zh.md",
     "LICENSE"
   ],
   "engines": {
