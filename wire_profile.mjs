@@ -18,7 +18,7 @@
  *   node wire_profile.mjs ~/.dsh web --plugin /path/to/dsh-jev-prune
  */
 
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -114,9 +114,14 @@ const targets = [
 for (const pluginDest of targets) {
   mkdirSync(pluginDest, { recursive: true })
   for (const file of files) {
-    copyFileSync(join(pluginSrc, file), join(pluginDest, file))
+    // files 里可能有目录条目（如 assets/）——目录用递归拷贝，文件用 copyFileSync
+    if (statSync(join(pluginSrc, file)).isDirectory()) {
+      cpSync(join(pluginSrc, file), join(pluginDest, file), { recursive: true })
+    } else {
+      copyFileSync(join(pluginSrc, file), join(pluginDest, file))
+    }
   }
-  console.log(`  已落包 ${pluginDest}（${files.length} 个文件）`)
+  console.log(`  已落包 ${pluginDest}（${files.length} 个条目）`)
 }
 console.log(`✅ 插件已复制到 ${targets.length} 个候选解析位置`)
 
