@@ -13,7 +13,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { estimateTokens } from './jev.js'
-import { countChars, parseLimit, pressureLevel, pruneSessionWithJev, sliceWithBudget } from './prune.js'
+import { countChars, decideAction, parseLimit, pressureLevel, pruneSessionWithJev, sliceWithBudget } from './prune.js'
 import {
   DEFAULT_COMPACT_TOOLS,
   DEFAULT_EVIDENCE_PATTERNS,
@@ -391,6 +391,36 @@ const run = ({ events, cache, cfg, threshold }) => {
     cfg: { neverPruneTools: ['Bash'] }, // toolNameOf 固定返回 Bash
   })
   assert.equal(out.pruned.length, 0, 'neverPruneTools 里的工具不该被裁')
+}
+
+// ⑤b 外部审查回归：第一层黑名单必须**归一化**比较。
+// 真实 DSH 的改写类工具名是小写 edit/write，而默认黑名单历史上是 PascalCase ——
+// 字面 includes 永远不命中，"改写类永不裁剪"的承诺在第一层静默失效。
+{
+  const base = { inTail: false, verdict: { keep: false, prob: 0.05 }, charsBefore: 5000, minCharsToPrune: 400 }
+  const pascal = ['Edit', 'Write', 'MultiEdit', 'ApplyPatch']
+  assert.equal(decideAction({ ...base, tool: 'edit', neverPruneTools: pascal }), 'keep', '小写 edit 要命中 Edit')
+  assert.equal(decideAction({ ...base, tool: 'write', neverPruneTools: pascal }), 'keep', '小写 write 要命中 Write')
+  assert.equal(decideAction({ ...base, tool: 'multi_edit', neverPruneTools: pascal }), 'keep', 'multi_edit 要命中 MultiEdit')
+  assert.equal(decideAction({ ...base, tool: 'apply_patch', neverPruneTools: pascal }), 'keep', 'apply_patch 要命中 ApplyPatch')
+  assert.equal(decideAction({ ...base, tool: 'str_replace_editor', neverPruneTools: DEFAULT_NEVER_COMPACT_TOOLS }), 'keep')
+  // 反事实：只读工具不受黑名单保护，正常进入后续裁决分支
+  assert.equal(decideAction({ ...base, tool: 'read', neverPruneTools: pascal }), 'prune', 'read 不在黑名单里，Jev 说过期就裁')
+
+  // 整链验证：toolNameOf 解析出小写 edit + PascalCase 黑名单 → 整条管线不碰它
+  const events = [resultEvent(15, 'c6', 'f'.repeat(5000))]
+  const session = fakeSession(events)
+  const pruner = fakePruner(999999)
+  const stats = freshStats()
+  const out = pruneSessionWithJev({
+    pruner, session, cache: new Map([[15, { keep: false, prob: 0.05 }]]),
+    cfg: { ...baseCfg, neverPruneTools: pascal },
+    stats, freeze: (m) => m,
+    toolNameOf: () => 'edit',
+    callIdOf: (e) => e.data.message.source.callId,
+  })
+  assert.equal(out.pruned.length, 0, '整条管线：小写 edit 不被裁')
+  assert.equal(session.appended.length, 0)
 }
 
 // ⑥ Jev 说过期但太短 → 不裁（省不到东西还丢信息）

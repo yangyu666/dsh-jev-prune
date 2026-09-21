@@ -27,28 +27,14 @@
  * 是为了**在花钱之前**就把非法范围筛掉，而不是等 API 报错。
  */
 
-import { countChars } from './prune.js'
+import { countChars, isToolIn, normalizeToolName } from './prune.js'
+
+// 归一化工具在 prune.js（依赖链最底层）——两层的安全黑名单共用同一套比较。
+// 这里转出以保持既有 import 路径（check.js / 调用方）不变。
+export { isToolIn, normalizeToolName }
 
 /** 回执文本的识别前缀（用于判断某个 checkpoint 是不是我们写的）。 */
 export const RECEIPT_MARKER = '[已压缩 · 确定性回执]'
-
-/**
- * 工具名归一化：小写 + 去掉下划线与连字符。
- *
- * 为什么必须做归一化：各宿主的工具命名风格差得很远 —— 实测真实 DSH 里是
- * **`pwsh` / `read` / `glob`**（全小写，shell 叫 pwsh），而 Claude Code 风格是
- * `Read` / `Bash` / `MultiEdit`。按字面比较会让**黑名单失效**（本该拦住 `edit` 却因为写的是 `Edit` 而放过），
- * 也会让**白名单永不命中**。归一化后 `Edit`/`edit`、`MultiEdit`/`multi_edit`、`ApplyPatch`/`apply_patch` 都等价。
- */
-export function normalizeToolName(name) {
-  return String(name ?? '').trim().toLowerCase().replace(/[_-]/g, '')
-}
-
-export function isToolIn(list, name) {
-  const needle = normalizeToolName(name)
-  if (needle.length === 0) return false
-  return (list ?? []).some((item) => normalizeToolName(item) === needle)
-}
 
 /**
  * 真实 DSH 只读探查类工具名（**取证得到，不是猜的**：解压会话日志读到的是 `read` / `glob` / `grep`）。

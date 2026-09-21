@@ -24,6 +24,26 @@ export function countChars(blocks) {
 }
 
 /**
+ * 工具名归一化：小写 + 去掉下划线与连字符。
+ *
+ * 为什么放在 prune.js（依赖链的最底层）：**两层的安全黑名单都必须用它**。
+ * 外部审查抓到的真 bug：第一层 `neverPruneTools.includes(tool)` 是字面比较，
+ * 默认值是 PascalCase（'Edit'），而真实 DSH 的工具名是全小写（edit/write）——
+ * 结果"改写类永不裁剪"这条承诺在第一层静默失效（第二层修了，第一层漏了）。
+ * 归一化后 'Edit'/'edit'、'MultiEdit'/'multi_edit'、'ApplyPatch'/'apply_patch' 都等价。
+ */
+export function normalizeToolName(name) {
+  return String(name ?? '').trim().toLowerCase().replace(/[_-]/g, '')
+}
+
+/** 名字是否在列表里（归一化比较；空名单/空名字一律 false）。 */
+export function isToolIn(list, name) {
+  const needle = normalizeToolName(name)
+  if (needle.length === 0) return false
+  return (list ?? []).some((item) => normalizeToolName(item) === needle)
+}
+
+/**
  * 把 blocks 的中间挖掉，保留头 headChars 与尾 tailChars，中间插入 marker。
  *
  * @param {Array} blocks 内容块数组
@@ -105,7 +125,9 @@ export function pressureLevel(used, minTokens, maxTokens) {
  */
 export function decideAction({ inTail, tool, neverPruneTools, verdict, charsBefore, minCharsToPrune }) {
   if (inTail) return 'keep'
-  if (neverPruneTools.includes(tool)) return 'keep'
+  // 归一化比较（外部审查回归）：真实 DSH 的工具名是小写 edit/write，
+  // 字面 includes 对 PascalCase 黑名单永远不命中 → "改写类永不裁剪"静默失效
+  if (isToolIn(neverPruneTools, tool)) return 'keep'
   if (verdict == null) return 'fallback'
   if (verdict.keep) return 'keep'
   if (charsBefore < minCharsToPrune) return 'keep'

@@ -25,7 +25,10 @@
  * @module dsh-jev-prune
  */
 
-import { writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -57,6 +60,47 @@ import {
   sessionEvents,
   toolNameOf,
 } from './state.js'
+
+// ---------------------------------------------------------------- 宿主版本探测
+/**
+ * 探测宿主 DSH 的版本号。
+ *
+ * 为什么要有这个：package.json 里写明了 testedAgainst 0.1.5-rc.2，而 DSH 0.1.x 是
+ * 预发布线，事件形状与服务名在 rc 之间会漂移——这是本插件最大的结构性风险。
+ * 靠"人肉记得升级后重跑测试"不可靠，所以在加载时把版本读出来：
+ *   · 记进心跳与状态（可观测）
+ *   · major.minor 与测试版本不一致时打一次 warning（不拒绝加载——也许只是字段没变）
+ */
+const TESTED_DSH_VERSION = '0.1.5-rc.2'
+const TESTED_DSH_SERIES = '0.1'
+
+function detectDshVersion() {
+  const readVersionAt = (path) => {
+    try {
+      return JSON.parse(readFileSync(path, 'utf8'))?.version ?? 'unknown'
+    } catch {
+      return null
+    }
+  }
+  // 路径 ①：走 require.resolve（尊重 exports map）
+  try {
+    const require = createRequire(import.meta.url)
+    const found = readVersionAt(require.resolve('@deepseek-ai/dsh/package.json'))
+    if (found != null) return found
+  } catch { /* exports 没暴露 package.json 时走路径 ② */ }
+  // 路径 ②：插件通常与宿主包同级安装（<prefix>/node_modules/ 下）
+  try {
+    const here = dirname(fileURLToPath(import.meta.url))
+    const found = readVersionAt(join(here, '..', '@deepseek-ai', 'dsh', 'package.json'))
+    if (found != null) return found
+  } catch { /* 都找不到就如实报 unknown */ }
+  return 'unknown'
+}
+
+const dshVersion = detectDshVersion()
+const dshVersionMatches = dshVersion === 'unknown'
+  ? null // 探测不到 ≠ 不匹配，不吓唬人，只如实上报
+  : dshVersion.split('.').slice(0, 2).join('.') === TESTED_DSH_SERIES
 
 /**
  * `freezeMessage` 来自 @deepseek-ai/dsh-llm。用**动态导入**而不是静态导入：
@@ -127,7 +171,9 @@ export const Config = z.object({
   /** state 历史最少保留的行数（避免为了塞进预算把上下文丢空） */
   minHistoryLines: z.number().default(8),
   /** 结果永不裁剪的工具 */
-  neverPruneTools: z.array(z.string()).default(['Edit', 'Write', 'MultiEdit', 'ApplyPatch']),
+  // 两层用同一份黑名单（含 str_replace_editor 等别名）；比较在 decideAction 里归一化，
+  // 所以这里写 PascalCase 或小写都等价——外部审查回归后与第二层统一
+  neverPruneTools: z.array(z.string()).default(DEFAULT_NEVER_COMPACT_TOOLS),
 
   // ---------------------------------------------------------------- 第二层：回执压缩
   /** 第二层总开关 */
@@ -202,7 +248,7 @@ export function resolveConfig(config = {}) {
     minCharsToPrune: config.minCharsToPrune ?? 400,
     judgeOn: config.judgeOn ?? 'pressure',
     softLimit: config.softLimit ?? '55%',
-    neverPruneTools: config.neverPruneTools ?? ['Edit', 'Write', 'MultiEdit', 'ApplyPatch'],
+    neverPruneTools: config.neverPruneTools ?? DEFAULT_NEVER_COMPACT_TOOLS,
     compactReceipts: config.compactReceipts ?? true,
     compactOn: config.compactOn ?? 'pressure',
     compactSoftLimit: config.compactSoftLimit ?? '70%',
@@ -240,6 +286,10 @@ export function resolveConfig(config = {}) {
 export function apply(ctx, config, deps = {}) {
   const cfg = resolveConfig(config)
   if (!cfg.enabled) return
+
+  if (dshVersionMatches === false) {
+    ctx.logger?.info?.(`[jev-prune] DSH ${dshVersion} 与测试版本 ${TESTED_DSH_VERSION} 不同系列 —— 事件字段可能已漂移，建议先跑 jev_probe_shapes 核对`)
+  }
 
   void loadFreeze() // 异步取 freezeMessage，失败就退化成浅拷贝
 
@@ -337,6 +387,7 @@ export function apply(ctx, config, deps = {}) {
         bootedAt,
         now: new Date().toISOString(),
         pid: typeof process !== 'undefined' ? process.pid : null,
+        dshVersion: { version: dshVersion, testedAgainst: TESTED_DSH_VERSION, matchesTested: dshVersionMatches },
         judgeReady: judge.ready !== false,
         model: cfg.model,
         keepThreshold: cfg.keepThreshold,
@@ -842,6 +893,10 @@ export function apply(ctx, config, deps = {}) {
       : { indexSize: 0, resolved: 0, unresolved: 0, names: [] }
     const lines = [
       `jev-prune  usage: ${used} tokens   model=${cfg.model}   ready=${judge.ready !== false}`,
+      `DSH 版本: ${dshVersion}（针对 ${TESTED_DSH_VERSION} 测试）`
+        + (dshVersionMatches === false
+          ? '  ⚠️ 版本系列不匹配——事件字段可能已变，请先跑一次 jev_probe_shapes 核对'
+          : ''),
       `第一层 阈值 keep≥${cfg.keepThreshold}   preserveRecent=${cfg.preserveRecent}   minChars=${cfg.minCharsToPrune}`,
       `第一层：判定 ${stats.judged} 次 / 请求 ${stats.requests} 次   Jev 保留 ${stats.keptByJev} / Jev 裁掉 ${stats.prunedByJev} / 按体积兜底裁 ${stats.prunedByVolume}`,
       `第一层：累计省下 ${stats.savedChars} 字符   压力门控跳过 ${stats.skipped} 次   错误 ${stats.errors} 次`,
