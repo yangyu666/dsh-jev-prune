@@ -44,11 +44,13 @@ Moving a whole pair out of the surface is destructive, so the default is deliber
 - **Intersection of two axes**: `result` (is the content still needed) and `effect` (did the call change state outside the session) must *each* fall inside this session's trailing `compactQuantile`
 - The tool is not in `neverCompactTools` (write-type calls are excluded by a hard rule, never by a probability)
 - **Evidence guard**: results matching `error` / `assert` / `fail` / `todo` and friends are never moved out (layer 1 may still trim them)
-- Steps whose assistant text (including `reasoning`) exceeds `maxStepTextChars` are never moved out — that step is reasoning
+- Steps whose assistant **text** exceeds `maxStepTextChars`, or whose **`reasoning`** exceeds `maxStepReasoningChars`, are never moved out. The two are measured separately on purpose: long `text` means the step is delivering a conclusion worth keeping, while long `reasoning` is just scratch work — merging them into one budget let reasoning length alone silently shut layer 2 off
 - Anything within the most recent `preserveRecent` nodes is skipped
 - Both ends of the range must satisfy DSH's tool-pairing balance; the span must save at least `compactMinChars` characters; and the receipt must stay below `receiptMaxRatio` of the original content's tokens
 
 Probabilities are consumed as **relative quantiles**, never as a fixed threshold: the output distribution of a small judge model is narrow, and only the relative ordering *within one session* carries stable information.
+
+**Degradation on small populations.** Read-only tools are often a minority in write/execute-heavy sessions (measured: 1 in 6), which can leave a quantile population of only two or three items — too few for ordering to mean anything. Rather than giving up, the mode degrades to an **absolute floor**: both axes must fall below `floorThreshold` (default `0.2`, materially stricter than `compactThreshold`, compensating for the missing relative information). If the population is below `minCandidatesForFloor` (default `3`), nothing is moved out — one or two samples are not a distribution. Degradation is always reported in the report and the heartbeat; it never happens silently.
 
 ## Requirements
 
@@ -92,12 +94,33 @@ node wire_profile.mjs <DSH_HOME> <profile-name>
 | `compactReceipts` / `compactOn` | `true` / `pressure` | Layer 2: switch and pressure line (`compactSoftLimit`, default 70%) |
 | `compactMode` | `relative` | `relative` (recommended) or `absolute` (with `compactThreshold`) |
 | `compactQuantile` | `0.34` | The trailing fraction taken on each of the two axes; the intersection is used |
+| `minCandidatesForRelative` | `4` | Minimum population for relative quantiles; below it the mode **degrades** to an absolute floor (see below) rather than giving up |
+| `floorThreshold` / `minCandidatesForFloor` | `0.2` / `3` | Absolute floor used in the degraded mode (materially stricter than `compactThreshold`) and its minimum sample size |
 | `neverCompactTools` | write-type tools | Never moved out; comparison is normalized (`Edit` ≡ `edit`) |
 | `compactTools` | read-only set | Allow-list, **non-empty by default** (`DSH_READONLY_TOOLS`: `read`/`glob`/`grep`/`list`/`fetch`… plus PowerShell read-only cmdlets such as `getchilditem`/`selectstring`). Setting it to `[]` relaxes the gate to the deny-list only — shell calls then become movable too, which is an explicit opt-in into an unsafe mode |
 | `evidenceGuard` / `evidencePatterns` | `true` / built-in list | Evidence guard |
 | `compactMinChars` / `receiptMaxRatio` | `2000` / `0.5` | Layer 2 economical floors |
 | `dryRun` | `false` | Both layers only judge and account; nothing is changed |
 | `heartbeatFile` | `''` | Where to persist state (the host swallows plugin logs, so a file is the only external observation channel) |
+
+### Out-of-range configuration
+
+Every numeric option has a valid range, and out-of-range values are **never** passed through to the runtime:
+
+- **Through the `Config` schema** (the host's normal load path) → a `ValidationError` is thrown. A loud refusal.
+- **Without schema normalization** (a config object injected directly by `cordis.patch.yml`, or the `PLUGIN_CFG` built by the smoke test) → `resolveConfig` falls the value back to its **default** (not to the nearest bound, because "how far off was it" isn't interpretable), and records a `configWarnings` entry in the status report and heartbeat.
+
+These are the real consequences, all of which used to happen **silently**:
+
+| Setting | Behavior before the fix |
+|---|---|
+| `preserveRecent = -5` | `lastAllowed` grew instead of shrinking → **recent-node protection completely defeated** (in-flight tool calls could be touched) |
+| `maxStepTextChars = -1` | every step judged "text too long" → **layer 2 permanently and silently dead** |
+| `compactMinChars = -100` | the gate ceased to exist |
+| `receiptMaxRatio = 5` | a receipt 5× larger than the original was allowed through (safety gate defeated) |
+| `keepThreshold = 2` | layer 1 pruned everything (`prob >= 2` is never true) |
+
+Note that `0` is a **legal** value for most keys (`headChars = 0` keeps no head; `preserveRecent = 0` protects nothing) — it is not treated as "unset".
 
 ## In-session usage
 

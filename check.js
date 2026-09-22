@@ -17,6 +17,8 @@ import { countChars, decideAction, parseLimit, pruneSessionWithJev, sliceWithBud
 import {
   DEFAULT_COMPACT_TOOLS,
   DEFAULT_EVIDENCE_PATTERNS,
+  DEFAULT_FLOOR_THRESHOLD,
+  DEFAULT_MIN_CANDIDATES_FOR_RELATIVE,
   DEFAULT_NEVER_COMPACT_TOOLS,
   DSH_READONLY_TOOLS,
   RECEIPT_MARKER,
@@ -44,7 +46,13 @@ import {
   sessionEvents,
   toolNameOf,
 } from './state.js'
-import { Config, isCompactableTool, resolveConfig } from './index.js'
+import {
+  CONFIG_WARNINGS,
+  Config,
+  clampConfigNumber,
+  isCompactableTool,
+  resolveConfig,
+} from './index.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -549,8 +557,11 @@ const run = ({ events, cache, cfg, threshold }) => {
   const strict = computeEligibleSeqs(verdicts, { quantile: 0.34, minCandidates: 4 })
   assert.deepEqual([...strict], [10], '必须取交集：只在 result 尾部(14)或只在 effect 尾部(12)的都不算')
 
-  // 样本量不足时宁可不做（小样本上排序没有意义）
-  assert.equal(computeEligibleSeqs(verdicts.slice(0, 2), { quantile: 0.5, minCandidates: 4 }).size, 0)
+  // 小总体分支（issue #27 修复）：此前样本不足**直接返回空集** → 第二层在只读占比低的
+  // 会话里静默不工作。现在改为降级到绝对下限模式，但下限阈值明显更严（0.2）。
+  // 这里样本=2（三条里取两条），低于 minCandidatesForFloor(3) → 仍然不做。
+  assert.equal(computeEligibleSeqs(verdicts.slice(0, 2), { quantile: 0.5, minCandidates: 4 }).size, 0,
+    '样本低于 minCandidatesForFloor 时仍不得做整对移出（1~2 条谈不上分布）')
 
   // 缺任何一轴的概率都不参与
   assert.equal(computeEligibleSeqs(
@@ -605,6 +616,7 @@ const run = ({ events, cache, cfg, threshold }) => {
     evidenceGuard: true,
     evidencePatterns: DEFAULT_EVIDENCE_PATTERNS,
     maxStepTextChars: 240,
+    maxStepReasoningChars: 240,
     compactMinChars: 1000,
   }
   const run = (overrides = {}, cacheOverride) => selectReceiptRanges({
@@ -650,11 +662,12 @@ const run = ({ events, cache, cfg, threshold }) => {
   assert.equal(tailSafe.ranges.length, 0)
   assert.ok(tailSafe.stats.skippedTail > 0)
 
-  // 6) 推理文本过长 → 整步排除
+  // 6) assistant 可见文本过长 → 整步排除（text 轴）
   const chatty = at(range.start)
   chatty.data.message.content[0].text = '先想一下'.repeat(100)
   const chattyRun = run()
-  assert.equal(chattyRun.stats.skippedText, 1, '长推理文本的步骤不应被整对移出')
+  assert.equal(chattyRun.stats.skippedText, 1, '过长的可见文本不应被整对移出')
+  assert.equal(chattyRun.stats.skippedReasoning, 0, 'text 轴拦截不得计入 reasoning 轴计数')
   chatty.data.message.content[0].text = '继续'
 
   // 7) 判定说"不可丢" → 排除
@@ -706,6 +719,7 @@ const run = ({ events, cache, cfg, threshold }) => {
       evidenceGuard: false,
       evidencePatterns: DEFAULT_EVIDENCE_PATTERNS,
       maxStepTextChars: 240,
+      maxStepReasoningChars: 240,
       compactMinChars: 100,
     },
   })
@@ -741,6 +755,7 @@ const run = ({ events, cache, cfg, threshold }) => {
       evidenceGuard: true,
       evidencePatterns: DEFAULT_EVIDENCE_PATTERNS,
       maxStepTextChars: 240,
+      maxStepReasoningChars: 240,
       compactMinChars: 100,
     },
   })
@@ -906,6 +921,7 @@ const run = ({ events, cache, cfg, threshold }) => {
       evidenceGuard: true,
       evidencePatterns: DEFAULT_EVIDENCE_PATTERNS,
       maxStepTextChars: 240,
+      maxStepReasoningChars: 240,
       compactMinChars: 100,
     },
   })
@@ -915,7 +931,8 @@ const run = ({ events, cache, cfg, threshold }) => {
   assert.equal(stats.skippedTool, 1, 'edit 应被黑名单拦下（归一化后比较）')
   assert.deepEqual(stats.blockedToolNames, { edit: 1 }, '必须如实记下被拦下的名字')
   assert.deepEqual(stats.allowedToolNames, { pwsh: 1, read: 1 }, '通过的名字也要记，便于自查')
-  assert.equal(stats.skippedText, 1, 'reasoning 块的长文本必须计入推理门控（只数 text 会让门控形同虚设）')
+  assert.equal(stats.skippedReasoning, 1, '长 reasoning 必须计入 reasoning 轴门控（只数 text 会让门控形同虚设）')
+  assert.equal(stats.skippedText, 0, 'reasoning 轴拦截不得计入 text 轴计数')
 
   // 同一份数据，配上白名单 → 只允许 read（pwsh 被拦）
   const allow = selectReceiptRanges({
@@ -930,14 +947,15 @@ const run = ({ events, cache, cfg, threshold }) => {
       evidenceGuard: true,
       evidencePatterns: DEFAULT_EVIDENCE_PATTERNS,
       maxStepTextChars: 240,
+      maxStepReasoningChars: 240,
       compactMinChars: 100,
     },
   })
   assert.equal(allow.ranges.length, 1, '只允许 read → 剩短文本那一读'
-    + '（另一条 read 带长 reasoning，被推理门控拦下）')
+    + '（另一条 read 带长 reasoning，被 reasoning 轴门控拦下）')
   assert.equal(allow.ranges[0].steps.length, 1)
   assert.equal(allow.ranges[0].steps[0].calls[0].name, 'read')
-  assert.equal(allow.stats.skippedText, 1, '长 reasoning 的那条 read 必须被拦下')
+  assert.equal(allow.stats.skippedReasoning, 1, '长 reasoning 的那条 read 必须被拦下')
   assert.equal(allow.stats.skippedTool, 2, 'pwsh 与 edit 都被工具门拦下')
   assert.deepEqual(allow.stats.blockedToolNames, { pwsh: 1, edit: 1 })
 }
@@ -971,6 +989,7 @@ const run = ({ events, cache, cfg, threshold }) => {
     evidenceGuard: true,
     evidencePatterns: DEFAULT_EVIDENCE_PATTERNS,
     maxStepTextChars: 240,
+    maxStepReasoningChars: 240,
     compactMinChars: 100,
   })
   const runCase = (compactTools) => selectReceiptRanges({
@@ -1094,6 +1113,64 @@ const run = ({ events, cache, cfg, threshold }) => {
     '不过滤时仍会给出（无用的）尾部——这正是需要过滤的原因')
 }
 
+// ---------------------------------------------------------------- 小总体降级（issue #27 回归）
+
+{
+  // 修复前：`usable.length < minCandidates` 一律返回空集。后果是**只读工具在写/执行
+  // 密集会话里占少数时，第二层在绝大多数真实会话中静默不工作**，而报错只说
+  // "需要 ≥4 个"，读起来像"样本确实不够"而不像 bug。这个块把降级行为钉成断言。
+  const near = [
+    { seq: 1, prob: 0.10, effectProb: 0.05 }, // 两轴都远低于 0.2 → 该选中
+    { seq: 2, prob: 0.30, effectProb: 0.10 }, // effect 低但 prob 不够低 → 单轴尾部，不该选
+    { seq: 3, prob: 0.50, effectProb: 0.45 }, // 两轴都高 → 不该选
+  ]
+  const notes = []
+  const small = computeEligibleSeqs(near, {
+    quantile: 0.34, minCandidates: 4, minCandidatesForAbsolute: 3, floorThreshold: 0.2,
+    onNote: (n) => notes.push(n),
+  })
+  assert.deepEqual([...small], [1],
+    '总体=3 (<4) 时不得直接放弃，应降级为绝对下限：仅两轴同时 <0.2 的入选')
+  assert.equal(notes.length, 1, '降级必须发出说明（否则用户又分不清"样本不够"和"功能坏了"）')
+  assert.ok(/降级为绝对下限/.test(notes[0]), `说明文案应点明降级：${notes[0]}`)
+
+  // 绝对下限比 compactThreshold(0.5) 严：0.3/0.3 在 absolute 模式下会被选中，
+  // 但在小总体的降级模式下必须被拒（没有相对信息时只能用"更保守"来补偿）
+  const mid = [
+    { seq: 4, prob: 0.30, effectProb: 0.30 },
+    { seq: 5, prob: 0.31, effectProb: 0.32 },
+    { seq: 6, prob: 0.33, effectProb: 0.33 },
+  ]
+  assert.equal(computeEligibleSeqs(mid, {
+    quantile: 0.34, minCandidates: 4, minCandidatesForAbsolute: 3, floorThreshold: 0.2,
+  }).size, 0, '降级模式的阈值必须明显严于 compactThreshold，两轴 0.3 不该被放行')
+
+  // 样本连最低线都不到 → 仍然不做，且说明里点出原因
+  const tinyNotes = []
+  assert.equal(computeEligibleSeqs(near.slice(0, 2), {
+    quantile: 0.34, minCandidates: 4, minCandidatesForAbsolute: 3,
+    onNote: (n) => tinyNotes.push(n),
+  }).size, 0)
+  assert.ok(/低于绝对下限模式的最低样本/.test(tinyNotes[0] ?? ''), `应说明样本过少：${tinyNotes[0]}`)
+
+  // 总体达标时**不得**触发降级分支（口径不能被悄悄改掉）
+  const bigNotes = []
+  const big = computeEligibleSeqs(verdicts6(), {
+    quantile: 0.5, minCandidates: 4, minCandidatesForAbsolute: 3,
+    onNote: (n) => bigNotes.push(n),
+  })
+  assert.equal(bigNotes.length, 0, '总体达标时必须走正常的相对分位路径，不得降级')
+  assert.ok(big.size > 0, '正常路径仍应给出结果')
+
+  function verdicts6() {
+    return [
+      { seq: 10, prob: 0.10, effectProb: 0.05 }, { seq: 12, prob: 0.12, effectProb: 0.06 },
+      { seq: 14, prob: 0.11, effectProb: 0.07 }, { seq: 20, prob: 0.13, effectProb: 0.30 },
+      { seq: 22, prob: 0.14, effectProb: 0.33 }, { seq: 24, prob: 0.15, effectProb: 0.28 },
+    ]
+  }
+}
+
 // ---------------------------------------------------------------- 判定值的有效性（外部审查）
 
 {
@@ -1114,6 +1191,74 @@ const run = ({ events, cache, cfg, threshold }) => {
     'undefined/null 判定值同样不得入选')
 }
 
+// ---------------------------------------------------------------- 文本门控两轴分离（issue #26 回归）
+
+{
+  // 修复前：assistantTextChars = text + reasoning 累加，与单一阈值 maxStepTextChars 比较。
+  // 后果：reasoning 的分布（实测 0~1207，且会溢出到数千）完全主导阈值，只要模型多写几句
+  // 草稿，第二层就在没有任何日志的情况下整层失效。这个块把"两轴独立"钉成断言。
+  const evs = []
+  let seq = 0
+  const addStep = (tool, text, reasoning) => {
+    const callId = `t${seq + 1}`
+    const content = [{ type: 'tool-call', id: callId, name: tool, arguments: {} }]
+    if (text != null) content.unshift({ type: 'text', text })
+    if (reasoning != null) content.unshift({ type: 'reasoning', text: reasoning })
+    evs.push({ seq: (seq += 1), type: 'assistant/message', data: { message: { content } } })
+    evs.push({
+      seq: (seq += 1),
+      type: 'tool/result',
+      data: { message: { source: { callId }, content: [{ type: 'tool-result', content: [{ type: 'text', text: 'z'.repeat(3000) }] }] } },
+    })
+  }
+  evs.push({ seq: (seq += 1), type: 'user/message', data: { content: [{ type: 'text', text: 'go' }] } })
+  addStep('read', '看一下。', '想'.repeat(1300)) // 长 reasoning、短 text ← 修复前的"整层关闭"元凶
+  const at2 = (s) => evs.find((e) => e.seq === s)
+  const cache2 = new Map()
+  for (const e of evs) if (e.type === 'tool/result') cache2.set(e.seq, { keep: false, prob: 0.1, effectProb: 0.05, chars: 3000 })
+  const run2 = (over) => selectReceiptRanges({
+    surface: evs.map((e) => e.seq),
+    eventAt: at2,
+    cache: cache2,
+    dropVerdict: () => true,
+    cfg: {
+      preserveRecent: 0,
+      compactTools: [],
+      neverCompactTools: DEFAULT_NEVER_COMPACT_TOOLS,
+      evidenceGuard: false,
+      evidencePatterns: DEFAULT_EVIDENCE_PATTERNS,
+      maxStepTextChars: 1200,
+      maxStepReasoningChars: 4000,
+      compactMinChars: 100,
+      ...over,
+    },
+  })
+
+  // ① 生产默认下，reasoning=1300 的步骤**必须合格**（修复前这里会是 0 段）
+  const defaults = run2()
+  assert.equal(defaults.ranges.length, 1,
+    'reasoning=1300 在默认 maxStepReasoningChars=4000 下必须仍可整对移出'
+    + '（修复前与 1200 的 text 阈值累加 → 0 段，第二层静默失效）')
+  assert.equal(defaults.stats.skippedReasoning, 0)
+  assert.equal(defaults.stats.skippedText, 0)
+
+  // ② reasoning 真的超限时才拦，且只记到 reasoning 轴
+  const tight = run2({ maxStepReasoningChars: 500 })
+  assert.equal(tight.ranges.length, 0, 'reasoning 超过自己的阈值时必须拦下')
+  assert.equal(tight.stats.skippedReasoning, 1)
+  assert.equal(tight.stats.skippedText, 0, 'reasoning 轴拦截不得污染 text 轴计数')
+
+  // ③ 反过来：reasoning 很长、但 text 超限 → 必须记到 text 轴
+  //    （这条在修复前是"分不出来的"——两个原因共用一个计数器）
+  const textOver = run2({ maxStepTextChars: 2 })
+  assert.equal(textOver.stats.skippedText, 1, 'text 超限必须记到 text 轴')
+  assert.equal(textOver.stats.skippedReasoning, 0, 'text 轴拦截不得污染 reasoning 轴计数')
+
+  // ④ 两轴阈值互不影响：只调 text 阈值不得改变 reasoning 的判定结果
+  const textLoose = run2({ maxStepTextChars: 100000 })
+  assert.equal(textLoose.ranges.length, 1, '放宽 text 阈值不应影响 reasoning 轴的通过性')
+}
+
 // ---------------------------------------------------------------- 配置兜底完整性（外部审查）
 
 {
@@ -1131,6 +1276,89 @@ const run = ({ events, cache, cfg, threshold }) => {
   const empty = resolveConfig({})
   for (const key of schemaKeys) {
     assert.notEqual(empty[key], undefined, `${key} 在未归一化配置下不得为 undefined`)
+  }
+}
+
+// ---------------------------------------------------------------- 越界配置钳制（issue #28 回归）
+
+{
+  // 修复前：schema 只有 .default()、resolveConfig 只有 `?? 兜底`（只挡 undefined/null），
+  // 所以任何越界值原样穿透到运行时，且后果是**静默失效**而非报错。这个块把每条后果钉死。
+  //
+  // ⚠️ 这里有**两层独立防线**，测试必须分别打，否则会误判"修好了"：
+  //   ① `Config(raw)`（schemastery）→ 越界**抛 ValidationError**，是"响亮的拒绝"
+  //   ② `resolveConfig(raw)`（我们自己的钳制）→ 越界**回落到默认值 + 告警**，是"静默的修正"
+  // 真实的"未归一化"路径（cordis.patch.yml 直接注入配置对象、冒烟测试的 PLUGIN_CFG）
+  // 只经过 ②，所以 ② 必须自己站得住，不能依赖 ①。
+
+  // ① schemastery 层必须响亮地拒绝（不是静默 clamp）
+  assert.throws(() => Config({ preserveRecent: -5 }), /expected number >= 0/,
+    'Config 应对越界值抛错，而不是悄悄改掉')
+  assert.throws(() => Config({ receiptMaxRatio: 5 }), /expected number <= 1/)
+
+  // ② 我们的钳制层：越界 → 回落到默认值（而不是钳到边界）
+  const neg = resolveConfig({ preserveRecent: -5 })
+  assert.equal(neg.preserveRecent, 4, 'preserveRecent=-5 必须回落到默认 4（负数会让最近区保护反向放大）')
+  assert.ok(neg[CONFIG_WARNINGS].some((w) => /preserveRecent/.test(w)), '钳制必须留下告警')
+  assert.ok(/低于下限/.test(neg[CONFIG_WARNINGS][0]), `告警应说明原因：${neg[CONFIG_WARNINGS][0]}`)
+  assert.ok(/已改为 4/.test(neg[CONFIG_WARNINGS][0]), '告警应同时给出改后的值')
+
+  // ②b 第二层永久静默失效：maxStepTextChars=-1 会让每一步都 text > -1
+  assert.equal(resolveConfig({ maxStepTextChars: -1 }).maxStepTextChars, 1200)
+
+  // ②c 经济性门失效
+  assert.equal(resolveConfig({ compactMinChars: -100 }).compactMinChars, 2000)
+
+  // ②d receiptMaxRatio 同时是"回执不得比原文大"的安全门 → 上界收在 1
+  const high = resolveConfig({ receiptMaxRatio: 5 })
+  assert.equal(high.receiptMaxRatio, 0.5, 'receiptMaxRatio > 1 等于允许"压缩后更占地方"')
+  assert.ok(high[CONFIG_WARNINGS].some((w) => /高于上限/.test(w)), '超上限也要告警')
+
+  // ②e 概率类越界
+  assert.equal(resolveConfig({ keepThreshold: 2 }).keepThreshold, 0.5)
+  assert.equal(resolveConfig({ floorThreshold: 7 }).floorThreshold, DEFAULT_FLOOR_THRESHOLD)
+
+  // ②f 计数类下界不能是 0（配 0 等于把功能关掉，那是布尔开关的职责）
+  assert.equal(resolveConfig({ minHistoryLines: 0 }).minHistoryLines, 8)
+  assert.equal(resolveConfig({ maxCompactionsPerPass: 0 }).maxCompactionsPerPass, 1)
+  assert.equal(resolveConfig({ minCandidatesForRelative: 1 }).minCandidatesForRelative,
+    DEFAULT_MIN_CANDIDATES_FOR_RELATIVE, '相对分位至少要 2 条才谈得上"排序"')
+
+  // ① 非数值一律回落到默认值（"改了多少"不可解释，"打到默认"才可解释）
+  for (const bad of [NaN, Infinity, -Infinity, '600', {}, []]) {
+    const got = clampConfigNumber('headChars', bad, 600, null)[0]
+    assert.equal(got, 600, `headChars=${String(bad)} 应回落到默认值 600`)
+  }
+
+  // ① 未配置（undefined/null/''）**不是**非法，必须静默用默认值、不产生告警
+  for (const unset of [undefined, null, '']) {
+    const [v, clamped] = clampConfigNumber('headChars', unset, 600, null)
+    assert.equal(v, 600)
+    assert.equal(clamped, false, `${String(unset)} 是"没配"而不是"配错"，不该告警`)
+  }
+  assert.equal(resolveConfig({})[CONFIG_WARNINGS].length, 0, '全部合法的配置不得产生告警')
+
+  // 合法值必须原样保留（钳制不能顺手改掉正常配置）
+  const ok = resolveConfig({ preserveRecent: 0, headChars: 0, maxStepTextChars: 5000, receiptMaxRatio: 1 })
+  assert.equal(ok.preserveRecent, 0, '0 是合法值（不保护最近区），不得被当成缺省')
+  assert.equal(ok.headChars, 0)
+  assert.equal(ok.maxStepTextChars, 5000)
+  assert.equal(ok.receiptMaxRatio, 1, '1 是上界本身，闭区间内')
+  assert.equal(ok[CONFIG_WARNINGS].length, 0)
+
+  // 区间表必须覆盖**每一个**数值型 schema 键，否则新加的键会悄悄不受保护
+  const numericKeys = Object.keys(Config?.dict ?? {}).filter((k) => Config.dict[k]?.type === 'number')
+  assert.ok(numericKeys.length >= 20, `应能枚举出数值键（实际 ${numericKeys.length} 个）`)
+  const uncovered = numericKeys.filter((k) => clampConfigNumber(k, 1e12, 1, null)[0] === 1e12)
+  assert.deepEqual(uncovered, [], `这些数值键尚未纳入钳制区间表：${uncovered.join(', ')}`)
+
+  // schema 的 .min() 与钳制表必须同向（防止两处各写一个数字后漂移）：
+  // 比 schema 下界更小的值，在钳制层也必须被判为越界
+  for (const key of numericKeys) {
+    const min = Config.dict[key]?.meta?.min
+    if (typeof min !== 'number') continue
+    assert.equal(clampConfigNumber(key, min - 1, 0, null)[1], true,
+      `${key}：低于 schema 下界 ${min} 的值在钳制层也必须被判为越界`)
   }
 }
 

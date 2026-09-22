@@ -38,6 +38,9 @@ import { JEV_PRUNE_MARKER, isToolIn, parseLimit, pruneSessionWithJev } from './p
 import {
   DEFAULT_COMPACT_TOOLS,
   DEFAULT_EVIDENCE_PATTERNS,
+  DEFAULT_FLOOR_THRESHOLD,
+  DEFAULT_MIN_CANDIDATES_FOR_FLOOR,
+  DEFAULT_MIN_CANDIDATES_FOR_RELATIVE,
   DEFAULT_NEVER_COMPACT_TOOLS,
   DSH_READONLY_TOOLS,
   RECEIPT_MARKER,
@@ -146,30 +149,30 @@ export const Config = z.object({
   model: z.string().default('jev-latest'),
   baseUrl: z.string().default('https://api.typesafe.ai/v1/systemone'),
   /** P(保留) ≥ 该值 → 不裁 */
-  keepThreshold: z.number().default(0.5),
+  keepThreshold: z.number().min(0).max(1).default(0.5),
   /** 最近 N 个 surface 节点永不裁剪（含正在进行的工具调用） */
-  preserveRecent: z.number().default(4),
+  preserveRecent: z.number().min(0).default(4),
   /** 裁到多少字符就够：留头 + 标记 + 留尾 */
-  headChars: z.number().default(600),
-  tailChars: z.number().default(200),
+  headChars: z.number().min(0).default(600),
+  tailChars: z.number().min(0).default(200),
   /** 小于该长度的结果即使 Jev 说过期也不裁（省不到东西、还丢信息） */
-  minCharsToPrune: z.number().default(400),
+  minCharsToPrune: z.number().min(0).default(400),
   /** 何时开始判定：pressure（上下文超软阈值才判）| always */
   judgeOn: z.string().default('pressure'),
   softLimit: z.string().default('55%'),
   /** state 预算（Jev 上限 32k） */
-  maxStateTokens: z.number().default(25000),
-  maxRequestTokens: z.number().default(30000),
-  textHead: z.number().default(400),
-  textTail: z.number().default(150),
-  inputChars: z.number().default(300),
-  judgeTimeoutMs: z.number().default(60000),
+  maxStateTokens: z.number().min(1).default(25000),
+  maxRequestTokens: z.number().min(1).default(30000),
+  textHead: z.number().min(0).default(400),
+  textTail: z.number().min(0).default(150),
+  inputChars: z.number().min(0).default(300),
+  judgeTimeoutMs: z.number().min(1).default(60000),
   /** 只判定不裁剪，用来先观察行为 */
   dryRun: z.boolean().default(false),
   /** 提问措辞：goal（默认，实测区分度最高）| legacy（上游原味，几乎无区分度）| contrast | consequence */
   wording: z.string().default('goal'),
   /** state 历史最少保留的行数（避免为了塞进预算把上下文丢空） */
-  minHistoryLines: z.number().default(8),
+  minHistoryLines: z.number().min(1).default(8),
   /** 结果永不裁剪的工具 */
   // 两层用同一份黑名单（含 str_replace_editor 等别名）；比较在 decideAction 里归一化，
   // 所以这里写 PascalCase 或小写都等价——外部审查回归后与第二层统一
@@ -191,11 +194,21 @@ export const Config = z.object({
    */
   compactMode: z.string().default('relative'),
   /** relative 模式：两轴各取尾部这个比例，**取交集** */
-  compactQuantile: z.number().default(0.34),
-  /** relative 模式需要的最小样本量；小于它则不做整对移出（排序在小样本上没有意义） */
-  minCandidatesForRelative: z.number().default(4),
+  compactQuantile: z.number().min(0).max(1).default(0.34),
+  /**
+   * relative 模式需要的最小总体规模；小于它则**降级为绝对下限模式**（不是我原本设想的"直接不做"）。
+   *
+   * issue #27：只读工具在写/执行密集会话里往往只占极少数（实测只读 1/6 → 总体仅 2 条），
+   * 而此前低于这个数就返回空集 → **第二层在绝大多数真实会话里静默不工作**，
+   * 报错文案却说"需要 ≥4 个"，看着像"样本确实不够"而不像 bug。
+   */
+  minCandidatesForRelative: z.number().min(2).default(DEFAULT_MIN_CANDIDATES_FOR_RELATIVE),
+  /** 降级模式（总体 < minCandidatesForRelative）用的绝对下限，**明显严于** compactThreshold */
+  floorThreshold: z.number().min(0).max(1).default(DEFAULT_FLOOR_THRESHOLD),
+  /** 降级模式仍要求的最低样本量；低于它连分布都谈不上，仍然不做 */
+  minCandidatesForFloor: z.number().min(1).default(DEFAULT_MIN_CANDIDATES_FOR_FLOOR),
   /** absolute 模式用的阈值 */
-  compactThreshold: z.number().default(0.5),
+  compactThreshold: z.number().min(0).max(1).default(0.5),
   /**
    * 允许整对移出的工具（白名单）。**默认 = `DSH_READONLY_TOOLS`（只读工具集），即默认就带白名单。**
    *
@@ -215,19 +228,31 @@ export const Config = z.object({
   evidenceGuard: z.boolean().default(true),
   evidencePatterns: z.array(z.string()).default(DEFAULT_EVIDENCE_PATTERNS),
   /**
-   * assistant 消息文本（含 reasoning 块）超过这个长度的步骤不整对移出——它在推理，不是纯探查。
-   * 默认值是按真实会话标定的：实测 DeepSeek 每步 text 0~287 字符、reasoning 0~1207 字符，
-   * 早先的 240 会把绝大多数正常步骤拦掉（第二层因此在自然压力下 0 段可压）。
+   * assistant 消息里**用户可见文本**（`text` 块）超过这个长度的步骤不整对移出——它在交代结论。
+   * 默认值按真实会话标定：实测 DeepSeek 每步 text 仅 0~287 字符，1200 有充分余量。
+   *
+   * ⚠️ 这个阈值**不含 `reasoning`**（issue #26：此前两者累加，导致阈值被思考草稿主导）。
+   * reasoning 有独立阈值 `maxStepReasoningChars`。
    */
-  maxStepTextChars: z.number().default(1200),
+  maxStepTextChars: z.number().min(0).default(1200),
+  /**
+   * assistant 消息里**思考草稿**（`reasoning` 块）超过这个长度的步骤不整对移出。
+   *
+   * 为什么单独一个键、且默认值明显更宽：`detail` 级别的会话里 reasoning 天然很长
+   * （实测 0~1207 字符，且会随任务复杂度溢出到数千），它是模型的草稿而不是承重结论。
+   * 与 text 共用一个阈值时，reasoning 只要多写几百字就会把整层压缩静默关掉——
+   * 这是"第二层用不到"的主因。取 4000 是给"确实想了很久、这步大概不平凡"留余地，
+   * 同时让绝大多数正常步骤通过。想彻底关掉这道门就配成一个很大的数。
+   */
+  maxStepReasoningChars: z.number().min(0).default(4000),
   /** 一段范围至少要能省下这么多字符，才值得开一次压缩事务 */
-  compactMinChars: z.number().default(2000),
+  compactMinChars: z.number().min(0).default(2000),
   /** 回执必须是原内容 token 的这个比例以下才动手（服务端硬要求 <1.0，我们更严） */
-  receiptMaxRatio: z.number().default(0.5),
+  receiptMaxRatio: z.number().min(0).max(1).default(0.5),
   /** 一次 pass 最多做几次压缩事务 */
-  maxCompactionsPerPass: z.number().default(1),
+  maxCompactionsPerPass: z.number().min(1).default(1),
   /** 回执里每行入参截断到多少字符 */
-  receiptArgChars: z.number().default(120),
+  receiptArgChars: z.number().min(0).default(120),
 
   /**
    * 心跳文件路径。非空时，插件会在加载完成、每次判定 pass、每次裁剪后写一份 JSON 快照。
@@ -238,7 +263,99 @@ export const Config = z.object({
   logLevel: z.string().default('info'),
 })
 
+/**
+ * `resolveConfig` 把越界配置的说明挂在这个键下（普通字符串键，不是 Symbol——
+ * 心跳要 JSON 序列化，Symbol 存不进去）。调用方按需取用：
+ *
+ *   const cfg = resolveConfig(raw)
+ *   for (const w of cfg[CONFIG_WARNINGS] ?? []) log('warn', w)
+ *
+ * 它不是 `Config` schema 的键，所以 `check.js` 里"schema 键必须有兜底"的断言不受影响。
+ */
+export const CONFIG_WARNINGS = '__configWarnings'
+
+/**
+ * 数值配置的**合法区间表**。`[min, max]`，`Infinity` 表示"上不封顶"。
+ *
+ * 为什么必须有这张表（issue #28）：`Config` 的 schema 只写了 `.default()`，没有 `.min()/.max()`，
+ * 而 `resolveConfig` 又只做 `?? 兜底`（只挡 undefined/null）。于是**任何越界值都原样穿透**
+ * 到运行时，且后果往往不是报错而是**静默失效**。实测（未修前）：
+ *
+ *   - `preserveRecent = -5` → `lastAllowed = surface.length - 1 - (-5)` 反而**变大**，
+ *     最近区保护**完全失效**。这是最危险的一条：两层都会去动正在进行的工具调用。
+ *   - `maxStepTextChars = -1` → 每一步都 `text > -1` → 第二层**永久静默失效**。
+ *   - `compactMinChars = -100` → 该门形同不存在（"省得够不够"永远为真）。
+ *   - `receiptMaxRatio = 5` → 回执比原文大 5 倍也放行（安全门失效）。
+ *   - `keepThreshold = 2` → 第一层所有节点都裁（`prob >= 2` 恒假）。
+ *
+ * 分档的意义：
+ *   · `float01` —— 概率/比例，越界后果是"判据恒真或恒假"，一律钳到 [0,1]。
+ *   · `nonNeg`  —— **0 是合法值**（如 headChars=0 = 不留头），只挡负数。
+ *   · `count`   —— 计数类，下界 1（配成 0 等于把该功能关掉，那是布尔开关的职责）。
+ *   · `positive`—— 严格正数，下界取一个很小的正数而非 0（避免除零/无穷循环）。
+ *
+ * 上界为什么普遍设 1e9：这些键都是"越大越宽松"的方向（多留一点、多等一会），
+ * 钳住它们是在替用户做一个他没要求的决定，收益远小于风险。真正需要上界的是
+ * **会转化为内存/时间开销**的那几个（见各自注释与 MAX_* 常量）。
+ */
+const CONFIG_RANGES = {
+  // 概率 / 比例：越界会让判据恒真或恒假
+  keepThreshold: [0, 1],
+  compactQuantile: [0, 1],
+  compactThreshold: [0, 1],
+  floorThreshold: [0, 1],
+  // receiptMaxRatio 不只是比例，它同时是"回执不得比原文大"的安全门：
+  // >1 就等于允许"压缩后反而更占地方"，所以上界收在 1。
+  // 注释里写的"服务端硬要求 <1.0，我们更严"指的是默认值 0.5，不是上界。
+  receiptMaxRatio: [0, 1],
+  // 非负（0 合法）
+  preserveRecent: [0, 1e9],
+  headChars: [0, 1e9],
+  tailChars: [0, 1e9],
+  textHead: [0, 1e9],
+  textTail: [0, 1e9],
+  minCharsToPrune: [0, 1e9],
+  compactMinChars: [0, 1e9],
+  receiptArgChars: [0, 1e9],
+  inputChars: [0, 1e9],
+  maxStepTextChars: [0, 1e9],
+  maxStepReasoningChars: [0, 1e9],
+  // 计数类
+  minHistoryLines: [1, 1e9],
+  minCandidatesForRelative: [2, 1e9],
+  minCandidatesForFloor: [1, 1e9],
+  maxCompactionsPerPass: [1, 1e9],
+  // 预算 / 超时（正数）
+  maxStateTokens: [1, 1e9],
+  maxRequestTokens: [1, 1e9],
+  judgeTimeoutMs: [1, 1e9],
+}
+
+/**
+ * 按区间表钳制配置值；越界时通过 `onWarn` 报告**改动前后**的值。
+ *
+ * 返回 `[钳制后的值, 是否发生过钳制]`。非有限值（NaN / Infinity / 字符串）一律回落到
+ * `fallback`（即默认值）——因为"改了多少"在这个语义下不可解释，"打到默认"才可解释。
+ * 这正是 `Number.isFinite` 而不是 `typeof === 'number'` 的理由：`typeof NaN === 'number'`。
+ */
+export function clampConfigNumber(key, value, fallback, onWarn) {
+  const [lo, hi] = CONFIG_RANGES[key] ?? [Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY]
+  const warn = (kind, got) => {
+    onWarn?.(`配置 ${key}=${got} 非法（${kind}）→ 已改为 ${fallback}（合法区间 ${lo}~${hi}）`)
+    return fallback
+  }
+  // 值缺失（undefined/null/''）不是"非法"，是"没配"→ 静默用默认值，不打扰用户
+  if (value == null || value === '') return [fallback, false]
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return [warn('不是有限数值', JSON.stringify(value) ?? String(value)), true]
+  }
+  if (value < lo) return [warn(`低于下限 ${lo}`, value), true]
+  if (value > hi) return [warn(`高于上限 ${hi}`, value), true]
+  return [value, false]
+}
+
 export function resolveConfig(config = {}) {
+  const warnings = []
   return {
     ...config,
     enabled: config.enabled ?? true,
@@ -247,11 +364,11 @@ export function resolveConfig(config = {}) {
     // 维护约定：Config schema 的每个 default 都必须在这里有对应兜底（本键此前遗漏；
     // 影响为零是因为 JevClient 的默认参数会在 undefined 时生效，但约定不该靠下游兜底）。
     baseUrl: config.baseUrl ?? 'https://api.typesafe.ai/v1/systemone',
-    preserveRecent: config.preserveRecent ?? 4,
-    keepThreshold: config.keepThreshold ?? 0.5,
-    headChars: config.headChars ?? 600,
-    tailChars: config.tailChars ?? 200,
-    minCharsToPrune: config.minCharsToPrune ?? 400,
+    preserveRecent: clampConfigNumber('preserveRecent', config.preserveRecent, 4, (w) => warnings.push(w))[0],
+    keepThreshold: clampConfigNumber('keepThreshold', config.keepThreshold, 0.5, (w) => warnings.push(w))[0],
+    headChars: clampConfigNumber('headChars', config.headChars, 600, (w) => warnings.push(w))[0],
+    tailChars: clampConfigNumber('tailChars', config.tailChars, 200, (w) => warnings.push(w))[0],
+    minCharsToPrune: clampConfigNumber('minCharsToPrune', config.minCharsToPrune, 400, (w) => warnings.push(w))[0],
     judgeOn: config.judgeOn ?? 'pressure',
     softLimit: config.softLimit ?? '55%',
     neverPruneTools: config.neverPruneTools ?? DEFAULT_NEVER_COMPACT_TOOLS,
@@ -259,33 +376,40 @@ export function resolveConfig(config = {}) {
     compactOn: config.compactOn ?? 'pressure',
     compactSoftLimit: config.compactSoftLimit ?? '70%',
     compactMode: config.compactMode ?? 'relative',
-    compactQuantile: config.compactQuantile ?? 0.34,
-    minCandidatesForRelative: config.minCandidatesForRelative ?? 4,
-    compactThreshold: config.compactThreshold ?? 0.5,
+    compactQuantile: clampConfigNumber('compactQuantile', config.compactQuantile, 0.34, (w) => warnings.push(w))[0],
+    minCandidatesForRelative: clampConfigNumber('minCandidatesForRelative', config.minCandidatesForRelative, DEFAULT_MIN_CANDIDATES_FOR_RELATIVE, (w) => warnings.push(w))[0],
+    floorThreshold: clampConfigNumber('floorThreshold', config.floorThreshold, DEFAULT_FLOOR_THRESHOLD, (w) => warnings.push(w))[0],
+    minCandidatesForFloor: clampConfigNumber('minCandidatesForFloor', config.minCandidatesForFloor, DEFAULT_MIN_CANDIDATES_FOR_FLOOR, (w) => warnings.push(w))[0],
+    compactThreshold: clampConfigNumber('compactThreshold', config.compactThreshold, 0.5, (w) => warnings.push(w))[0],
     compactTools: config.compactTools ?? DEFAULT_COMPACT_TOOLS,
     neverCompactTools: config.neverCompactTools ?? DEFAULT_NEVER_COMPACT_TOOLS,
     evidenceGuard: config.evidenceGuard ?? true,
     evidencePatterns: config.evidencePatterns ?? DEFAULT_EVIDENCE_PATTERNS,
-    maxStepTextChars: config.maxStepTextChars ?? 1200,
-    compactMinChars: config.compactMinChars ?? 2000,
-    receiptMaxRatio: config.receiptMaxRatio ?? 0.5,
-    maxCompactionsPerPass: config.maxCompactionsPerPass ?? 1,
-    receiptArgChars: config.receiptArgChars ?? 120,
+    maxStepTextChars: clampConfigNumber('maxStepTextChars', config.maxStepTextChars, 1200, (w) => warnings.push(w))[0],
+    maxStepReasoningChars: clampConfigNumber('maxStepReasoningChars', config.maxStepReasoningChars, 4000, (w) => warnings.push(w))[0],
+    compactMinChars: clampConfigNumber('compactMinChars', config.compactMinChars, 2000, (w) => warnings.push(w))[0],
+    receiptMaxRatio: clampConfigNumber('receiptMaxRatio', config.receiptMaxRatio, 0.5, (w) => warnings.push(w))[0],
+    maxCompactionsPerPass: clampConfigNumber('maxCompactionsPerPass', config.maxCompactionsPerPass, 1, (w) => warnings.push(w))[0],
+    receiptArgChars: clampConfigNumber('receiptArgChars', config.receiptArgChars, 120, (w) => warnings.push(w))[0],
     dryRun: config.dryRun ?? false,
     wording: config.wording ?? 'goal',
-    minHistoryLines: config.minHistoryLines ?? 8,
+    minHistoryLines: clampConfigNumber('minHistoryLines', config.minHistoryLines, 8, (w) => warnings.push(w))[0],
     // issue #4：这 6 个键此前只在 Config schema 里有 default，resolveConfig 漏了——
     // config 未经 schemastery 归一化时（冒烟测试的 PLUGIN_CFG、被 patch 直接注入的对象），
     // abridge 拿到 undefined → head+tail+40 是 NaN → 同一段文本输出两遍、state 带 "NaN"。
     // 维护约定：Config schema 的每个 default 都必须在这里有对应兜底。
-    textHead: config.textHead ?? 400,
-    textTail: config.textTail ?? 150,
-    inputChars: config.inputChars ?? 300,
-    maxStateTokens: config.maxStateTokens ?? 25000,
-    maxRequestTokens: config.maxRequestTokens ?? 30000,
-    judgeTimeoutMs: config.judgeTimeoutMs ?? 60000,
+    textHead: clampConfigNumber('textHead', config.textHead, 400, (w) => warnings.push(w))[0],
+    textTail: clampConfigNumber('textTail', config.textTail, 150, (w) => warnings.push(w))[0],
+    inputChars: clampConfigNumber('inputChars', config.inputChars, 300, (w) => warnings.push(w))[0],
+    maxStateTokens: clampConfigNumber('maxStateTokens', config.maxStateTokens, 25000, (w) => warnings.push(w))[0],
+    maxRequestTokens: clampConfigNumber('maxRequestTokens', config.maxRequestTokens, 30000, (w) => warnings.push(w))[0],
+    judgeTimeoutMs: clampConfigNumber('judgeTimeoutMs', config.judgeTimeoutMs, 60000, (w) => warnings.push(w))[0],
     heartbeatFile: config.heartbeatFile ?? '',
     logLevel: config.logLevel ?? 'info',
+    // 越界配置的**审计出口**（issue #28）：钳制是静默改写用户意图的动作，
+    // 必须留下痕迹——否则用户配了 preserveRecent=-5 以为"更宽"，实际拿到的却是默认值，
+    // 而他对"为什么和在文档里读到的行为不一样"完全没有线索。
+    [CONFIG_WARNINGS]: warnings,
   }
 }
 
@@ -429,6 +553,9 @@ export function apply(ctx, config, deps = {}) {
         dshVersion: { version: dshVersion, testedAgainst: TESTED_DSH_VERSION, matchesTested: dshVersionMatches },
         judgeReady: judge.ready !== false,
         model: cfg.model,
+        // 越界配置被钳制的记录（issue #28）。空数组 = 配置全部合法。
+        // 落盘的原因是"钳制"本身就是一种静默行为差异，必须以可观测的方式留痕。
+        configWarnings: cfg[CONFIG_WARNINGS] ?? [],
         keepThreshold: cfg.keepThreshold,
         preserveRecent: cfg.preserveRecent,
         wording: cfg.wording,
@@ -595,6 +722,9 @@ export function apply(ctx, config, deps = {}) {
     pruner.pruneSession = (session) => pruneViaJev(pruner, session)
     takeover = { attempted: true, installed: true, reason: 'ok' }
     log('info', `已接管 ctx.toolResultPruner.pruneSession（keepThreshold=${cfg.keepThreshold}, preserveRecent=${cfg.preserveRecent}, dryRun=${cfg.dryRun}）`)
+    // 越界配置必须在加载时就喊出来（issue #28）：钳制后的行为与用户写下的配置不一致，
+    // 若不提示，用户会一直以为"我配了但没生效"是插件的 bug。
+    for (const w of cfg[CONFIG_WARNINGS] ?? []) log('warn', w)
     writeHeartbeat()
     return () => {
       pruner.pruneSession = originalSession
@@ -772,6 +902,11 @@ export function apply(ctx, config, deps = {}) {
       eligibleSeqs = computeEligibleSeqs(verdicts, {
         quantile: cfg.compactQuantile,
         minCandidates: cfg.minCandidatesForRelative,
+        minCandidatesForAbsolute: cfg.minCandidatesForFloor,
+        floorThreshold: cfg.floorThreshold,
+        // 降级模式的说明必须能被看到：否则用户只会看到"交集为空"，
+        // 又回到"分不清是样本不够还是功能坏了"的老问题（issue #27）
+        onNote: (note) => { report.quantileNote = note },
       })
     } else {
       eligibleSeqs = new Set(verdicts
@@ -781,9 +916,11 @@ export function apply(ctx, config, deps = {}) {
     }
     report.eligible = [...eligibleSeqs].sort((a, b) => a - b)
     if (eligibleSeqs.size === 0) {
-      report.blocked = cfg.compactMode === 'relative'
-        ? `两轴尾部交集为空（候选 ${verdicts.length} 个，需要 ≥${cfg.minCandidatesForRelative} 个）`
-        : '没有同时低于阈值的候选'
+      // 降级模式的说明优先展示：它比"交集为空"更具体（issue #27）
+      report.blocked = report.quantileNote
+        ?? (cfg.compactMode === 'relative'
+          ? `两轴尾部交集为空（候选 ${verdicts.length} 个，需要 ≥${cfg.minCandidatesForRelative} 个）`
+          : '没有同时低于阈值的候选')
       stats.compactSkipped += 1
       return report
     }
@@ -865,12 +1002,15 @@ export function apply(ctx, config, deps = {}) {
       lastCompact: {
         blocked: report.blocked,
         eligible: report.eligible,
+        // 分位总体太小而走降级时的说明；为空即正常走相对分位（issue #27 的可观测出口）
+        quantileNote: report.quantileNote ?? null,
         selection: report.selection == null ? null : {
           skippedTail: report.selection.skippedTail,
           skippedTool: report.selection.skippedTool,
           skippedVerdict: report.selection.skippedVerdict,
           skippedGuard: report.selection.skippedGuard,
           skippedText: report.selection.skippedText,
+          skippedReasoning: report.selection.skippedReasoning,
           skippedIncomplete: report.selection.skippedIncomplete,
           skippedShort: report.selection.skippedShort,
           // 工具名如实落盘：这是"白名单没配上"唯一能自查的证据
@@ -940,6 +1080,11 @@ export function apply(ctx, config, deps = {}) {
           ? '  ⚠️ 版本系列不匹配——事件字段可能已变，请先跑一次 jev_probe_shapes 核对'
           : ''),
       `第一层 阈值 keep≥${cfg.keepThreshold}   preserveRecent=${cfg.preserveRecent}   minChars=${cfg.minCharsToPrune}`,
+      // 越界配置被钳制时必须显式列出：否则"我配了却没生效"会被误当成插件 bug（issue #28）
+      ...(cfg[CONFIG_WARNINGS]?.length > 0
+        ? [`⚠️ 配置修正 ${cfg[CONFIG_WARNINGS].length} 处（越界值已被钳制，实际生效值见上）：`,
+          ...cfg[CONFIG_WARNINGS].map((w) => `    · ${w}`)]
+        : []),
       `第一层：判定 ${stats.judged} 次 / 请求 ${stats.requests} 次   `
         + `Jev 保留 ${stats.keptByJev} / Jev 裁掉 ${stats.prunedByJev} / 按体积兜底裁 ${stats.prunedByVolume}`
         + `（最近区保护 ${stats.keptByTail} / 黑名单保护 ${stats.keptByBlacklist} 不计入 Jev）`,
@@ -976,10 +1121,12 @@ export function apply(ctx, config, deps = {}) {
       `合格范围 ${report.considered} 段`,
     ]
     if (report.blocked) lines.push(`未执行：${report.blocked}`)
+    // 降级模式单独一行说明：与"未执行"分开，因为降级**可能仍然成功压缩了**（issue #27）
+    if (report.quantileNote) lines.push(`分位说明：${report.quantileNote}`)
     if (report.selection) {
       const s = report.selection
       lines.push(`排除计数：最近区 ${s.skippedTail} / 工具不允许 ${s.skippedTool} / 判定不通过 ${s.skippedVerdict}`
-        + ` / 证据守卫 ${s.skippedGuard} / 推理文本过长 ${s.skippedText}`
+        + ` / 证据守卫 ${s.skippedGuard} / 结论文本过长 ${s.skippedText} / 思考草稿过长 ${s.skippedReasoning}`
         + ` / 配对不完整 ${s.skippedIncomplete} / 省得太少 ${s.skippedShort}`)
       // 工具名如实列出：白名单不命中时，这里能一眼看出"是名字没配上"而不是"模型判断不对"
       const allow = Object.entries(s.allowedToolNames ?? {})
