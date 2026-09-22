@@ -726,6 +726,12 @@ export function apply(ctx, config, deps = {}) {
 
     const bySeq = new Map(fresh.map((c) => [c.seq, c]))
     const freshSeqs = [...bySeq.keys()]
+    // 本轮开始时的请求数，用于把 `stats.requests` 只加上**本轮真正发出**的部分。
+    // （这里曾经漏了声明：结算行读一个不存在的 `startRequests`，在严格模式下抛
+    // ReferenceError，被 pre-step 的 catch 吞成「判定失败：startRequests is not defined」。
+    // 危害在于**判定结果已经写进 decisions，第一层裁剪照常执行**——功能看起来完全正常，
+    // 只有 errors 计数与心跳在说谎。smoke 的 J 块现在钉住了"成功路径不得留下被吞的错误"。）
+    const startRequests = judge.requests
     // 批级容错（issue #34）：旧实现让第一处失败冒泡到调用方，于是**后续批次也不会再问**——
     // 已经能问出来的概率被一起丢掉。现在逐批 try：失败的批记一笔、继续问下一批。
     // 只有**所有**批都失败才把错误抛出去（那种情况确实等于整轮没判定）。

@@ -773,6 +773,45 @@ async function layer2Run(effectOfS2) {
     `实际判定数=${judgedCount}（批数 ${batchSizes.length}）`)
 }
 
+// ---------- J. 判定 pass 不得静默抛错（回归：startRequests 未声明） ----------
+// judgePass 的结算行读过未声明的 `startRequests`（全仓 0 次声明、1 次引用），
+// 在严格模式下抛 ReferenceError，被 pre-step 的 catch 吞成
+// stats.errors + lastNote="判定失败：startRequests is not defined"。
+//
+// 危害恰恰在于它**不显眼**：判定结果已经写进 decisions，第一层裁剪照常执行，
+// 所以从会话行为上看功能完全正常——只有 errors 计数与心跳在说谎。
+// 这个 bug 能一路活到 PR #28 之后，就是因为此前没有任何断言检查过 errors 计数。
+{
+  const pruner = makePruner()
+  const session = makeSession()
+  const compaction = makeCompaction(session)
+  const ctx = makeCtx({ pruner, session, compaction })
+  const judge = fakeJudge(
+    { [session.seqs.s1]: 0.05, [session.seqs.s2]: 0.05, [session.seqs.s3]: 0.05 },
+    { [session.seqs.s1]: 0.05, [session.seqs.s2]: 0.05, [session.seqs.s3]: 0.05 },
+  )
+  mod.apply(ctx, { ...PLUGIN_CFG, dryRun: true }, { judge })
+  const agentRef = { agent: { session, options: {} } }
+  await ctx.handlers.get('agent/pre-step')(agentRef, () => {})
+
+  const statusTool = ctx.registeredTools.find((t) => t?.name === 'jev_prune_status')
+  const statusText = String(await statusTool.execute({}, agentRef))
+  const lines = statusText.split(String.fromCharCode(10))
+
+  // 前提：判定真的跑过了，否则"没有错误"毫无意义
+  check('前提：判定确实执行了（否则 J 块无意义）',
+    judge.requests > 0,
+    `实际发出 ${judge.requests} 次`)
+  // 关键断言：成功路径上不允许留下任何被吞掉的错误
+  check('判定成功后不得留下被吞掉的错误（startRequests 未声明回归）',
+    !/错误 [1-9]/.test(statusText),
+    lines.filter((l) => /错误|判定失败/.test(l)).join(' | ') || '未发现错误行')
+  check('判定成功后不得被记成"判定失败"',
+    !/判定失败/.test(statusText),
+    lines.find((l) => /判定失败/.test(l)) ?? '无')
+}
+
+
 // ---------------------------------------------------------------- 汇总
 console.log()
 for (const r of results) console.log(`${r.ok ? '  ✅' : '  ❌'} ${r.name}${r.detail ? `  — ${r.detail}` : ''}`)
