@@ -103,7 +103,12 @@ node wire_profile.mjs <DSH_HOME> <profile-name>
 |---|---|---|
 | `enabled` | `true` | Master switch |
 | `model` | `jev-latest` | Judge model |
-| `keepThreshold` | `0.5` | Layer 1: `P(keep)` ≥ this value means no trimming |
+| `keepMode` | `budget` | Layer 1 decision rule. `budget`: *how much* to trim is set by the volume rule, *which* results by Jev's ranking (see below). `absolute`: the legacy fixed-threshold behaviour |
+| `keepThreshold` | `0.5` | Layer 1: in `absolute` mode, `P(keep)` ≥ this means no trimming; in `budget` mode it is a **protection ceiling** only (results at or above it never enter the candidate pool) |
+| `volumeBudgetThresholdChars` | `8192` | `budget` mode: a result's savings potential (`chars − head − tail`) counts toward the trim budget only above this size — mirroring the DSH-native pruning threshold, so the plugin's savings target equals what the native volume rule would have freed |
+| `keepFloorThreshold` / `minCandidatesForBudget` | `0.2` / `4` | `budget` mode small-population fallback: with fewer than 4 judged candidates, only results with `P(keep) < 0.2` are eligible (same degraded-mode shape as layer 2) |
+| `budgetMinChars` | `0` | `budget` mode: skip candidates whose trim would save less than this |
+| `resultExcerptChars` | `240` | Layer 1: per-result excerpt budget copied into the judge's state (see below); `0` restores the blind `ok, N chars` line |
 | `preserveRecent` | `4` | The most recent N surface nodes are left alone by both layers |
 | `headChars` / `tailChars` | `600` / `200` | Layer 1: how many head/tail characters a trim keeps |
 | `minCharsToPrune` | `400` | Layer 1: anything shorter is never trimmed |
@@ -156,6 +161,45 @@ The old behaviour was asymmetric — layer 2 skipped when it could not resolve a
 **The boundary** (corrected during the PR #28 review): failing closed justifies declining to spend, but it must not turn into silently switching the feature off. When the soft limit is an **absolute token count** (`softLimit: 3000`), the threshold comes straight from `limit.value` and **the meter is irrelevant** — so if the meter is missing or throws, the gate is simply left **un-armed for that pass** (reported as `压力门本次不设防` at `warn` level) and judging proceeds. An earlier revision of this PR required a successful measurement unconditionally, which turned "stop wasting money" into "the first layer never runs again" for any host that does not register `tokenMeter` — strictly worse than the bug it was fixing. `smoke_apply.mjs` pins both directions.
 
 Note that `tokenMeter` is a **host-provided** service; if your host does not expose it, configure `softLimit` as an absolute token count (or set `judgeOn: 'always'` / `compactOn: 'always'`) rather than relying on ratio-based pressure gating.
+
+### Layer 1: budget-based trimming
+
+The layer-1 decision used to be a bare fixed threshold: `keep = P(keep) ≥ 0.5`. Live-host measurement broke that assumption: **every judged candidate scored below 0.5** (42/42 in a 132k-token session, 5/5 in a short one; median ≈ 0.13–0.17). Jev's probabilities live in a narrow band — the exact trap layer 2 had already escaped by switching to relative quantiles, except nobody applied the lesson to layer 1. Under the fixed threshold, the first layer's real-world behaviour was *"trim everything that was judged"*, including results the session still needed.
+
+`budget` mode (the default) decouples the two questions:
+
+- **How much to trim** comes from the volume rule: the budget is the total savings potential of results that exceed `volumeBudgetThresholdChars` (mirroring the DSH-native threshold, so the plugin targets exactly what the native volume rule would have freed, no more).
+- **Which results** comes from Jev: candidates are sorted by `P(keep)` ascending and trimmed until the budget is met. Results with `P(keep) ≥ keepThreshold` (0.5) are a protection ceiling and never enter the pool; candidates whose savings are already counted stop there — the rest are recorded as `预算已用尽` (`keptByBudget`) rather than silently kept or trimmed.
+- With a small population (< `minCandidatesForBudget`), the mode **degrades** to an absolute floor (`keepFloorThreshold`, 0.2) instead of inventing a ranking from 2–3 samples — the same degraded-mode shape layer 2 uses.
+
+The old behaviour stays available as `keepMode: 'absolute'`.
+
+### Result excerpts (giving the judge eyes)
+
+The judge's state used to describe every tool result as `ok, 16489 chars (内容省略)` — the judge knew *that something big existed* but not *what was in it*. Blind judging plus a fixed threshold degenerates into "trim whatever is large".
+
+With `resultExcerptChars` (default `240`), each result line in the state carries a bounded excerpt. Lines are picked by **informativeness**, not position, because the two naive rules both failed a real-session A/B:
+
+1. error/evidence-pattern lines (the obvious candidate), plus
+2. **salient lines**: constant identifiers (`THRESHOLD_DISCOUNT_PCT`, `E2001_BASE_IMAGE`), assignments/keys (`timeout = 4800`), file paths — the critical config line in a 20 KB module is neither at the head nor an error, and rule 1 alone missed it (measured: judging outcomes identical to no excerpt at all), plus
+3. a middle-line fallback for pure-prose results (the middle is exactly what "cut the middle" loses).
+
+The excerpt is hard-bounded per result and counted against the state budget, so it cannot blow up the request size. Note the interaction with `budget` mode: excerpts shift *probabilities*; only the ranking-based decision converts better information into *different trimming*. Under a fixed threshold both A/B arms behaved identically — the excerpt's value presupposes the ranking rule.
+
+### Judgement observability (heartbeat)
+
+The heartbeat now records **decision evidence**, not just counters — because both the 0.5-threshold failure above and the upstream `#25–#29` regressions were invisible in a stats-only heartbeat:
+
+| Field | Content |
+|---|---|
+| `keep` | Layer-1 decision rule as configured (mode, ceiling, floor, budget parameters) |
+| `gate` | Last pressure-gate evaluation: `used` / resolved window / threshold / `skip` + reason / candidate count |
+| `probSummary` | Distribution of `P(keep)`: p10–p90, mean, counts above/below the ceiling |
+| `probSamples` | Last 200 raw probabilities (for histograms) |
+| `lastJudgePass.rows` | Per-candidate detail: seq, tool, chars, `prob`, `effectProb` |
+| `stats.preStepEvents` / `stats.judgePassSkipped` + `lastJudgeSkipReason` | Distinguishes "the event never fired" / "no candidates" / "gate skipped" — three failures that used to look identical from outside |
+
+One structural fix came out of this: the heartbeat is merge-written, but the pre-step hook itself never called `writeHeartbeat` — so gate-skipped passes left the file frozen at the boot snapshot (`bootedAt == now`) and every skipped path was unobservable. The hook now persists after every step.
 
 ### Out-of-range configuration
 

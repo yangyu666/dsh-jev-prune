@@ -149,8 +149,30 @@ export const Config = z.object({
   apiKey: z.string().default(''),
   model: z.string().default('jev-latest'),
   baseUrl: z.string().default('https://api.typesafe.ai/v1/systemone'),
-  /** P(保留) ≥ 该值 → 不裁 */
+  /** P(保留) ≥ 该值 → 不裁（budget 模式下这是**保护上限**：达到即不进候选池） */
   keepThreshold: z.number().min(0).max(1).default(0.5),
+  /**
+   * 第一层裁决模式（P0-1）：
+   *   · `budget`（默认）——"**裁多少**"由体积规则决定（budget = 超过 volumeBudgetThresholdChars
+   *     的结果按我们的 head/tail 裁剪本可省下的字符总量），"**裁哪些**"由 Jev 概率**排序**决定
+   *     （从最低开始裁，裁到省够 budget 即停）；`keepThreshold` 退居保护上限。
+   *   · `absolute` —— 旧行为：逐节点 `prob >= keepThreshold` 判。
+   * 为什么必须换：实测 Jev 概率是**窄带**（真实会话 42/42 条低于 0.5、P50=0.13），
+   * 固定 0.5 会把所有判定过的结果都判成"可裁"；而纯相对分位又会"每轮必裁固定比例"
+   * （不需要压缩时也在动刀，且比例与宿主需要腾多少空间无关）。两条路都不成立，
+   * 所以拆成正交的两件事：省多少 = 体积规则，裁哪些 = Jev 排序。
+   */
+  keepMode: z.string().default('budget'),
+  /** budget 模式小样本降级用的绝对下限（口径与第二层 floorThreshold 一致） */
+  keepFloorThreshold: z.number().min(0).max(1).default(0.2),
+  /** budget 模式：候选少于此数则降级为绝对下限（小样本上排序没有意义） */
+  minCandidatesForBudget: z.number().min(1).default(4),
+  /** 预算口径：超过该体积的结果才计入"体积规则本会省下多少"（默认 8192 = DSH 自带裁剪器的真实默认阈值） */
+  volumeBudgetThresholdChars: z.number().min(0).default(8192),
+  /** 预算下限（0 = 严格跟随体积规则；正数表示即使体积规则省不到也至少腾出这么多） */
+  budgetMinChars: z.number().min(0).default(0),
+  /** 值得动手的最小收益（与 sliceWithBudget 的 minGain 同口径；小于它不进候选池） */
+  minGainChars: z.number().min(0).default(40),
   /** 最近 N 个 surface 节点永不裁剪（含正在进行的工具调用） */
   preserveRecent: z.number().min(0).default(4),
   /** 裁到多少字符就够：留头 + 标记 + 留尾 */
@@ -167,6 +189,15 @@ export const Config = z.object({
   textHead: z.number().min(0).default(400),
   textTail: z.number().min(0).default(150),
   inputChars: z.number().min(0).default(300),
+  /**
+   * state 里每个工具结果的**摘录预算**（字符，P0-2）。
+   * 0 = 关闭（回到旧的 `ok, N chars (内容省略)`）。
+   * 为什么需要：判断者此前只看得到体积、看不到内容——Claude 版的教训（256 条结果
+   * 无一过阈值、与假评分器打平）说明盲判≈抛硬币；我们自己的 in-vivo 实测里
+   * 42/42 判"过期"，被误判的正是后续修 bug 要用的那条结果。
+   * 摘录内容 = 头 2 行 + 命中证据词的行（报错栈/失败断言**往往在中段**，恰是被掐掉的位置）。
+   */
+  resultExcerptChars: z.number().min(0).default(240),
   judgeTimeoutMs: z.number().min(1).default(60000),
   /**
    * 单次 ask 内最多重试几次（issue #34）。只对可重试失败生效：
@@ -319,6 +350,7 @@ export const CONFIG_WARNINGS = '__configWarnings'
 const CONFIG_RANGES = {
   // 概率 / 比例：越界会让判据恒真或恒假
   keepThreshold: [0, 1],
+  keepFloorThreshold: [0, 1],
   compactQuantile: [0, 1],
   compactThreshold: [0, 1],
   floorThreshold: [0, 1],
@@ -338,10 +370,16 @@ const CONFIG_RANGES = {
   inputChars: [0, 1e9],
   maxStepTextChars: [0, 1e9],
   maxStepReasoningChars: [0, 1e9],
+  // P0-1 预算模式 / P0-2 摘录（0 合法：摘录 0 = 关闭；budgetMinChars 0 = 严格跟随体积规则）
+  volumeBudgetThresholdChars: [0, 1e9],
+  budgetMinChars: [0, 1e9],
+  minGainChars: [0, 1e9],
+  resultExcerptChars: [0, 1e9],
   // 计数类
   minHistoryLines: [1, 1e9],
   minCandidatesForRelative: [2, 1e9],
   minCandidatesForFloor: [1, 1e9],
+  minCandidatesForBudget: [1, 1e9],
   maxCompactionsPerPass: [1, 1e9],
   // 预算 / 超时（正数）
   maxStateTokens: [1, 1e9],
@@ -386,6 +424,13 @@ export function resolveConfig(config = {}) {
     baseUrl: config.baseUrl ?? 'https://api.typesafe.ai/v1/systemone',
     preserveRecent: clampConfigNumber('preserveRecent', config.preserveRecent, 4, (w) => warnings.push(w))[0],
     keepThreshold: clampConfigNumber('keepThreshold', config.keepThreshold, 0.5, (w) => warnings.push(w))[0],
+    keepMode: config.keepMode ?? 'budget',
+    keepFloorThreshold: clampConfigNumber('keepFloorThreshold', config.keepFloorThreshold, 0.2, (w) => warnings.push(w))[0],
+    minCandidatesForBudget: clampConfigNumber('minCandidatesForBudget', config.minCandidatesForBudget, 4, (w) => warnings.push(w))[0],
+    volumeBudgetThresholdChars: clampConfigNumber('volumeBudgetThresholdChars', config.volumeBudgetThresholdChars, 8192, (w) => warnings.push(w))[0],
+    budgetMinChars: clampConfigNumber('budgetMinChars', config.budgetMinChars, 0, (w) => warnings.push(w))[0],
+    minGainChars: clampConfigNumber('minGainChars', config.minGainChars, 40, (w) => warnings.push(w))[0],
+    resultExcerptChars: clampConfigNumber('resultExcerptChars', config.resultExcerptChars, 240, (w) => warnings.push(w))[0],
     headChars: clampConfigNumber('headChars', config.headChars, 600, (w) => warnings.push(w))[0],
     tailChars: clampConfigNumber('tailChars', config.tailChars, 200, (w) => warnings.push(w))[0],
     minCharsToPrune: clampConfigNumber('minCharsToPrune', config.minCharsToPrune, 400, (w) => warnings.push(w))[0],
@@ -497,9 +542,31 @@ export function apply(ctx, config, deps = {}) {
     keptByJev: 0,
     keptByTail: 0,
     keptByBlacklist: 0,
+    /**
+     * P0-1：被**预算**（而不是判定）留下来的条数。
+     * budget 模式下"Jev 说过期但预算已经用完"是常态——不单独计数的话，
+     * 用户会看到"Jev 裁掉 0"却不知道为什么，也无法判断预算是不是太紧。
+     */
+    keptByBudget: 0,
+    /** P0-1/P0-3：最近一次裁剪的预算分析（planTrims 的返回值），心跳里可见 */
+    lastBudget: null,
+    /** P0-3：最近若干条逐节点决策（含原因），让"为什么没裁/裁了"可复核 */
+    decisions: [],
     skipped: 0,
     errors: 0,
     lastNote: '',
+    /**
+     * P0-1/P0-3 遥测：keep 概率的累计分布。
+     * 为什么必须落盘：本插件历史上最大的问题都是"静默失效"，而这个分布是判断
+     * "阈值与分布是否匹配"的唯一依据——真实会话实测 42/42 低于 0.5（P50=0.13），
+     * 固定阈值等于"把每一轮判定都读成可裁"。没有这份数据，这个问题在运行时不可见。
+     */
+    probSum: 0,
+    probCount: 0,
+    keepAboveThreshold: 0,
+    keepBelowThreshold: 0,
+    /** P0-3：最近一次判定 pass 的门控快照（used/窗口/阈值/为什么跳过） */
+    lastGate: null,
     /**
      * 判定批次失败次数（issue #34）。旧实现一处失败就冒泡、后续批次不再问，
      * 已经能拿到的概率被一起丢掉；现在逐批容错，失败批数如实上报，
@@ -521,6 +588,29 @@ export function apply(ctx, config, deps = {}) {
     receiptFenceMisses: 0,
     compactSkipped: 0,
     lastCompactNote: '',
+  }
+
+  /**
+   * P0-3：keep 概率的分布快照（最近至多 500 个样本）。
+   * 落盘的理由：这个插件最大的历史问题是"静默失效"，而"阈值与分布是否匹配"
+   * 只有看到分布本身才能判断——真实会话实测 42/42 低于 0.5（P50=0.13），
+   * 固定阈值等于把每一轮判定都读成"可裁"。
+   */
+  const probSamples = []
+  function probSummary() {
+    if (stats.probCount === 0) return null
+    const sorted = [...probSamples].sort((a, b) => a - b)
+    const q = (p) => (sorted.length === 0 ? null : sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))])
+    return {
+      n: stats.probCount,
+      sampled: sorted.length,
+      mean: Number((stats.probSum / stats.probCount).toFixed(4)),
+      p10: q(0.1), p25: q(0.25), p50: q(0.5), p75: q(0.75), p90: q(0.9),
+      aboveKeepThreshold: stats.keepAboveThreshold,
+      belowKeepThreshold: stats.keepBelowThreshold,
+      keepThreshold: cfg.keepThreshold,
+      keepMode: cfg.keepMode,
+    }
   }
 
   const log = (level, message) => {
@@ -595,6 +685,16 @@ export function apply(ctx, config, deps = {}) {
         // 落盘的原因是"钳制"本身就是一种静默行为差异，必须以可观测的方式留痕。
         configWarnings: cfg[CONFIG_WARNINGS] ?? [],
         keepThreshold: cfg.keepThreshold,
+        // P0-1/P0-3：第一层的裁决模式与预算口径（判据落盘，否则"为什么没裁"不可复核）
+        keep: {
+          mode: cfg.keepMode,
+          keepThreshold: cfg.keepThreshold,
+          floor: cfg.keepFloorThreshold,
+          minCandidates: cfg.minCandidatesForBudget,
+          volumeThresholdChars: cfg.volumeBudgetThresholdChars,
+          budgetMinChars: cfg.budgetMinChars,
+        },
+        stateExcerptChars: cfg.resultExcerptChars,
         preserveRecent: cfg.preserveRecent,
         wording: cfg.wording,
         compact: {
@@ -631,7 +731,14 @@ export function apply(ctx, config, deps = {}) {
 
   async function judgePass(agent, signal) {
     const session = agent?.session
-    if (session?.surface?.nodes == null || judge.ready === false) return
+    // P0-3：把"没判定"的原因也落盘。此前这条路径是完全静默的——judged=0 时无法区分
+    // "门没开"（有 lastGate）/"没有候选"（有 surface 但都不可判）/"session 形态不对"，
+    // 而这三者的处置完全不同。
+    if (session?.surface?.nodes == null || judge.ready === false) {
+      stats.judgePassSkipped = (stats.judgePassSkipped ?? 0) + 1
+      stats.lastJudgeSkipReason = judge.ready === false ? 'judge 未就绪' : 'session.surface.nodes 不可用'
+      return
+    }
 
     const surface = [...session.surface.nodes]
     const eventAt = (seq) => session.eventAt(seq)
@@ -647,7 +754,15 @@ export function apply(ctx, config, deps = {}) {
     })
     const cache = decisionsOf(session)
     const fresh = candidates.filter((c) => !cache.has(c.seq))
-    if (fresh.length === 0) return
+    if (fresh.length === 0) {
+      // P0-3：区分"没有候选"与"候选都已判定过"——前者说明筛选条件把结果全排除了
+      // （preserveRecent / 黑名单 / 已裁标记），需要看见 surface 规模才能判断是否配置过紧。
+      stats.judgePassSkipped = (stats.judgePassSkipped ?? 0) + 1
+      stats.lastJudgeSkipReason = candidates.length === 0
+        ? `无候选（surface ${surface.length} 节点：可能全落在最近区/黑名单/已裁剪）`
+        : `候选全部已判定（候选 ${candidates.length}，缓存 ${cache.size}）`
+      return
+    }
 
     // 压力门控：不到软阈值就不花 Jev 的钱
     //
@@ -683,9 +798,16 @@ export function apply(ctx, config, deps = {}) {
       const threshold = limit.kind === 'ratio'
         ? (windowTokens == null ? null : Math.floor(windowTokens * limit.value))
         : limit.value
+      // P0-3：门控快照。三道门里这是第一道（插件判定门）；宿主的压缩门（compaction-basic
+      // 的 thresholdRatio，默认 0.8）决定了第一层有没有写入权——两者都落盘才看得清全貌。
+      stats.lastGate = {
+        used, measured, windowTokens, limitRaw: cfg.softLimit, threshold,
+        skip: false, reason: '', candidates: fresh.length,
+      }
       if (threshold == null) {
         // 阈值算不出来（ratio 模式 + 窗口未知）→ 与第二层同向：不做判定，不花钱
         stats.skipped += fresh.length
+        stats.lastGate = { ...stats.lastGate, skip: true, reason: '窗口未知（ratio 模式算不出阈值）' }
         stats.lastNote = '解析不出上下文窗口，第一层保守跳过（与第二层同向）'
         log('info', stats.lastNote)
         return
@@ -693,10 +815,12 @@ export function apply(ctx, config, deps = {}) {
       if (!measured) {
         // 阈值能定出来但拿不到用量 → 无法比较，只能不设防地继续。
         // 这里**不 return**：绝对阈值分支下 meter 本来就无关，return 等于把功能关掉。
+        stats.lastGate = { ...stats.lastGate, reason: 'meter 不可用，本次不设防' }
         stats.lastNote = `拿不到 token 用量（meter 缺失或抛错），压力门本次不设防（阈值 ${threshold}）`
         log('warn', stats.lastNote)
       } else if (used < threshold) {
         stats.skipped += fresh.length
+        stats.lastGate = { ...stats.lastGate, skip: true, reason: `压力不足（${used} < ${threshold}）` }
         return
       }
     }
@@ -713,6 +837,8 @@ export function apply(ctx, config, deps = {}) {
         maxStateTokens: cfg.maxStateTokens,
         inputChars: cfg.inputChars,
         minHistoryLines: cfg.minHistoryLines,
+        // P0-2：结果摘录预算（0 = 关闭）。判断者能看到"里面是什么"再决定留不留。
+        resultExcerptChars: cfg.resultExcerptChars,
       },
     })
     if (!fitted) {
@@ -784,6 +910,15 @@ export function apply(ctx, config, deps = {}) {
       const value = cache.get(seq)
       if (value != null && (typeof value.prob === 'number' || typeof value.effectProb === 'number')) {
         stats.judged += 1
+        // P0-3 遥测：把概率分布记下来（这是判断"阈值是否失配"的唯一依据）
+        if (typeof value.prob === 'number') {
+          stats.probSum += value.prob
+          stats.probCount += 1
+          if (value.prob >= cfg.keepThreshold) stats.keepAboveThreshold += 1
+          else stats.keepBelowThreshold += 1
+          probSamples.push(value.prob)
+          if (probSamples.length > 500) probSamples.shift()
+        }
       }
     }
     stats.requests += judge.requests - startRequests
@@ -800,7 +935,17 @@ export function apply(ctx, config, deps = {}) {
         stateTokens: estimateTokens(state),
         nameIndexSize: nameByCallId.size,
         events: describeEvents(session),
+        // 逐候选明细（seq/工具/概率）——viewer 画散点、排查"为什么裁这条"用
+        rows: fresh.map((c) => {
+          const v = cache.get(c.seq) ?? {}
+          return { seq: c.seq, tool: c.tool, chars: c.chars, prob: v.prob ?? null, effectProb: v.effectProb ?? null }
+        }),
       },
+      // P0-3：判定依据落盘（分布 + 门控快照），否则"阈值失配/门没开"在运行时不可见
+      probSummary: probSummary(),
+      // 原始样本（最近 200 个）——viewer 用它画直方图；分位数只能看形状不能看尾巴
+      probSamples: probSamples.slice(-200),
+      gate: stats.lastGate,
     })
   }
 
@@ -826,7 +971,12 @@ export function apply(ctx, config, deps = {}) {
         charsRemoved: out.charsRemoved,
         seqs: out.pruned.map((p) => p.originalSeq),
       },
+      // P0-1/P0-3：预算分析与逐节点决策落盘——"裁了哪些、为什么、预算够不够"可复核
+      budget: out.plan ?? null,
+      decisions: out.decisions ?? [],
     })
+    // 供 jev_prune_status / 心跳汇总使用（只留最近一批，避免无限增长）
+    if (Array.isArray(out.decisions) && out.decisions.length > 0) stats.decisions = out.decisions.slice(0, 50)
     return out
   }
 
@@ -1218,6 +1368,9 @@ export function apply(ctx, config, deps = {}) {
   ctx.effect(() => installSummaryHook())
 
   ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
+    // P0-3：判定链条的最外层计数。没有它时，"一次性零判定"无法区分
+    // 「事件没触发」/「提前 return」/「门控跳过」——三者的排查方向完全不同。
+    stats.preStepEvents = (stats.preStepEvents ?? 0) + 1
     // 双保险：如果 apply() 时服务还没就绪，每次 pre-step 再试一次。
     // 依赖时序这种东西不该让插件"看起来加载成功、实际什么都没做"。
     if (!takeover.installed) installPrunerOverride()
@@ -1225,6 +1378,7 @@ export function apply(ctx, config, deps = {}) {
     if (judge.ready === false) {
       stats.errors += 1
       stats.lastNote = '未配置 TYPESAFE_API_KEY，跳过判定'
+      writeHeartbeat()
       return next()
     }
     try {
@@ -1242,6 +1396,11 @@ export function apply(ctx, config, deps = {}) {
       stats.lastCompactNote = `回执压缩失败：${error?.message ?? String(error)}`
       log('info', stats.lastCompactNote)
     }
+    // P0-3：**每步必落盘**。此前只有「判定真的跑了 / 压缩真的做了」才写心跳——
+    // 于是「门控跳过 / 没有候选 / session 形态不对」这类最需要排查的路径恰好不落盘，
+    // 文件里永远是启动快照（实测踩坑：softLimit 未到时 bootedAt==now，
+    // 外部无法区分「事件没触发」和「触发了但门没开」）。合并写下每步一次写成本可接受。
+    writeHeartbeat()
     return next()
   })
 
@@ -1265,7 +1424,9 @@ export function apply(ctx, config, deps = {}) {
         + (dshVersionMatches === false
           ? '  ⚠️ 版本系列不匹配——事件字段可能已变，请先跑一次 jev_probe_shapes 核对'
           : ''),
-      `第一层 阈值 keep≥${cfg.keepThreshold}   preserveRecent=${cfg.preserveRecent}   minChars=${cfg.minCharsToPrune}`,
+      `第一层 模式=${cfg.keepMode}${cfg.keepMode === 'budget'
+        ? `（预算口径：>${cfg.volumeBudgetThresholdChars} 字符的结果按 head/tail 本可省的量；保护上限 prob≥${cfg.keepThreshold}）`
+        : `（绝对阈值 keep≥${cfg.keepThreshold}）`}   preserveRecent=${cfg.preserveRecent}   minChars=${cfg.minCharsToPrune}   摘录=${cfg.resultExcerptChars}字符`,
       // 越界配置被钳制时必须显式列出：否则"我配了却没生效"会被误当成插件 bug（issue #28）
       ...(cfg[CONFIG_WARNINGS]?.length > 0
         ? [`⚠️ 配置修正 ${cfg[CONFIG_WARNINGS].length} 处（越界值已被钳制，实际生效值见上）：`,
@@ -1273,7 +1434,23 @@ export function apply(ctx, config, deps = {}) {
         : []),
       `第一层：判定 ${stats.judged} 次 / 请求 ${stats.requests} 次   `
         + `Jev 保留 ${stats.keptByJev} / Jev 裁掉 ${stats.prunedByJev} / 按体积兜底裁 ${stats.prunedByVolume}`
-        + `（最近区保护 ${stats.keptByTail} / 黑名单保护 ${stats.keptByBlacklist} 不计入 Jev）`,
+        + `（最近区保护 ${stats.keptByTail} / 黑名单保护 ${stats.keptByBlacklist} / 预算用尽保留 ${stats.keptByBudget} 不计入 Jev）`,
+      // P0-3：概率分布 + 门控快照。这两行是"阈值是否失配 / 门为什么没开"的唯一现场证据，
+      // 过去缺失导致 P0-1/P0-1b 只能在外部用探针挖出来。
+      probSummary() == null
+        ? '第一层：keep 概率分布（暂无样本）'
+        : `第一层：keep 概率 P10/P50/P90 = ${probSummary().p10}/${probSummary().p50}/${probSummary().p90}`
+          + `（样本 ${probSummary().n}，高于阈值 ${probSummary().aboveKeepThreshold} / 低于 ${probSummary().belowKeepThreshold}）`
+          + (probSummary().n >= 10 && probSummary().aboveKeepThreshold === 0 && cfg.keepMode === 'absolute'
+            ? '   ⚠️ 全部低于阈值——绝对阈值与 Jev 窄带失配，建议保持 keepMode=budget' : ''),
+      stats.lastGate == null
+        ? '第一层门控：尚未评估'
+        : `第一层门控：used=${stats.lastGate.used}（measured=${stats.lastGate.measured}）`
+          + ` / 窗口=${stats.lastGate.windowTokens ?? '未知'} / 阈值=${stats.lastGate.threshold ?? '算不出'}`
+          + `   ${stats.lastGate.skip ? `本次跳过：${stats.lastGate.reason}` : '已放行'}`,
+      stats.lastBudget == null
+        ? '第一层预算：尚未裁剪'
+        : `第一层预算：${stats.lastBudget.note}`,
       `第一层：累计省下 ${stats.savedChars} 字符   压力门控跳过 ${stats.skipped} 次   错误 ${stats.errors} 次`,
       // 批次失败与重试计数只在异常时出现（issue #34）：常态下不该占版面。
       // 口径修正（PR #28 review）：这里要的是"最近一次 pass 重试了几次"（lastRetries），

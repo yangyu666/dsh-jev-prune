@@ -13,7 +13,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { JevClient, JevError, estimateTokens } from './jev.js'
-import { countChars, decideAction, parseLimit, pruneSessionWithJev, sliceWithBudget } from './prune.js'
+import { countChars, decideAction, parseLimit, planTrims, pruneSessionWithJev, sliceWithBudget } from './prune.js'
 import {
   DEFAULT_COMPACT_TOOLS,
   DEFAULT_EVIDENCE_PATTERNS,
@@ -42,6 +42,7 @@ import {
   questionsFor,
   recentGoal,
   resultChars,
+  resultExcerpt,
   selectCandidates,
   sessionEvents,
   toolNameOf,
@@ -217,9 +218,42 @@ assert.match(built.state, /【上下文】/)
 assert.match(built.state, /【任务目标】/, 'state 必须带任务目标 —— 缺它会让概率悬在阈值附近')
 assert.match(built.state, /【history】/)
 assert.match(built.state, /\[s1\]\[user\]/)
-// tool/result 只给注记与体积，不给全文
+// tool/result 只给注记、体积与**有界摘录**——不给全文。
+// P0-2 起不变量变了：从"正文一律不进 state"改为"正文只能以 ≤ resultExcerptChars 的摘录出现"。
+// 判盲的代价是实测过的（Claude 版 256 条无一过阈值、我们 42/42 判过期），所以摘录默认开启。
 assert.match(built.state, /\[s3\]\[tool_result\] ok, 5000 chars/)
-assert.equal(/x{100}/.test(built.state), false, '工具结果正文不应进 state')
+assert.match(built.state, /摘录: /, 'P0-2：结果应带关键摘录（判盲缓解）')
+assert.equal(/x{1000}/.test(built.state), false, '工具结果正文不得整段进 state（只允许有界摘录）')
+assert.equal(/x{200}/.test(built.state), false, '单行超长正文只允许取头部一小段（摘录受预算截断）')
+
+// P0-2：摘录要带**对的线索**——头几行 + 命中证据词的行（报错/失败**往往在结果中段**，
+// 正是"掐中间"策略会丢掉的位置）
+{
+  const body = [
+    'Step 2/7 : RUN apt-get update && apt-get install -y curl',
+    ...Array.from({ length: 40 }, (_, i) => `filler line ${i} lorem ipsum dolor sit amet`),
+    'ERROR E2001_BASE_IMAGE: base image node:18-broken does not exist; use node:20-alpine instead',
+    ...Array.from({ length: 40 }, (_, i) => `tail filler ${i}`),
+  ].join('\n')
+  const ev = {
+    type: 'tool/result',
+    data: { message: { source: { callId: 'cX' }, content: [{ type: 'tool-result', content: [{ type: 'text', text: body }] }] } },
+  }
+  const excerpt = resultExcerpt(ev, 240)
+  assert.match(excerpt, /Step 2\/7/, '头行应进摘录（"这是什么文件/命令"）')
+  assert.match(excerpt, /E2001_BASE_IMAGE/, '中段的证据行应进摘录（这是掐中间会丢的那一段）')
+  assert.equal(excerpt.includes('tail filler 39'), false, '尾部无证据的填充不该占摘录预算')
+  assert.ok(Array.from(excerpt).length <= 240, `摘录必须受预算约束，实际 ${Array.from(excerpt).length}`)
+  assert.equal(resultExcerpt(ev, 0), '', '预算 0 = 关闭摘录')
+  // 关闭时必须回到旧行为（可配置回退，别把判盲当成不可逆）
+  const off = buildJevState({
+    surface,
+    eventAt,
+    goal,
+    options: { textHead: 400, textTail: 150, maxStateTokens: 25000, inputChars: 300, resultExcerptChars: 0 },
+  })
+  assert.equal(/x{100}/.test(off.state), false, 'resultExcerptChars=0 时必须回到"只给体积"的旧行为')
+}
 
 // 预算压制：预算很紧时应从最老开始丢行，但保留行数地板，并如实报告是否装下
 const squeezed = buildJevState({
@@ -531,6 +565,104 @@ const run = ({ events, cache, cfg, threshold }) => {
   const { out } = run({ events, cache: new Map([[22, { keep: false, prob: 0.05 }]]) })
   assert.equal(out.pruned.length, 1, '只有结构完整的那条被处理')
   assert.equal(out.pruned[0].originalSeq, 22)
+}
+
+// ================================================================ P0-1：预算匹配的裁剪选择
+// 为什么需要这一层：Jev 概率是**窄带**的（真实会话实测 42/42 条低于 0.5、P50=0.13），
+// 固定 0.5 阈值会把每一轮判定都读成"可裁"；而纯相对分位又会"每轮必裁固定比例"。
+// 所以拆成正交的两件事：**省多少**由体积规则定（预算）、**裁哪些**由概率排序定。
+{
+  const node = (seq, chars, prob, extra = {}) => ({
+    seq, index: seq, tool: 'read', chars,
+    gain: chars - 50 - 30 - 6, // 与 baseCfg 的 head/tail 一致（marker=' MARK ' 6 字符）
+    prob, effectProb: prob, verdict: { keep: prob >= 0.5, prob }, inTail: false, blacklisted: false,
+    ...extra,
+  })
+
+  // ① 预算 = 0（没有结果超过体积阈值）→ **一条都不裁**
+  //    这是"不做无谓动作"的核心保证：体积规则本来就不会动它们，我们也别动。
+  const small = [node(1, 800, 0.05), node(2, 900, 0.06), node(3, 1000, 0.07), node(4, 1100, 0.08)]
+  const zeroPlan = planTrims(small, { keepMode: 'budget' })
+  assert.equal(zeroPlan.mode, 'budget')
+  assert.equal(zeroPlan.budget, 0, '没有结果超过体积阈值时预算应为 0')
+  assert.equal(zeroPlan.selected.size, 0, '预算为 0 时一条都不裁')
+  assert.match(zeroPlan.note, /预算 0 字符/)
+
+  // ② 有一条超阈值 → 预算 = 它的可省量；按概率升序裁，裁够就停
+  const mixed = [
+    node(10, 12000, 0.09), // 超阈值：贡献预算
+    node(11, 900, 0.03),   // 概率最低
+    node(12, 900, 0.04),
+    node(13, 900, 0.20),
+  ]
+  const plan = planTrims(mixed, { keepMode: 'budget' })
+  assert.equal(plan.mode, 'budget')
+  assert.equal(plan.budget, 12000 - 50 - 30 - 6, '预算应为超阈值结果的可省字符数')
+  // 顺序即设计：先裁概率最低的小结果（11、12 各 814 字符），省不够预算时必须动到那条大的（10）
+  // ——"预算从哪来"与"先裁谁"是两件事，前者是体积规则的既成事实，后者是 Jev 排序。
+  assert.deepEqual([...plan.selected], [11, 12, 10], '按概率升序裁，裁到省够预算为止')
+  assert.ok(plan.spent >= plan.budget, '裁完必须至少省到预算量')
+
+  // ③ 保护上限：prob ≥ keepThreshold 的一律不进候选池
+  const protectedSet = [node(20, 12000, 0.9), node(21, 900, 0.05), node(22, 900, 0.06), node(23, 900, 0.07)]
+  const guarded = planTrims(protectedSet, { keepMode: 'budget' })
+  assert.equal(guarded.keptByCeiling, 1, 'prob 0.9 的应计入保护上限')
+  assert.equal(guarded.selected.has(20), false, '保护上限之上的结果绝不能被选中')
+
+  // ④ 小样本（< minCandidatesForBudget）→ 降级绝对下限，只裁 prob < floorThreshold 的
+  const tiny = [node(30, 12000, 0.05), node(31, 12000, 0.30)]
+  const floored = planTrims(tiny, { keepMode: 'budget' })
+  assert.equal(floored.mode, 'floor', '候选太少应降级为绝对下限')
+  assert.deepEqual([...floored.selected], [30], '降级模式只裁 prob < 0.2 的')
+
+  // ⑤ keepMode 不是 budget 时返回 null（调用方退回逐节点 absolute 裁决，旧行为不变）
+  assert.equal(planTrims(mixed, { keepMode: 'absolute' }), null)
+  assert.equal(planTrims(mixed, undefined), null, '缺省时不得改变旧行为')
+
+  // ⑥ 整链：budget 模式下只裁"预算内"的那条，其余如实记为"预算用尽"
+  //    （候选需 ≥ minCandidatesForBudget=4，否则会先走小样本降级——见 ④）
+  {
+    const events = [
+      resultEvent(40, 'c1', 'x'.repeat(12000)),
+      resultEvent(41, 'c2', 'y'.repeat(5000)),
+      resultEvent(42, 'c3', 'z'.repeat(900)),
+      resultEvent(43, 'c4', 'w'.repeat(900)),
+    ]
+    const { out, stats } = run({
+      events,
+      cache: new Map([
+        [40, { keep: false, prob: 0.05 }], [41, { keep: false, prob: 0.06 }],
+        [42, { keep: false, prob: 0.07 }], [43, { keep: false, prob: 0.08 }],
+      ]),
+      cfg: { keepMode: 'budget' },
+    })
+    assert.equal(out.pruned.length, 1, '只裁预算内的那一条')
+    assert.equal(out.pruned[0].originalSeq, 40)
+    assert.equal(stats.prunedByJev, 1)
+    assert.equal(stats.keptByBudget, 3, '概率同样低但预算已用尽的那三条应记入 keptByBudget')
+    assert.equal(out.plan.mode, 'budget')
+    assert.equal(out.decisions[0].reason, 'selected(budget)')
+    assert.equal(out.decisions[1].reason, 'budget-exhausted')
+  }
+
+  // ⑦ 对照：`absolute` 模式（旧行为）下四条都会被裁 —— 证明省下来的是"预算"在起作用
+  {
+    const events = [
+      resultEvent(50, 'c1', 'x'.repeat(12000)),
+      resultEvent(51, 'c2', 'y'.repeat(5000)),
+      resultEvent(52, 'c3', 'z'.repeat(900)),
+      resultEvent(53, 'c4', 'w'.repeat(900)),
+    ]
+    const { out } = run({
+      events,
+      cache: new Map([
+        [50, { keep: false, prob: 0.05 }], [51, { keep: false, prob: 0.06 }],
+        [52, { keep: false, prob: 0.07 }], [53, { keep: false, prob: 0.08 }],
+      ]),
+      cfg: { keepMode: 'absolute' },
+    })
+    assert.equal(out.pruned.length, 4, 'absolute 模式会四条都裁（这是被替换掉的旧行为）')
+  }
 }
 
 // ================================================================ 第二层：回执压缩

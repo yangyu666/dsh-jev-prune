@@ -18,6 +18,8 @@ import { estimateTokens } from './jev.js'
 // 外部审查（issue #2）：selectCandidates 此前用字面 includes，默认 PascalCase 黑名单
 // 对真实小写工具名（edit/write）静默失效——改写类节点照进候选、照花判定钱。
 import { isToolIn } from './prune.js'
+// 摘录优先带"命中证据词的行"，词表与第二层的证据守卫共用一份（口径一致）。
+import { DEFAULT_EVIDENCE_PATTERNS } from './receipt.js'
 
 export const STATE_CONTEXT =
   '一个编码助手的对话正被压缩以释放上下文。history 是当前模型可见的全部历史（surface），' +
@@ -174,6 +176,87 @@ export function looksPruned(event, marker) {
   return blocks.some((block) => typeof block?.text === 'string' && block.text.includes(marker))
 }
 
+/**
+ * 工具结果的**关键摘录**（P0-2，判盲缓解）。
+ *
+ * 问题：state 里工具结果此前只有 `ok, N chars`——判断者只知道"有这么一条很大的东西"，
+ * 看不到里面是什么。Claude 版的历史教训（issue #26：256 条结果无一过 0.5 阈值、
+ * 与假评分器打平）证明**盲判 ≈ 抛硬币**；我们自己的 in-vivo 实测也是 42/42 判"过期"，
+ * 其中一个会话里被误判的正是后续修 bug 必须用的结果。
+ *
+ * 设计：拿**最便宜的位置线索**补上"这是什么"，不展开全文——
+ *   · 头 2 行：文件/命令回显通常在这里（"Step 2/7 : RUN apt-get…"、"// 模块：payment"）
+ *   · 命中证据词的行（error/fail/assert/timeout…，词表与第二层守卫共用）：
+ *     报错栈、失败断言、超时配置**往往在结果中段**——恰是"掐中间"策略丢掉的位置
+ * 总预算 `resultExcerptChars` 字符（默认 240，0 = 关闭回到旧行为）。
+ *
+ * @returns {string} 摘录文本；无内容/预算为 0 时返回 ''
+ */
+export function resultExcerpt(event, budget = 240) {
+  if (!(budget > 0)) return ''
+  const blocks = resultContent(event)
+  if (!Array.isArray(blocks)) return ''
+  const text = blocks
+    .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text)
+    .join('\n')
+  if (text.trim().length === 0) return ''
+  const lines = text.split('\n').map((line) => line.trim()).filter((line) => line.length > 0)
+  if (lines.length === 0) return ''
+
+  const clip = (line, max = 120) => {
+    const points = Array.from(line)
+    return points.length <= max ? line : points.slice(0, max).join('') + '…'
+  }
+
+  /**
+   * **按信息量打分选行**（而不是先到先得）。
+   *
+   * 实测教训：最初是"头 2 行 + 错误词行"，结果 4 行的预算被**头部元数据**吃光——
+   * DSH 的 read 结果开头是 `<path>…</path>` / `<type>file</type>`，而它们的信息
+   * 在 state 的 tool_call 行里已经有了。真正有区分度的中段配置行
+   * （`THRESHOLD_DISCOUNT_PCT = 15`）根本挤不进来，于是摘录等于没摘。
+   *
+   * 现在给每行打分再取前 4：
+   *   4.0 证据词（error/fail/assert/timeout…）——报错栈/失败断言
+   *   3.5 常量标识符（ALL_CAPS）——配置项、错误码（如 THRESHOLD_DISCOUNT_PCT）
+   *   3.0 赋值/键值（`x = 15` / `"k": v`）——具体数值
+   *   2.0 路径/文件名
+   *   1.0 头部两行（提供"这是什么"的上下文）
+   *   0.2 纯元数据行（`<path>`/`<type>`/`</…>`）——与 tool_call 行重复
+   */
+  const escaped = DEFAULT_EVIDENCE_PATTERNS.map((p) => String(p).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  const evidenceRe = new RegExp(escaped.join('|'), 'i')
+  const allCapsRe = /\b[A-Z][A-Z0-9_]{4,}\b/
+  const assignRe = /[\w.$-]+\s*[=:]\s*\S+/
+  const pathRe = /[\w./\\-]+\.(js|ts|mjs|cjs|json|py|go|rs|java|rb|md|conf|ini|cfg|log|ya?ml|toml|sql)\b/i
+  const metaRe = /^<\/?[a-z][a-z0-9-]*>?$|^<type>[^<]*<\/type>$|^<\/?(path|type|content)>/i
+
+  const scored = lines.map((line, idx) => {
+    let score = 0.5
+    if (metaRe.test(line)) score = 0.2
+    else if (evidenceRe.test(line)) score = 4
+    else if (allCapsRe.test(line)) score = 3.5
+    else if (assignRe.test(line)) score = 3
+    else if (pathRe.test(line)) score = 2
+    if (idx === 0) score = Math.max(score, 1)
+    if (idx === 1) score = Math.max(score, 0.8)
+    if (idx === Math.floor(lines.length / 2)) score = Math.max(score, 1.5) // 中段兜底：掐中间丢的就是这里
+    return { line, idx, score }
+  })
+
+  const picked = scored
+    .slice()
+    .sort((a, b) => (b.score - a.score) || (a.idx - b.idx))
+    .slice(0, 4)
+    .sort((a, b) => a.idx - b.idx)
+    .map((entry) => clip(entry.line))
+  if (picked.length === 0) return ''
+  let excerpt = picked.join(' | ')
+  if (Array.from(excerpt).length > budget) excerpt = Array.from(excerpt).slice(0, budget).join('') + '…'
+  return excerpt
+}
+
 /** 最近若干条「纯文本用户消息」作为任务目标（对齐上游 goalFromMessages）。 */
 export function recentGoal(events, limit = 3, maxChars = 500) {
   const picked = []
@@ -294,6 +377,7 @@ function effectPhrase(c, wording) {
  */
 export function buildJevState({ surface, eventAt, goal, context = STATE_CONTEXT, options }) {
   const { textHead, textTail, maxStateTokens, inputChars } = options
+  const excerptBudget = Number.isFinite(options.resultExcerptChars) ? options.resultExcerptChars : 240
   const minLines = Math.max(1, options.minHistoryLines ?? 8)
   const entries = []
   for (const seq of surface) {
@@ -301,7 +385,9 @@ export function buildJevState({ surface, eventAt, goal, context = STATE_CONTEXT,
     if (event == null) continue
     const type = event.type
     if (type === 'tool/result') {
-      entries.push([`[s${seq}][tool_result] ok, ${resultChars(event)} chars (内容省略)`])
+      // P0-2：带上关键摘录（头 2 行 + 证据词行），让判断者知道"里面是什么"再决定留不留
+      const excerpt = resultExcerpt(event, excerptBudget)
+      entries.push([`[s${seq}][tool_result] ok, ${resultChars(event)} chars${excerpt.length > 0 ? `；摘录: ${excerpt}` : ' (内容省略)'}`])
       continue
     }
     if (type === 'compaction/summary') {

@@ -101,7 +101,12 @@ node wire_profile.mjs <DSH_HOME> <profile名>
 |---|---|---|
 | `enabled` | `true` | 总开关 |
 | `model` | `jev-latest` | 判断模型 |
-| `keepThreshold` | `0.5` | 第一层：`P(保留)` ≥ 该值不裁 |
+| `keepMode` | `budget` | 第一层裁决模式。`budget`：*裁多少*由体积规则定、*裁哪些*由 Jev 排序定（见下文）；`absolute`：旧的固定阈值行为 |
+| `keepThreshold` | `0.5` | 第一层：`absolute` 模式下 `P(保留)` ≥ 该值不裁；`budget` 模式下只是**保护上限**（达到它的一条都不进候选池） |
+| `volumeBudgetThresholdChars` | `8192` | `budget` 模式：结果的可省字符（`chars − head − tail`）只在超过该值时计入裁剪预算——与 DSH 原生裁剪阈值对齐，插件的省量目标正好等于原生体积规则本会释放的空间 |
+| `keepFloorThreshold` / `minCandidatesForBudget` | `0.2` / `4` | `budget` 模式小样本降级：判定候选不足 4 条时，只有 `P(保留) < 0.2` 的结果可裁（与第二层同款降级形态） |
+| `budgetMinChars` | `0` | `budget` 模式：裁剪节省低于该值的结果跳过 |
+| `resultExcerptChars` | `240` | 第一层：写入判定 state 的每条结果摘录预算（见下文）；`0` 恢复盲判的 `ok, N chars` 行 |
 | `preserveRecent` | `4` | 最近 N 个 surface 节点两层都不碰 |
 | `headChars` / `tailChars` | `600` / `200` | 第一层裁剪保留的头/尾字符数 |
 | `minCharsToPrune` | `400` | 第一层：短于该长度不裁 |
@@ -154,6 +159,45 @@ node wire_profile.mjs <DSH_HOME> <profile名>
 **边界（PR #28 review 修正）**：fail-closed 只授权"拒绝花钱"，不能变成"把功能悄悄关掉"。`softLimit` 是**绝对 token 数**（如 `softLimit: 3000`）时，阈值直接来自 `limit.value`，**与 meter 无关**——所以 meter 缺失/抛错时只是压力门**本次不设防**（以 `warn` 级记一条 `压力门本次不设防`），判定照常进行。本 PR 的早期版本无条件要求"必须量到用量"，于是对任何没注册 `tokenMeter` 的宿主，第一层从此再也不跑——比它修的那个 bug 更糟。`smoke_apply.mjs` 把两个方向都钉住了。
 
 另注意 `tokenMeter` 是**宿主提供**的服务；如果你的宿主不暴露它，请把 `softLimit` 配成绝对 token 数（或用 `judgeOn: 'always'` / `compactOn: 'always'`），而不要依赖比例式的压力门。
+
+### 第一层：预算匹配式裁决
+
+第一层的裁决曾经就是一个裸的固定阈值：`保留 = P(保留) ≥ 0.5`。活宿主实测击穿了这一假设：**所有被判定候选的概率全部低于 0.5**（132k token 会话里 42/42，短会话 5/5；中位数约 0.13–0.17）。Jev 的概率挤在窄带里——这正是第二层早已靠相对分位逃出来的那个坑，只是没人把教训同步到第一层。固定阈值下，第一层在真实压力下的实际行为是"**判定过的全裁**"，包括会话还需要的结果。
+
+`budget` 模式（默认）把两个问题拆开：
+
+- **裁多少**由体积规则定：预算 = 超过 `volumeBudgetThresholdChars` 的结果的可省字符总和（与 DSH 原生阈值对齐——插件的省量目标正好等于原生体积规则本会释放的空间，不多不少）。
+- **裁哪些**由 Jev 定：候选按 `P(保留)` 升序裁，省够预算即停。`P(保留) ≥ keepThreshold`（0.5）是保护上限，永不进池；预算用尽后剩余候选如实记为 `keptByBudget`，既不虚报"Jev 保留"也不静默裁掉。
+- 小样本（< `minCandidatesForBudget`）时**降级**为绝对下限（`keepFloorThreshold`，0.2），而不是用两三个样本硬排序——与第二层同款降级形态。
+
+旧行为保留为 `keepMode: 'absolute'`。
+
+### 结果摘录（让判定者看得见内容）
+
+判定 state 曾经把每条工具结果写成 `ok, 16489 chars (内容省略)`——判定者只知道"有这么条大东西"，不知道里面是什么。盲判加固定阈值会退化成"看到大的就裁"。
+
+`resultExcerptChars`（默认 `240`）让 state 里每条结果带一段**有界摘录**。选行按**信息量**打分而非位置——因为两条朴素规则都在真实会话 A/B 里失败过：
+
+1. 错误词/证据模式行（最直觉的候选），加上
+2. **显著行**：常量标识符（`THRESHOLD_DISCOUNT_PCT`、`E2001_BASE_IMAGE`）、赋值/键值（`timeout = 4800`）、文件路径——20KB 模块里那条关键配置行既不在开头也不是报错，只按规则 1 取时判定结果与"完全不看内容"一模一样（实测）；加上
+3. 纯散文结果取中段一行兜底（"掐中间"丢掉的正是中间）。
+
+摘录按结果硬性限额、计入 state 预算，不会撑大请求。注意与 `budget` 模式的交互：摘录改变的是*概率*；只有排序式裁决才能把更好的信息变成*不同的裁剪*。固定阈值下两组 A/B 行为完全一致——摘录的价值以排序规则为前提。
+
+### 判定可观测性（心跳）
+
+心跳现在记录**决策依据**而不只是计数——上面的 0.5 阈值失灵和上游 #25–#29 的回归，在纯计数心跳里全都不可见：
+
+| 字段 | 内容 |
+|---|---|
+| `keep` | 第一层裁决模式与参数（mode / 上限 / 下限 / 预算口径） |
+| `gate` | 最近一次压力门评估：`used` / 解析出的窗口 / 阈值 / `skip` + 原因 / 候选数 |
+| `probSummary` | `P(保留)` 分布：p10–p90、均值、高于/低于上限的计数 |
+| `probSamples` | 最近 200 个原始概率（画直方图用） |
+| `lastJudgePass.rows` | 逐候选明细：seq、工具、字符数、`prob`、`effectProb` |
+| `stats.preStepEvents` / `stats.judgePassSkipped` + `lastJudgeSkipReason` | 区分「事件没触发」/「没有候选」/「门控跳过」——从外部看曾经一模一样的三种失败 |
+
+顺带修了一个结构性问题：心跳是合并写，但 pre-step 钩子自己从不调 `writeHeartbeat`——门控跳过的 pass 会让文件冻在启动快照（`bootedAt == now`），所有跳过路径全部不可观测。现在钩子每步落盘。
 
 ### 越界配置的处理
 
