@@ -60,6 +60,22 @@ export const DSH_READONLY_TOOLS = [
 /** 默认白名单 = 上面的只读工具集（安全默认）。设为 `[]` 可放宽为只受黑名单约束。 */
 export const DEFAULT_COMPACT_TOOLS = [...DSH_READONLY_TOOLS]
 
+/**
+ * 相对分位模式需要的**最小总体规模**；低于它则降级为绝对下限模式（见 computeEligibleSeqs）。
+ * 独立导出是为了让 index.js 的 schema 与 receipt.js 的运行时兜底共用同一个数字——
+ * 两处各写一个字面量的话，改一处就会漂移。
+ */
+export const DEFAULT_MIN_CANDIDATES_FOR_RELATIVE = 4
+
+/**
+ * 降级模式（总体 < 上面那个数）的**绝对下限阈值**。明显严于 compactThreshold(0.5)：
+ * 没有相对排序信息时，只能靠"概率本身够不够低"来替代，所以阈值必须更保守。
+ */
+export const DEFAULT_FLOOR_THRESHOLD = 0.2
+
+/** 降级模式仍要求的最低样本量：低于它连"分布"都谈不上，宁可不做。 */
+export const DEFAULT_MIN_CANDIDATES_FOR_FLOOR = 3
+
 /** 永不整对移出的工具：改写型调用是承重信息（第一版实测 Jev 误删过 Edit）。比较时归一化。 */
 export const DEFAULT_NEVER_COMPACT_TOOLS = [
   'Edit', 'Write', 'MultiEdit', 'ApplyPatch', 'NotebookEdit',
@@ -136,22 +152,36 @@ function toolCallsOf(event) {
 }
 
 /**
- * assistant 消息里的文本长度（用于"这段推理不该被吞掉"的门控）。
+ * 按块类型分别统计 assistant 消息的字符数。
  *
- * ⚠️ 必须把 `reasoning` 块算进来：实测 DSH 的 assistant 消息块是
- * `[reasoning, tool-call]`（模型把思考写在 reasoning 里，text 常常只有一句"看一下。"）。
- * 只数 text 会让这个门控形同虚设——一条思考了两千字的步骤会被当成纯探查删掉。
+ * ⚠️ **text 与 reasoning 必须分开统计、分开设阈值**（这是 issue #26 的修复）。
+ *
+ * 历史经过（保留给维护者，避免又合并回去）：
+ *   最初只数 `text` —— 实测 DSH 的 assistant 消息块是 `[reasoning, tool-call]`，
+ *   模型把思考写在 reasoning 里、text 常常只有一句"看一下。"，于是门控形同虚设，
+ *   一条思考了两千字的步骤会被当成纯探查删掉。于是改成"text + reasoning 累加"。
+ *   但两者**性质完全不同**：`text` 是用户可见的结论/说明（长 = 有信息量，该守），
+ *   `reasoning` 是模型的草稿（长 = 想得多，**不代表这一步有承重信息**）。
+ *   合并累加的直接后果是阈值被 reasoning 主导：实测 DeepSeek 单步
+ *   text 0~287、reasoning 0~1207 字符，合并后卡在 1200 的右端——
+ *   **只要模型在思考上多花点字，第二层整层静默关闭**（实测 reasoning=1300 时
+ *   10 步里合格 0 步，且无任何日志提示是这道门导致的）。
+ *   分开之后，各自按自己的分布标定，两个信号互不污染。
+ *
+ * @returns {{text:number, reasoning:number}} 各自独立的字符数（码点计）
  */
-function assistantTextChars(event) {
+function assistantBlockChars(event) {
   const content = event.data?.message?.content
-  if (!Array.isArray(content)) return 0
-  let chars = 0
+  if (!Array.isArray(content)) return { text: 0, reasoning: 0 }
+  let text = 0
+  let reasoning = 0
   for (const block of content) {
-    if ((block?.type === 'text' || block?.type === 'reasoning') && typeof block.text === 'string') {
-      chars += Array.from(block.text).length
-    }
+    if (typeof block?.text !== 'string') continue
+    const chars = Array.from(block.text).length
+    if (block.type === 'text') text += chars
+    else if (block.type === 'reasoning') reasoning += chars
   }
-  return chars
+  return { text, reasoning }
 }
 
 /** tool-call 块的 id（不同版本字段名不同，逐个容忍）。
@@ -261,12 +291,18 @@ export function scanEvidence(text, patterns) {
  * （必须同时在两轴的尾部），而不是取并集。
  *
  * @param {Array<{seq:number, prob?:number, effectProb?:number}>} verdicts
- * @param {{quantile:number, minCandidates:number}} options
+ * @param {{quantile:number, minCandidates:number, minCandidatesForAbsolute?:number,
+ *   floorThreshold?:number, onNote?:(note:string)=>void}} options
  * @returns {Set<number>} 同时落在两轴尾部 quantile 的 seq 集合
  * @throws quantile 非法时抛错（issue #6：此前 NaN/undefined 会静默返回空集——
  *   第二层"功能静默死亡"，而 compactPass 还会把它渲染成"样本不够"，误导排查）
  */
-export function computeEligibleSeqs(verdicts, { quantile, minCandidates }) {
+export function computeEligibleSeqs(verdicts, {
+  quantile, minCandidates,
+  minCandidatesForAbsolute = 3,
+  floorThreshold = 0.2,
+  onNote,
+} = {}) {
   if (!Number.isFinite(quantile) || quantile < 0 || quantile > 1) {
     throw new Error(`compactQuantile 非法：${quantile}（必须是 0~1 的有限数值；配置留空/解析成 null 都会走到这里）`)
   }
@@ -276,8 +312,33 @@ export function computeEligibleSeqs(verdicts, { quantile, minCandidates }) {
     // 混进尾部，可能被选中做整对移出。口径与上面的 quantile 校验统一。
     (v) => Number.isFinite(v?.prob) && Number.isFinite(v?.effectProb),
   )
-  // 相对分位需要一个总体；样本太小则排序没有意义 → 宁可不做
-  if (usable.length < Math.max(2, minCandidates ?? 4)) return new Set()
+  if (usable.length === 0) return new Set()
+
+  // ── 小总体分支（issue #27 修复）────────────────────────────────────────────
+  // 此前 `usable.length < minCandidates` 直接返回空集：只读工具在写/执行密集会话里
+  // 常常只占极少数（实测只读 1/6 → 总体仅 2 条），于是**第二层在绝大多数真实会话里
+  // 静默不工作**，而报错文案只说"需要 ≥4 个"，看起来像"样本确实不够"，不像 bug。
+  //
+  // 修法：小总体时降级为**绝对下限兜底**，而不是放弃。安全性论证——
+  //   分位排序携带的是"会话内相对位置"信息，需要总体；绝对下限携带的是"这个值本身
+  //   够不够低"，不需要比较。两者正交，所以降级不是放宽安全标准，而是**换一个更弱的
+  //   信号**。为补偿这个信号更弱，这里加三重约束：
+  //     ① floorThreshold 比 compactThreshold(0.5) 严格得多（默认 0.2）
+  //     ② 仍然要求**两轴同时**满足（与相对模式口径一致——实测 result 轴被体量污染，
+  //        单看它会放过"结果很大但确实无用"的调用）
+  //     ③ 样本比 minCandidatesForAbsolute 还少时仍然不做（1 条根本谈不上分布）
+  //   注意这在数学上**不是绝对禁止**：当相对阈值取到 0.5 附近时，尾部就是 prob<0.5，
+  //   与绝对阈值同构。降级分支只是把阈值收紧到 0.2 来补足"没有相对信息"这个缺口。
+  if (usable.length < Math.max(2, minCandidates ?? 4)) {
+    if (usable.length < Math.max(1, minCandidatesForAbsolute)) {
+      onNote?.(`总体仅 ${usable.length} 条，低于绝对下限模式的最低样本 ${minCandidatesForAbsolute} → 不做整对移出`)
+      return new Set()
+    }
+    const floor = usable.filter((v) => v.prob < floorThreshold && v.effectProb < floorThreshold)
+    onNote?.(`总体仅 ${usable.length} 条（< ${minCandidates}）→ 降级为绝对下限模式：`
+      + `要求两轴同时 < ${floorThreshold}，命中 ${floor.length}/${usable.length} 条`)
+    return new Set(floor.map((v) => v.seq))
+  }
 
   // quantile=0 的语义是字面意义"一条不取"（issue #6：此前 Math.max(1,…) 会反而取 1 条）
   const take = quantile === 0 ? 0 : Math.max(1, Math.floor(usable.length * quantile))
@@ -348,7 +409,11 @@ export function selectReceiptRanges({ surface, eventAt, cache, dropVerdict, cfg 
     skippedToolUnknown: 0,
     skippedVerdict: 0,
     skippedGuard: 0,
+    /** 用户可见文本过长的步骤数（text 轴） */
     skippedText: 0,
+    /** 思考草稿过长的步骤数（reasoning 轴）——与 skippedText 分开计数，
+     *  否则排查时无法区分"是结论在守"还是"是草稿在守"（issue #26） */
+    skippedReasoning: 0,
     skippedIncomplete: 0,
     skippedShort: 0,
     guardHits: [],
@@ -385,7 +450,13 @@ export function selectReceiptRanges({ surface, eventAt, cache, dropVerdict, cfg 
     else if (cfg.compactTools.length > 0
       && step.calls.some((call) => !isToolIn(cfg.compactTools, call.name))) reason = 'tool'
     else if (step.calls.some((call) => isToolIn(cfg.neverCompactTools, call.name))) reason = 'tool'
-    else if (assistantTextChars(step.head) > cfg.maxStepTextChars) reason = 'text'
+    else {
+      // 两轴分开判（issue #26）：text = 结论/说明（长则守），reasoning = 草稿（长则守）。
+      // 拆开的重点是**阈值各自标定**——合并累加会让 reasoning 的分布盖住 text 的语义。
+      const { text, reasoning } = assistantBlockChars(step.head)
+      if (text > cfg.maxStepTextChars) reason = 'text'
+      else if (reasoning > cfg.maxStepReasoningChars) reason = 'reasoning'
+    }
     if (reason == null) {
       for (const seq of resultSeqs) {
         const verdict = cache?.get(seq)
@@ -428,6 +499,7 @@ export function selectReceiptRanges({ surface, eventAt, cache, dropVerdict, cfg 
         stats.skippedGuard += 1
         stats.guardHits.push({ headSeq: step.headSeq, matches: hits })
       } else if (reason === 'text') stats.skippedText += 1
+      else if (reason === 'reasoning') stats.skippedReasoning += 1
       else stats.skippedIncomplete += 1
       continue
     }

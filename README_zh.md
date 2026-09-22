@@ -42,11 +42,13 @@ DSH 自带的上下文回收是**纯体积**的：工具结果超过阈值就掐
 - **两轴判定取交集**：`result`（内容是否还需要）与 `effect`（调用是否改变了会话外状态）各自落在本次会话的尾部 `compactQuantile` 分位内
 - 工具不在 `neverCompactTools`（改写类调用按硬规则永不移出）
 - **证据守卫**：结果命中 `error` / `assert` / `fail` / `todo` 等词不移出（仍可被第一层截断）
-- assistant 消息文本（含 `reasoning`）超过 `maxStepTextChars` 的步骤不移出——那一步在推理
+- assistant 消息的**可见文本**超过 `maxStepTextChars`、或**思考草稿**（`reasoning`）超过 `maxStepReasoningChars` 的步骤不移出。两者**分开统计**：text 长说明这一步在交代结论（该守），reasoning 长只是模型草稿写得多（不代表有承重信息）。合并成一个预算时，光靠 reasoning 长度就能把第二层静默关掉
 - 落在最近 `preserveRecent` 个节点内不移出
 - 区间两端满足 DSH 的工具配对平衡；整段至少能省 `compactMinChars` 字符；回执 token 低于原内容的 `receiptMaxRatio`
 
 概率的使用方式是**相对分位**而不是固定阈值：判断型小模型的输出分布很窄，只有同一会话内的相对排序携带稳定信息。
+
+**小总体降级。** 只读工具在写/执行密集的会话里常常只占少数（实测只读 1/6），此时分位总体可能只有两三条——排序没有意义。这种情况**不是直接放弃**，而是降级为绝对下限模式：要求两轴**同时**低于 `floorThreshold`（默认 `0.2`，比 `compactThreshold` 明显更严，用来补偿"没有相对信息"这个缺口）。若样本连 `minCandidatesForFloor`（默认 3）都不到，则仍然不做——一两条谈不上分布。降级发生时会在报告与心跳里给出说明，不会静默发生。
 
 ## 环境要求
 
@@ -90,12 +92,33 @@ node wire_profile.mjs <DSH_HOME> <profile名>
 | `compactReceipts` / `compactOn` | `true` / `pressure` | 第二层开关与压力线（`compactSoftLimit` 默认 70%） |
 | `compactMode` | `relative` | `relative`（推荐）或 `absolute`（配 `compactThreshold`） |
 | `compactQuantile` | `0.34` | 两轴各取尾部的比例，取交集 |
+| `minCandidatesForRelative` | `4` | 相对分位的**最小总体规模**；低于它则降级为绝对下限模式（见下），**不是**直接放弃 |
+| `floorThreshold` / `minCandidatesForFloor` | `0.2` / `3` | 降级模式用的绝对下限（明显严于 `compactThreshold`）与其最低样本量 |
 | `neverCompactTools` | 改写类工具 | 永不移出；比较时归一化（`Edit` 与 `edit` 等价） |
 | `compactTools` | 只读工具集 | 白名单，**默认非空**（`DSH_READONLY_TOOLS`：`read`/`glob`/`grep`/`list`/`fetch`…，含 PowerShell 的 `getchilditem`/`selectstring` 等只读命令）；配成 `[]` 会**放宽**为只受黑名单约束——shell 调用也会被整对移出，属显式 opt-in 的不安全模式 |
 | `evidenceGuard` / `evidencePatterns` | `true` / 内置词表 | 证据守卫 |
 | `compactMinChars` / `receiptMaxRatio` | `2000` / `0.5` | 第二层经济性下限 |
 | `dryRun` | `false` | 两层只判定记账、不动手 |
 | `heartbeatFile` | `''` | 状态落盘路径（宿主会吞掉插件日志，落盘是唯一的外部观测通道） |
+
+### 越界配置的处理
+
+所有数值配置都有合法区间，越界值**不会**被原样送进运行时：
+
+- **经 `Config` schema 校验的路径**（宿主正常加载）→ 越界直接抛 `ValidationError`，响亮拒绝。
+- **未经归一化的路径**（`cordis.patch.yml` 直接注入配置对象、冒烟测试构造的 `PLUGIN_CFG`）→ 由 `resolveConfig` 钳制：非法值回落到**默认值**（不是钳到边界，因为"改了多少"不可解释），并在状态报告与心跳里留下一条 `configWarnings` 记录。
+
+举几个真实后果（都是修复前会**静默**发生的）：
+
+| 配置 | 修复前后果 |
+|---|---|
+| `preserveRecent = -5` | `lastAllowed` 反而变大 → **最近区保护完全失效**（会去动正在进行的工具调用） |
+| `maxStepTextChars = -1` | 每步都判为"文本过长" → **第二层永久静默失效** |
+| `compactMinChars = -100` | 该门形同不存在 |
+| `receiptMaxRatio = 5` | 回执比原文大 5 倍也放行（安全门失效） |
+| `keepThreshold = 2` | 第一层全部裁剪（`prob >= 2` 恒假） |
+
+`0` 在多数键上是**合法值**（如 `headChars = 0` 表示不留头、`preserveRecent = 0` 表示不保护最近区），不会被当成"没配"。
 
 ## 会话内使用
 
