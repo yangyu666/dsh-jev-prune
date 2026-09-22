@@ -12,7 +12,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { estimateTokens } from './jev.js'
+import { JevClient, JevError, estimateTokens } from './jev.js'
 import { countChars, decideAction, parseLimit, pruneSessionWithJev, sliceWithBudget } from './prune.js'
 import {
   DEFAULT_COMPACT_TOOLS,
@@ -57,18 +57,54 @@ import {
 const here = dirname(fileURLToPath(import.meta.url))
 
 // ---------------------------------------------------------------- token 估算
-// 词 = 1 + ⌊(len-1)/6⌋：6 个字母 → 1；12 个字母 → 2
+// 常数由真实 BPE 标定（见 jev.js 的 TOKEN_ESTIMATE_CONSTANTS 注释）。
+// 英文词 ≤ 6 字母 → 0.9 片，向上取整后是 1
 assert.equal(estimateTokens('abcdef'), 1)
+// 12 字母 → 0.9 + 6×0.16 = 1.86 → ceil = 2
 assert.equal(estimateTokens('abcdefghijkl'), 2)
-// 数字串 = len/2：4 位数字 → 2
-assert.equal(estimateTokens('1234'), 2)
-// 其他字符各 0.9：4 个符号 → ceil(3.6) = 4
-assert.equal(estimateTokens('....'), 4)
+// 数字串按 1.8 片/位分组：4 位 → 4/1.8 = 2.22 → ceil = 3
+assert.equal(estimateTokens('1234'), 3)
+// 符号成串按 0.65/字符：4 个 → 2.6 → ceil = 3
+assert.equal(estimateTokens('....'), 3)
 // 混排的实际量级：JSON 密集文本不能被明显低估
 const jsonish = '{"file_path": "/server/src/game/betting.ts", "limit": 1000}'
 const got = estimateTokens(jsonish)
 assert.ok(got >= 20 && got <= 60, `JSON 估算应在合理区间，实际 ${got}`)
 assert.equal(estimateTokens(''), 0)
+
+// 空串与纯空白都要落到 0/1 的边界，不能变成 0 除或 NaN
+assert.ok(estimateTokens(' ') >= 1, '纯空白至少要算 1（下游会拿它当除数）')
+
+// 标定效果（issue #33 回归）：对真实 BPE 的平均绝对偏差必须压住。
+//
+// ⚠️ 留出集原则（PR #28 review）：这些样本**不得**参与常数拟合。
+// 早期版本直接复用了标定数据本身，于是断言退化成同义反复——它必然通过，
+// 只能防"手改常数"，完全防不了"过拟合到拟合集"。
+// 下面这组是标定时**留出**的样本（gpt-tokenizer 实测值），常数没见过它们，
+// 所以 MAE 超过阈值真的说明泛化坏了。
+const HOLDOUT_CASES = [
+  // [文本, 真实 token 数（gpt-tokenizer 实测，未参与拟合）]
+  ['There is a substantial difference between a plausible-sounding explanation and a verified one; the former is cheap, the latter is not. '.repeat(3), 79],
+  ['DEFAULT_NEVER_PRUNE_TOOLS DEFAULT_NEVER_COMPACT_TOOLS resolveConfig clampConfigNumber CONFIG_RANGES CONFIG_WARNINGS '.repeat(3), 76],
+  ['这个插件的第一层只做截断（可逆），第二层会把调用与结果整对移出（破坏性），所以两层的黑名单必须分开维护。'.repeat(3), 120],
+  ['await client.ask(state, questions, { signal }) 之后要检查 lastRetries lastError 与 requests，不能用累计量判断"这一次"是否重试过。'.repeat(3), 105],
+  ['2026-09-22T02:58:00.579Z WARN meter=missing threshold=3000 measured=false action=proceed\n'.repeat(5), 150],
+]
+let tokenAbsDrift = 0
+for (const [text, real] of HOLDOUT_CASES) {
+  tokenAbsDrift += Math.abs(estimateTokens(text) - real) / real
+}
+const tokenMae = tokenAbsDrift / HOLDOUT_CASES.length
+if (!(tokenMae <= 0.15)) {
+  throw new Error(`token 估算在留出集上的平均绝对偏差 ${(tokenMae * 100).toFixed(1)}% 超过 15%`
+    + `（标定过拟合或常数被手改？）`)
+}
+
+// 方向性：估算不能系统性偏大（把两层的门都收紧）。
+// 旧实现在英文与路径上 +37%/+44%，正是这条要防的。
+const englishProse = HOLDOUT_CASES[0][0]
+assert.ok(estimateTokens(englishProse) / 79 - 1 <= 0.15,
+  `纯英文必须不显著高估（实际 ${estimateTokens(englishProse)} vs 真实 79）`)
 
 // ---------------------------------------------------------------- 事件构造
 function userEvent(seq, text) {
@@ -1320,7 +1356,8 @@ const run = ({ events, cache, cfg, threshold }) => {
 
   // ②f 计数类下界不能是 0（配 0 等于把功能关掉，那是布尔开关的职责）
   assert.equal(resolveConfig({ minHistoryLines: 0 }).minHistoryLines, 8)
-  assert.equal(resolveConfig({ maxCompactionsPerPass: 0 }).maxCompactionsPerPass, 1)
+  assert.equal(resolveConfig({ maxCompactionsPerPass: 0 }).maxCompactionsPerPass, 3,
+    '越界的配额回落默认值 3（issue #35 把默认从 1 提到 3）')
   assert.equal(resolveConfig({ minCandidatesForRelative: 1 }).minCandidatesForRelative,
     DEFAULT_MIN_CANDIDATES_FOR_RELATIVE, '相对分位至少要 2 条才谈得上"排序"')
 
@@ -1359,6 +1396,172 @@ const run = ({ events, cache, cfg, threshold }) => {
     if (typeof min !== 'number') continue
     assert.equal(clampConfigNumber(key, min - 1, 0, null)[1], true,
       `${key}：低于 schema 下界 ${min} 的值在钳制层也必须被判为越界`)
+  }
+}
+
+// ------------------------------------------- Jev 客户端：可重试失败与退避（issue #34）
+// 旧实现单次失败就丢掉整轮判定：一次网络抖动 → 本次 pass 全部候选没有概率 →
+// 两层静默不动。这里把"该重试的重试、不该重试的立刻放弃"两件事都钉住。
+{
+  const okBody = { answers: { q1: { noul: 0.12 } }, usage: { input_tokens: 10, output_tokens: 2 } }
+  const okResponse = () => ({ ok: true, status: 200, text: async () => JSON.stringify(okBody) })
+
+  // 1) 网络层异常（fetch 抛错）→ 重试；第二次成功
+  {
+    let calls = 0
+    const client = new JevClient({
+      apiKey: 'k',
+      maxRetries: 2,
+      retryBaseMs: 0,
+      fetchImpl: async () => {
+        calls += 1
+        if (calls === 1) throw new Error('ECONNRESET')
+        return okResponse()
+      },
+    })
+    const out = await client.ask('state', { q1: 'x' })
+    assert.equal(out.q1, 0.12, '重试后应拿到概率')
+    assert.equal(calls, 2, '网络异常应重试一次')
+    assert.equal(client.retries, 1)
+    assert.equal(client.lastRetries, 1, '本次 ask 重试了 1 次')
+    assert.equal(client.requests, 2, 'requests 计入失败尝试：2 次尝试都真的发出去了')
+    // 口径一致性（PR #28 review）：requests = 成功 ask 数 + 重试数
+    assert.equal(client.requests, 1 + client.retries, 'requests 必须等于成功次数 + 重试次数')
+
+    // 关键回归（PR #28 review）：累计量不得被当成"本次"用。
+    // 上一次 ask 重试过，这一次完全顺利 → lastRetries 必须归零，
+    // 否则状态报告会从此永久显示"重试 N 次"。
+    client.fetchImpl = okResponse
+    await client.ask('state', { q1: 'x' })
+    assert.equal(client.lastRetries, 0, '新的 ask 顺利时应报 lastRetries=0')
+    assert.equal(client.retries, 1, '累计量保留历史（供"这个 client 重试过没有"判断）')
+  }
+
+  // 2) 5xx → 重试；429 → 重试
+  for (const status of [500, 503, 429]) {
+    let calls = 0
+    const client = new JevClient({
+      apiKey: 'k',
+      maxRetries: 2,
+      retryBaseMs: 0,
+      fetchImpl: async () => {
+        calls += 1
+        if (calls === 1) return { ok: false, status, text: async () => 'boom' }
+        return okResponse()
+      },
+    })
+    const out = await client.ask('state', { q1: 'x' })
+    assert.equal(out.q1, 0.12, `${status} 之后应重试成功`)
+    assert.equal(calls, 2)
+  }
+
+  // 3) 4xx（密钥错 / 请求本身有问题）→ **不重试**，立刻抛
+  for (const status of [400, 401, 403, 404]) {
+    let calls = 0
+    const client = new JevClient({
+      apiKey: 'k',
+      maxRetries: 3,
+      retryBaseMs: 0,
+      fetchImpl: async () => {
+        calls += 1
+        return { ok: false, status, text: async () => 'nope' }
+      },
+    })
+    await assert.rejects(() => client.ask('state', { q1: 'x' }), JevError)
+    assert.equal(calls, 1, `${status} 不该重试（实际发了 ${calls} 次）`)
+    assert.equal(client.retries, 0)
+    assert.equal(client.lastRetries, 0)
+    assert.equal(client.requests, 1, '不可重试的失败也真的发过一次请求')
+  }
+
+  // 4) 响应缺 answers → 不重试（换一次大概率还是坏响应）
+  {
+    let calls = 0
+    const client = new JevClient({
+      apiKey: 'k',
+      maxRetries: 3,
+      retryBaseMs: 0,
+      fetchImpl: async () => {
+        calls += 1
+        return { ok: true, status: 200, text: async () => JSON.stringify({ usage: {} }) }
+      },
+    })
+    await assert.rejects(() => client.ask('state', { q1: 'x' }), /缺少 answers/)
+    assert.equal(calls, 1, '形状错误不该重试')
+  }
+
+  // 5) 一直失败 → 尝试次数 = maxRetries + 1（不多不少），并记录 lastError
+  {
+    let calls = 0
+    const client = new JevClient({
+      apiKey: 'k',
+      maxRetries: 2,
+      retryBaseMs: 0,
+      fetchImpl: async () => {
+        calls += 1
+        return { ok: false, status: 503, text: async () => 'down' }
+      },
+    })
+    await assert.rejects(() => client.ask('state', { q1: 'x' }), JevError)
+    assert.equal(calls, 3, 'maxRetries=2 表示最多 3 次尝试')
+    assert.equal(client.retries, 2)
+    assert.equal(client.lastRetries, 2)
+    assert.equal(client.requests, 3, '全部失败的 3 次尝试都要计入 requests')
+    assert.equal(client.requests, client.retries + 1, '口径：尝试数 = 重试数 + 1')
+    assert.ok(client.lastError.length > 0, 'lastError 要留下原因')
+  }
+
+  // 6) 外部 signal 已 abort → 一次都不发（用户中断不该触发重试）
+  {
+    let calls = 0
+    const client = new JevClient({
+      apiKey: 'k',
+      maxRetries: 3,
+      retryBaseMs: 0,
+      fetchImpl: async () => {
+        calls += 1
+        throw new Error('should not be called')
+      },
+    })
+    const ac = new AbortController()
+    ac.abort()
+    await assert.rejects(() => client.ask('state', { q1: 'x' }, { signal: ac.signal }), /中断/)
+    assert.equal(calls, 0, 'abort 后不应发起请求')
+  }
+
+  // 7) 请求中途被中断 → 不重试
+  {
+    let calls = 0
+    const client = new JevClient({
+      apiKey: 'k',
+      maxRetries: 3,
+      retryBaseMs: 0,
+      fetchImpl: async () => {
+        calls += 1
+        throw new Error('aborted by signal')
+      },
+    })
+    const ac = new AbortController()
+    const promise = client.ask('state', { q1: 'x' }, { signal: ac.signal })
+    ac.abort()
+    await assert.rejects(() => promise, /中断/)
+    assert.equal(calls, 1, '被中断时只发一次，不继续重试')
+  }
+
+  // 8) maxRetries=0 时退化为旧行为（不重试），确保配置可关
+  {
+    let calls = 0
+    const client = new JevClient({
+      apiKey: 'k',
+      maxRetries: 0,
+      retryBaseMs: 0,
+      fetchImpl: async () => {
+        calls += 1
+        throw new Error('boom')
+      },
+    })
+    await assert.rejects(() => client.ask('state', { q1: 'x' }), JevError)
+    assert.equal(calls, 1, 'maxRetries=0 应退化为单次尝试')
   }
 }
 

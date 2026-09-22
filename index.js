@@ -42,6 +42,7 @@ import {
   DEFAULT_MIN_CANDIDATES_FOR_FLOOR,
   DEFAULT_MIN_CANDIDATES_FOR_RELATIVE,
   DEFAULT_NEVER_COMPACT_TOOLS,
+  DEFAULT_NEVER_PRUNE_TOOLS,
   DSH_READONLY_TOOLS,
   RECEIPT_MARKER,
   computeEligibleSeqs,
@@ -167,16 +168,24 @@ export const Config = z.object({
   textTail: z.number().min(0).default(150),
   inputChars: z.number().min(0).default(300),
   judgeTimeoutMs: z.number().min(1).default(60000),
+  /**
+   * 单次 ask 内最多重试几次（issue #34）。只对可重试失败生效：
+   * 网络异常 / 超时 / 429 / 5xx。4xx 与响应形状错误立刻放弃（重试没意义）。
+   * 0 = 关闭重试（退化为旧行为）。
+   */
+  judgeMaxRetries: z.number().min(0).default(2),
+  /** 重试退避基数（ms）；实际等待为 base × 2^attempt。0 = 不等待（测试用） */
+  judgeRetryBaseMs: z.number().min(0).default(300),
   /** 只判定不裁剪，用来先观察行为 */
   dryRun: z.boolean().default(false),
   /** 提问措辞：goal（默认，实测区分度最高）| legacy（上游原味，几乎无区分度）| contrast | consequence */
   wording: z.string().default('goal'),
   /** state 历史最少保留的行数（避免为了塞进预算把上下文丢空） */
   minHistoryLines: z.number().min(1).default(8),
-  /** 结果永不裁剪的工具 */
-  // 两层用同一份黑名单（含 str_replace_editor 等别名）；比较在 decideAction 里归一化，
-  // 所以这里写 PascalCase 或小写都等价——外部审查回归后与第二层统一
-  neverPruneTools: z.array(z.string()).default(DEFAULT_NEVER_COMPACT_TOOLS),
+  /** 结果永不裁剪的工具。比第二层的 neverCompactTools **窄**（见 receipt.js 的说明） */
+  // 第一层只截断（可逆），所以默认只守"参数即内容"的写文件类工具；
+  // 差异型编辑工具（Edit / ApplyPatch …）第一层可裁，第二层仍守。
+  neverPruneTools: z.array(z.string()).default(DEFAULT_NEVER_PRUNE_TOOLS),
 
   // ---------------------------------------------------------------- 第二层：回执压缩
   /** 第二层总开关 */
@@ -249,8 +258,17 @@ export const Config = z.object({
   compactMinChars: z.number().min(0).default(2000),
   /** 回执必须是原内容 token 的这个比例以下才动手（服务端硬要求 <1.0，我们更严） */
   receiptMaxRatio: z.number().min(0).max(1).default(0.5),
-  /** 一次 pass 最多做几次压缩事务 */
-  maxCompactionsPerPass: z.number().min(1).default(1),
+  /**
+   * 一次 pass 最多做几次压缩事务（issue #35）。
+   *
+   * 旧默认值是 1：一次 pass 只回收一段，大上下文要靠**多轮 pre-step** 慢慢挤，
+   * 而每一轮都要重新走压力门、重新判定、重新选段——收敛慢且多花 Jev 调用。
+   * 单次 compactRegion 的成本是"一次摘要调用"（我们注入确定性回执，所以其实
+   * 不含模型生成），排队做 3 段与做 1 段的边际成本很低，于是默认提到 3。
+   *
+   * 上限仍是可配的：想完全回到旧行为就设成 1。
+   */
+  maxCompactionsPerPass: z.number().min(1).default(3),
   /** 回执里每行入参截断到多少字符 */
   receiptArgChars: z.number().min(0).default(120),
 
@@ -329,6 +347,8 @@ const CONFIG_RANGES = {
   maxStateTokens: [1, 1e9],
   maxRequestTokens: [1, 1e9],
   judgeTimeoutMs: [1, 1e9],
+  judgeMaxRetries: [0, 1e9],
+  judgeRetryBaseMs: [0, 1e9],
 }
 
 /**
@@ -371,7 +391,7 @@ export function resolveConfig(config = {}) {
     minCharsToPrune: clampConfigNumber('minCharsToPrune', config.minCharsToPrune, 400, (w) => warnings.push(w))[0],
     judgeOn: config.judgeOn ?? 'pressure',
     softLimit: config.softLimit ?? '55%',
-    neverPruneTools: config.neverPruneTools ?? DEFAULT_NEVER_COMPACT_TOOLS,
+    neverPruneTools: config.neverPruneTools ?? DEFAULT_NEVER_PRUNE_TOOLS,
     compactReceipts: config.compactReceipts ?? true,
     compactOn: config.compactOn ?? 'pressure',
     compactSoftLimit: config.compactSoftLimit ?? '70%',
@@ -389,7 +409,7 @@ export function resolveConfig(config = {}) {
     maxStepReasoningChars: clampConfigNumber('maxStepReasoningChars', config.maxStepReasoningChars, 4000, (w) => warnings.push(w))[0],
     compactMinChars: clampConfigNumber('compactMinChars', config.compactMinChars, 2000, (w) => warnings.push(w))[0],
     receiptMaxRatio: clampConfigNumber('receiptMaxRatio', config.receiptMaxRatio, 0.5, (w) => warnings.push(w))[0],
-    maxCompactionsPerPass: clampConfigNumber('maxCompactionsPerPass', config.maxCompactionsPerPass, 1, (w) => warnings.push(w))[0],
+    maxCompactionsPerPass: clampConfigNumber('maxCompactionsPerPass', config.maxCompactionsPerPass, 3, (w) => warnings.push(w))[0],
     receiptArgChars: clampConfigNumber('receiptArgChars', config.receiptArgChars, 120, (w) => warnings.push(w))[0],
     dryRun: config.dryRun ?? false,
     wording: config.wording ?? 'goal',
@@ -404,6 +424,8 @@ export function resolveConfig(config = {}) {
     maxStateTokens: clampConfigNumber('maxStateTokens', config.maxStateTokens, 25000, (w) => warnings.push(w))[0],
     maxRequestTokens: clampConfigNumber('maxRequestTokens', config.maxRequestTokens, 30000, (w) => warnings.push(w))[0],
     judgeTimeoutMs: clampConfigNumber('judgeTimeoutMs', config.judgeTimeoutMs, 60000, (w) => warnings.push(w))[0],
+    judgeMaxRetries: clampConfigNumber('judgeMaxRetries', config.judgeMaxRetries, 2, (w) => warnings.push(w))[0],
+    judgeRetryBaseMs: clampConfigNumber('judgeRetryBaseMs', config.judgeRetryBaseMs, 300, (w) => warnings.push(w))[0],
     heartbeatFile: config.heartbeatFile ?? '',
     logLevel: config.logLevel ?? 'info',
     // 越界配置的**审计出口**（issue #28）：钳制是静默改写用户意图的动作，
@@ -459,6 +481,8 @@ export function apply(ctx, config, deps = {}) {
     model: cfg.model,
     baseUrl: cfg.baseUrl,
     timeoutMs: cfg.judgeTimeoutMs,
+    maxRetries: cfg.judgeMaxRetries,
+    retryBaseMs: cfg.judgeRetryBaseMs,
   })
 
   /** session → Map(结果 seq → {keep, prob, effectProb, chars, tool}) */
@@ -476,6 +500,12 @@ export function apply(ctx, config, deps = {}) {
     skipped: 0,
     errors: 0,
     lastNote: '',
+    /**
+     * 判定批次失败次数（issue #34）。旧实现一处失败就冒泡、后续批次不再问，
+     * 已经能拿到的概率被一起丢掉；现在逐批容错，失败批数如实上报，
+     * 好判断"这轮少判了几批"而不是只看到一句笼统的失败。
+     */
+    judgeBatchFailures: 0,
     // 第二层
     compactions: 0,
     compactedSeqs: 0,
@@ -620,15 +650,52 @@ export function apply(ctx, config, deps = {}) {
     if (fresh.length === 0) return
 
     // 压力门控：不到软阈值就不花 Jev 的钱
+    //
+    // 失败方向（issue #32）：第一层与第二层的压力门必须**同向关闭**。
+    // 旧实现是不对称的——第二层解析不出阈值时 `return`（不做），第一层却直接
+    // **穿透**（照做）；更隐蔽的是 meter 缺失/抛错时 `used` 恒为 0，
+    // 于是 `0 < threshold` 永远成立 → 判定**每一轮都跑**，压力门等于不存在。
+    // 对一个"省 Jev 调用钱"的门来说，"解析不出来就别花钱"才是安全方向。
+    //
+    // 但"关闭"只对**真的算不出来**的情形成立（PR #28 review 修正）：
+    // `softLimit` 配成绝对 token 数时，threshold 由 limit.value 直接给出，
+    // **根本不需要 meter**。早期实现在这里无条件要求 `measured`，于是绝对阈值
+    // 分支也被挡掉——把"该省的钱省下来"升级成了"功能静默消失"，
+    // 比旧行为更糟。所以只要阈值本身能定出来（`threshold != null`），
+    // meter 不可用就只是"压力门降级为不设防"，而不是"什么都不做"。
     if (cfg.judgeOn !== 'always') {
       const meter = ctx.get('tokenMeter')
-      const used = typeof meter?.measure === 'function' ? (meter.measure(session)?.totalTokens ?? 0) : 0
+      let used = 0
+      let measured = false
+      try {
+        if (typeof meter?.measure === 'function') {
+          const measuredTokens = meter.measure(session)?.totalTokens
+          if (typeof measuredTokens === 'number' && Number.isFinite(measuredTokens)) {
+            used = measuredTokens
+            measured = true
+          }
+        }
+      } catch {
+        measured = false
+      }
       const windowTokens = await resolveWindow(agent)
       const limit = parseLimit(cfg.softLimit)
       const threshold = limit.kind === 'ratio'
         ? (windowTokens == null ? null : Math.floor(windowTokens * limit.value))
         : limit.value
-      if (threshold != null && used < threshold) {
+      if (threshold == null) {
+        // 阈值算不出来（ratio 模式 + 窗口未知）→ 与第二层同向：不做判定，不花钱
+        stats.skipped += fresh.length
+        stats.lastNote = '解析不出上下文窗口，第一层保守跳过（与第二层同向）'
+        log('info', stats.lastNote)
+        return
+      }
+      if (!measured) {
+        // 阈值能定出来但拿不到用量 → 无法比较，只能不设防地继续。
+        // 这里**不 return**：绝对阈值分支下 meter 本来就无关，return 等于把功能关掉。
+        stats.lastNote = `拿不到 token 用量（meter 缺失或抛错），压力门本次不设防（阈值 ${threshold}）`
+        log('warn', stats.lastNote)
+      } else if (used < threshold) {
         stats.skipped += fresh.length
         return
       }
@@ -657,26 +724,69 @@ export function apply(ctx, config, deps = {}) {
       overheadTokens: 40,
     })
 
-    const startRequests = judge.requests
+    const bySeq = new Map(fresh.map((c) => [c.seq, c]))
+    const freshSeqs = [...bySeq.keys()]
+    // 批级容错（issue #34）：旧实现让第一处失败冒泡到调用方，于是**后续批次也不会再问**——
+    // 已经能问出来的概率被一起丢掉。现在逐批 try：失败的批记一笔、继续问下一批。
+    // 只有**所有**批都失败才把错误抛出去（那种情况确实等于整轮没判定）。
+    let batchFailures = 0
+    let lastBatchError = null
+    let succeeded = 0
     for (const batch of batches) {
-      const answers = await judge.ask(state, batch, { signal })
-      for (const candidate of fresh) {
-        const prob = answers[`result_s${candidate.seq}`]
-        const effectProb = answers[`effect_s${candidate.seq}`]
-        if (typeof prob !== 'number' && typeof effectProb !== 'number') continue
-        const previous = cache.get(candidate.seq)
-        cache.set(candidate.seq, {
-          keep: typeof prob === 'number' ? prob >= cfg.keepThreshold : (previous?.keep ?? true),
+      let answers
+      try {
+        answers = await judge.ask(state, batch, { signal })
+      } catch (error) {
+        batchFailures += 1
+        lastBatchError = error
+        stats.judgeBatchFailures += 1
+        log('info', `判定批次失败（${batchFailures}/${batches.length}）：${error?.message ?? String(error)}`)
+        continue
+      }
+      succeeded += 1
+      // 遍历本批里的**候选**（一个候选有两个题号 result_sN / effect_sN）。
+      // 注意：两轴可能落在**不同批**（预算小的时候每题一批），所以本批只写
+      // 它带来的那一轴，另一轴留给它自己的批——合并写在下面按候选统一结算，
+      // 避免"同一候选被两批各记一次"。
+      const seqsInBatch = new Set()
+      for (const id of Object.keys(batch)) {
+        const seq = Number(id.slice(id.indexOf('_s') + 2))
+        if (Number.isFinite(seq)) seqsInBatch.add(seq)
+      }
+      for (const seq of seqsInBatch) {
+        const candidate = bySeq.get(seq)
+        if (candidate == null) continue
+        const prob = answers[`result_s${seq}`]
+        const effectProb = answers[`effect_s${seq}`]
+        const previous = cache.get(seq)
+        // 局部合并：本批给出的轴覆盖，未给出的轴沿用已有值
+        const merged = {
+          keep: typeof prob === 'number'
+            ? prob >= cfg.keepThreshold
+            : (previous?.keep ?? (typeof effectProb === 'number' ? effectProb >= cfg.keepThreshold : true)),
           prob: typeof prob === 'number' ? prob : (previous?.prob ?? null),
           effectProb: typeof effectProb === 'number' ? effectProb : (previous?.effectProb ?? null),
           chars: candidate.chars,
           tool: candidate.tool,
-        })
+        }
+        cache.set(seq, merged)
+      }
+    }
+    // 结算本轮的判定条数：按**候选**去重后统计（两轴齐了才算这一条判完）。
+    // 旧实现是"每批都遍历整个 fresh，能查到旧值就再累加一次"，条数按批数虚报。
+    for (const seq of freshSeqs) {
+      const value = cache.get(seq)
+      if (value != null && (typeof value.prob === 'number' || typeof value.effectProb === 'number')) {
         stats.judged += 1
       }
     }
     stats.requests += judge.requests - startRequests
+    if (batches.length > 0 && succeeded === 0) {
+      // 全部失败：这确实等于整轮没判定，如实抛出（调用方会记进 stats.errors）
+      throw lastBatchError ?? new Error('全部判定批次失败')
+    }
     stats.lastNote = `判定 ${fresh.length} 个候选，state ≈ ${estimateTokens(state)} tokens`
+      + (batchFailures > 0 ? `（${batchFailures}/${batches.length} 批失败，已跳过）` : '')
     log('debug', stats.lastNote)
     writeHeartbeat({
       lastJudgePass: {
@@ -898,15 +1008,22 @@ export function apply(ctx, config, deps = {}) {
     }
 
     // 压力门：整对删除比截断风险大，所以默认阈值更高（70% vs 第一层的 55%）
+    // 失败方向与第一层一致（issue #32）：解析不出阈值、或拿不到用量，都**不做**。
     if (!force && cfg.compactOn !== 'always') {
-      const used = (() => {
-        const meter = ctx.get?.('tokenMeter')
-        try {
-          return typeof meter?.measure === 'function' ? (meter.measure(session)?.totalTokens ?? 0) : 0
-        } catch {
-          return 0
+      const meter = ctx.get?.('tokenMeter')
+      let used = 0
+      let measured = false
+      try {
+        if (typeof meter?.measure === 'function') {
+          const measuredTokens = meter.measure(session)?.totalTokens
+          if (typeof measuredTokens === 'number' && Number.isFinite(measuredTokens)) {
+            used = measuredTokens
+            measured = true
+          }
         }
-      })()
+      } catch {
+        measured = false
+      }
       const limit = parseLimit(cfg.compactSoftLimit)
       const windowTokens = await resolveWindow(agent)
       const threshold = limit.kind === 'ratio'
@@ -917,7 +1034,13 @@ export function apply(ctx, config, deps = {}) {
         stats.compactSkipped += 1
         return report
       }
-      if (used < threshold) {
+      if (!measured) {
+        // 与第一层同口径（PR #28 review）：阈值能定出来时不因 meter 缺失而放弃，
+        // 只是压力门本次不设防。绝对阈值分支下 meter 本来就无关，
+        // 早期实现无条件 return 会把"保守"变成"功能静默消失"。
+        report.blocked = `拿不到 token 用量（meter 缺失或抛错），压力门本次不设防（阈值 ${threshold}）`
+        log('warn', report.blocked)
+      } else if (used < threshold) {
         report.blocked = `压力不足（${used} < ${threshold}）`
         stats.compactSkipped += 1
         return report
@@ -1146,6 +1269,18 @@ export function apply(ctx, config, deps = {}) {
         + `Jev 保留 ${stats.keptByJev} / Jev 裁掉 ${stats.prunedByJev} / 按体积兜底裁 ${stats.prunedByVolume}`
         + `（最近区保护 ${stats.keptByTail} / 黑名单保护 ${stats.keptByBlacklist} 不计入 Jev）`,
       `第一层：累计省下 ${stats.savedChars} 字符   压力门控跳过 ${stats.skipped} 次   错误 ${stats.errors} 次`,
+      // 批次失败与重试计数只在异常时出现（issue #34）：常态下不该占版面。
+      // 口径修正（PR #28 review）：这里要的是"最近一次 pass 重试了几次"（lastRetries），
+      // 而不是 client 从建起来到现在的累计量——后者一旦抖动过就永久 >0，
+      // 会让这一行在之后每一份报告里都出现，且数字只增不减。
+      ...(stats.judgeBatchFailures > 0 || judge.lastRetries > 0
+        ? [`判定请求：重试 ${judge.lastRetries ?? 0} 次   失败批次 ${stats.judgeBatchFailures} 个`
+          + (judge.lastError ? `   最近错误：${judge.lastError}` : '')]
+        : []),
+      // 累计重试只在真的发生过时出现，且与上面区分开，避免把历史当成现状
+      ...(judge.retries > 0 && judge.lastRetries === 0
+        ? [`判定请求：本 pass 无重试（本会话累计重试 ${judge.retries} 次、累计请求 ${judge.requests} 次）`]
+        : []),
       `第二层：summarize=${summaryHook.installed ? '已接管' : `未接管(${summaryHook.reason || '未尝试'})`}   `
         + `compactOn=${cfg.compactOn}   ${cfg.compactMode}${cfg.compactMode === 'relative' ? `(quantile=${cfg.compactQuantile})` : `(<${cfg.compactThreshold})`}`,
       `第二层：回执压缩 ${stats.compactions} 段 / 移出 ${stats.compactedSeqs} 节点 / 省约 ${stats.compactedChars} 字符   `
