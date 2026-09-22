@@ -41,18 +41,22 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Install full DSH dependency tree
+      - name: Install plugin deps + locked DSH host tree
         run: |
           npm ci --no-audit --no-fund
-          # 钉到 TESTED_DSH_VERSION，不用浮动 @next：2026-09-22 实测，上游把 next
-          # 升到 0.1.5-rc.3 时配套子包（dsh-client-ui-sidebar-documentpreview@^0.1.5-rc.3）
-          # 尚未发布，ETARGET 直接打断安装——任何 PR 在那个窗口都会挂 CI，且失败与
-          # PR 内容无关。版本对齐应覆盖 CI 的宿主安装（issue #19 同理）。
-          npm install --no-save --no-audit --no-fund @deepseek-ai/dsh@0.1.5-rc.2
+          # ⚠️ 宿主树来自**提交进仓库的锁定 fixture**（ci/dsh-host/package-lock.json，
+          # 585 包全锁 0.1.5-rc.2），用 npm ci 安装——不做任何 semver range 解析。
+          # 2026-09-22 两次实测：上游把 next 升到 0.1.5-rc.3 时只发了一部分子包
+          # （dsh-client-ui-sidebar-documentpreview@rc.3 缺失），而 dsh@rc.2 的 69 个
+          # 依赖全部声明为 `^0.1.5-rc.2`——semver 规则下该 range 匹配到同元组更大的
+          # rc.3，于是连钉死装 rc.2 都会在解析时漂进 rc.3 并 ETARGET（第一次用 @next、
+          # 第二次钉 rc.2 都炸在同一处）。浮动标签不行、钉单包也不行，唯一稳的是
+          # lockfile 冻结整棵树。升级宿主 = 在能装通新版本的机器上重新生成 fixture。
+          cd ci/dsh-host && npm ci --no-audit --no-fund
       - name: Make plugin resolvable as its package name
         run: |
-          mkdir -p node_modules/dsh-jev-prune
-          cp index.js jev.js state.js prune.js receipt.js package.json cordis.patch.yml node_modules/dsh-jev-prune/
+          mkdir -p ci/dsh-host/node_modules/dsh-jev-prune
+          cp index.js jev.js state.js prune.js receipt.js package.json cordis.patch.yml ci/dsh-host/node_modules/dsh-jev-prune/
       - name: Syntax-check shipped tools
         run: |
           node --check check.js
@@ -61,6 +65,7 @@ jobs:
           node --check verify_real_shapes.mjs
           node --check wire_profile.mjs
       - name: Real-host smoke (dynamic imports & version probe)
+        working-directory: ci/dsh-host
         run: |
           node --input-type=module -e "
             const m = await import('@deepseek-ai/dsh-llm');
@@ -68,10 +73,15 @@ jobs:
             console.log('freezeMessage ok');
           "
           node --input-type=module -e "
-            const m = await import('./index.js');
+            const m = await import('dsh-jev-prune');
             if (m?.name !== 'jev-prune') { console.error('插件模块加载异常'); process.exit(1); }
             console.log('plugin module loads against real DSH tree');
           "
+      - name: Assert host fixture matches testedAgainst
+        working-directory: ci/dsh-host
+        run: |
+          node -e "const v = require('@deepseek-ai/dsh/package.json').version; if (v !== '0.1.5-rc.2') { console.error('宿主树应为 0.1.5-rc.2，实际 ' + v); process.exit(1) }"
+          echo "host = @deepseek-ai/dsh@$(node -p "require('@deepseek-ai/dsh/package.json').version")"
       - name: Checks against real DSH tree
         run: |
           node check.js
