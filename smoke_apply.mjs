@@ -28,10 +28,14 @@ const check = (name, cond, detail = '') => (cond ? ok(name, detail) : bad(name, 
 // ---------------------------------------------------------------- 假 DSH 对象
 
 /**
- * 会话：user 提问 + 3 组只读探查（每组的工具结果大小不同）+ 1 条收尾文本。
+ * 会话：user 提问 + 若干组只读探查（每组的工具结果大小不同）+ 1 条收尾文本。
  * 这样才有「连续的只读步骤」可供第二层合并成一段。
+ *
+ * @param {Array<{tool:string,args:object,chars:number,interleave?:string}>} [plan]
+ *   自定义步骤表。默认三步连成**一段**；H 块要测多段配额，所以会传入
+ *   带 interleave（中间插一条 assistant 文本把段切开）的表。
  */
-function makeSession() {
+function makeSession(plan) {
   const events = new Map()
   let nextSeq = 1
   const add = (type, data) => {
@@ -52,9 +56,25 @@ function makeSession() {
 
   add('user/message', { content: [{ type: 'text', text: '排查河牌底池计算，先摸结构。' }], source: { kind: 'user' } })
   // 三步都必须在默认只读白名单内（read/grep/glob）——默认配置下 shell 工具进不了候选
-  const step1 = addStep('Read', { file_path: 'server/src/game/river.ts' }, 'a'.repeat(6000))
-  const step2 = addStep('Grep', { pattern: 'basePot', path: 'server/src' }, 'b'.repeat(4000))
-  const step3 = addStep('Glob', { pattern: '*.ts', path: 'server/src' }, 'c'.repeat(6000))
+  const effectivePlan = plan ?? [
+    { tool: 'Read', args: { file_path: 'server/src/game/river.ts' }, chars: 6000 },
+    { tool: 'Grep', args: { pattern: 'basePot', path: 'server/src' }, chars: 4000 },
+    { tool: 'Glob', args: { pattern: '*.ts', path: 'server/src' }, chars: 6000 },
+  ]
+  const steps = []
+  for (const item of effectivePlan) {
+    if (item.interleave) {
+      // 插一条不含 tool-call 的 assistant 文本，把前后两组只读步骤**切成两段**，
+      // 这样 maxCompactionsPerPass > 1 才有第二个可压区间
+      add('assistant/message', { message: { content: [{ type: 'text', text: item.interleave }] } })
+    }
+    const fill = item.fill ?? 'a'
+    steps.push(addStep(item.tool, item.args, fill.repeat(item.chars)))
+  }
+  const step1 = steps[0]
+  const step2 = steps[1]
+  const step3 = steps[2]
+
   const tail = add('assistant/message', { message: { content: [{ type: 'text', text: '继续。' }] } })
 
   const appended = []
@@ -253,6 +273,12 @@ check('导出 apply', typeof mod.apply === 'function')
 const PLUGIN_CFG = {
   enabled: true,
   apiKey: 'dummy', // 有注入的假 judge，这个不会被用到
+  // 本文件全部用例都走"决策路径"，不走压力门：假 ctx 里解析不出上下文窗口，
+  // 而并行门（issue #32）在两个方向上都要求**解析不出来就别做**——若沿用默认
+  // `judgeOn='pressure'`，第一层会诚实地什么都不做，测的就不是决策逻辑了。
+  // 压力门本身由下方 G 块专门覆盖。
+  judgeOn: 'always',
+  compactOn: 'always',
   preserveRecent: 0, // 让三条都进候选
   minCharsToPrune: 400,
   headChars: 600,
@@ -552,6 +578,174 @@ async function layer2Run(effectOfS2) {
   check('插件账本记到「回执摘要被消费 1 次」',
     /回执摘要被消费 1 次/.test(String(statusText)),
     String(statusText).split('\n').find((l) => /回执摘要被消费/.test(l)) ?? String(statusText).slice(0, 120))
+}
+
+// ---------- G. 两层压力门必须同向关闭（issue #32 回归） ----------
+// 旧实现是不对称的：第二层解析不出阈值 → 不做；第一层解析不出阈值 → **穿透照做**。
+// 更隐蔽的是 meter 缺失/抛错时 `used` 恒为 0，于是 `0 < threshold` 永远成立，
+// 判定每一轮都跑，压力门等于不存在。对一个"省 Jev 调用钱"的门来说，
+// "解析不出来就别花钱"才是安全方向。这里把两个方向都钉住。
+{
+  // G1：解析不出窗口 + 默认 judgeOn='pressure' → 第一层**不发请求**
+  const pruner = makePruner()
+  const session = makeSession()
+  const compaction = makeCompaction(session)
+  const ctx = makeCtx({ pruner, session, compaction })
+  const judge = fakeJudge({ [session.seqs.s1]: 0.05, [session.seqs.s2]: 0.05, [session.seqs.s3]: 0.05 },
+    { [session.seqs.s1]: 0.05, [session.seqs.s2]: 0.05, [session.seqs.s3]: 0.05 })
+  mod.apply(ctx, { ...PLUGIN_CFG, judgeOn: 'pressure' }, { judge })
+  await ctx.handlers.get('agent/pre-step')({ agent: { session, options: {} } }, () => {})
+  check('压力未知时第一层不发 Jev 请求（与第二层同向关闭）',
+    judge.requests === 0,
+    `实际发出 ${judge.requests} 次`)
+
+  // G2：meter 存在但 measure 抛错 → 同样不发请求（旧实现会把它当成 used=0 放行）
+  const pruner2 = makePruner()
+  const session2 = makeSession()
+  const compaction2 = makeCompaction(session2)
+  const ctx2 = makeCtx({ pruner: pruner2, session: session2, compaction: compaction2 })
+  ctx2.tokenMeter.measure = () => { throw new Error('meter 坏了') }
+  const judge2 = fakeJudge({ [session2.seqs.s1]: 0.05, [session2.seqs.s2]: 0.05, [session2.seqs.s3]: 0.05 },
+    { [session2.seqs.s1]: 0.05, [session2.seqs.s2]: 0.05, [session2.seqs.s3]: 0.05 })
+  mod.apply(ctx2, { ...PLUGIN_CFG, judgeOn: 'pressure' }, { judge: judge2 })
+  await ctx2.handlers.get('agent/pre-step')({ agent: { session: session2, options: {} } }, () => {})
+  check('meter 抛错时第一层也不发 Jev 请求（旧实现会放行）',
+    judge2.requests === 0,
+    `实际发出 ${judge2.requests} 次`)
+
+  // G3：meter 正常且用量低于阈值 → 不发请求；高于阈值 → 发
+  const pruner3 = makePruner()
+  const session3 = makeSession()
+  const compaction3 = makeCompaction(session3)
+  const ctx3 = makeCtx({ pruner: pruner3, session: session3, compaction: compaction3 })
+  // 用一个绝对阈值（非 ratio）绕开窗口解析：低于它必定不判，高于它必定判
+  const judge3 = fakeJudge({ [session3.seqs.s1]: 0.05, [session3.seqs.s2]: 0.05, [session3.seqs.s3]: 0.05 },
+    { [session3.seqs.s1]: 0.05, [session3.seqs.s2]: 0.05, [session3.seqs.s3]: 0.05 })
+  mod.apply(ctx3, { ...PLUGIN_CFG, judgeOn: 'pressure', softLimit: 999999 }, { judge: judge3 })
+  await ctx3.handlers.get('agent/pre-step')({ agent: { session: session3, options: {} } }, () => {})
+  check('用量低于绝对阈值时第一层不发请求', judge3.requests === 0, `实际发出 ${judge3.requests} 次`)
+
+  const pruner4 = makePruner()
+  const session4 = makeSession()
+  const compaction4 = makeCompaction(session4)
+  const ctx4 = makeCtx({ pruner: pruner4, session: session4, compaction: compaction4 })
+  const judge4 = fakeJudge({ [session4.seqs.s1]: 0.05, [session4.seqs.s2]: 0.05, [session4.seqs.s3]: 0.05 },
+    { [session4.seqs.s1]: 0.05, [session4.seqs.s2]: 0.05, [session4.seqs.s3]: 0.05 })
+  mod.apply(ctx4, { ...PLUGIN_CFG, judgeOn: 'pressure', softLimit: 1 }, { judge: judge4 })
+  await ctx4.handlers.get('agent/pre-step')({ agent: { session: session4, options: {} } }, () => {})
+  check('用量高于绝对阈值时第一层正常发请求', judge4.requests > 0, `实际发出 ${judge4.requests} 次`)
+}
+
+// ---------- H. 单次 pass 的压缩配额（issue #35 回归） ----------
+// 旧默认 maxCompactionsPerPass=1：一次 pass 只回收一段，大上下文要靠多轮 pre-step
+// 慢慢挤，每轮都要重走压力门 + 重判定。默认提到 3 之后，一段 pass 内应能压掉多段。
+// 这里用 interleave 把只读步骤切成**两段**，验证配额真的被放行了。
+{
+  const twoRangePlan = [
+    { tool: 'Read', args: { file_path: 'server/src/game/river.ts' }, chars: 6000, fill: 'a' },
+    { tool: 'Grep', args: { pattern: 'basePot', path: 'server/src' }, chars: 5000, fill: 'b' },
+    // 这条不带 tool-call 的 assistant 文本把前后只读步骤切成两段
+    { tool: 'Read', args: { file_path: 'server/src/game/turn.ts' }, chars: 6000, fill: 'c', interleave: '中间结论：再看下一段。' },
+    { tool: 'Glob', args: { pattern: '*.ts', path: 'server/src' }, chars: 5000, fill: 'd' },
+  ]
+  const pruner = makePruner()
+  const session = makeSession(twoRangePlan)
+  const compaction = makeCompaction(session)
+  const ctx = makeCtx({ pruner, session, compaction })
+  const seqs = session.steps.map((s) => s.result)
+  const judge = fakeJudge(
+    Object.fromEntries(seqs.map((s) => [s, 0.10])),
+    Object.fromEntries(seqs.map((s) => [s, 0.05])),
+  )
+  mod.apply(ctx, {
+    ...PLUGIN_CFG,
+    compactQuantile: 1,
+    minCandidatesForRelative: 3,
+    compactMinChars: 1000,
+    maxCompactionsPerPass: 2, // 显式给 2，确保两段都能压
+  }, { judge })
+
+  const agentRef = { agent: { session, options: {} } }
+  await ctx.handlers.get('agent/pre-step')(agentRef, () => {})
+  check('配额 ≥2 时一次 pass 压掉多段（旧默认 1 只能压一段）',
+    compaction.calls.length >= 2,
+    `实际压了 ${compaction.calls.length} 段`)
+
+  // 配额=1 必须严格只压一段（回归保护：配额不能被无视）
+  const pruner2 = makePruner()
+  const session2 = makeSession(twoRangePlan)
+  const compaction2 = makeCompaction(session2)
+  const ctx2 = makeCtx({ pruner: pruner2, session: session2, compaction: compaction2 })
+  const seqs2 = session2.steps.map((s) => s.result)
+  const judge2 = fakeJudge(
+    Object.fromEntries(seqs2.map((s) => [s, 0.10])),
+    Object.fromEntries(seqs2.map((s) => [s, 0.05])),
+  )
+  mod.apply(ctx2, {
+    ...PLUGIN_CFG,
+    compactQuantile: 1,
+    minCandidatesForRelative: 3,
+    compactMinChars: 1000,
+    maxCompactionsPerPass: 1,
+  }, { judge: judge2 })
+  await ctx2.handlers.get('agent/pre-step')({ agent: { session: session2, options: {} } }, () => {})
+  check('配额=1 时严格只压一段（配额不得被无视）',
+    compaction2.calls.length === 1,
+    `实际压了 ${compaction2.calls.length} 段`)
+
+  // 默认值必须是 3（issue #35 把默认从 1 上调）；通过 resolveConfig 读，避免硬编码漂移
+  const defaults = mod.resolveConfig({})
+  check('默认配额已从 1 提到 3', defaults.maxCompactionsPerPass === 3,
+    `实际默认 ${defaults.maxCompactionsPerPass}`)
+}
+
+// ---------- I. 批次循环只处理本批的题（issue #30 回归） ----------
+// 旧实现每批都遍历完整的 `fresh`：对不在本批里的候选，若缓存里已有旧值，
+// `previous` 分支会把它原样写回并**再累加一次** stats.judged——
+// 于是"判定了 N 条"按批数虚报（3 条切成 3 批 → 报 9 条）。
+// 这里造 3 条候选 + 只装得下 1 题的请求预算 = 3 批，
+// 然后直接读状态报告里的 `判定 N 次` 计数器。
+{
+  const pruner = makePruner()
+  const session = makeSession()
+  const compaction = makeCompaction(session)
+  const ctx = makeCtx({ pruner, session, compaction })
+  // 每条候选都给出真实的预置概率（这样 answers 里确实有值，不会被 `continue` 跳过）
+  const judge = fakeJudge({ [session.seqs.s1]: 0.10, [session.seqs.s2]: 0.11, [session.seqs.s3]: 0.12 },
+    { [session.seqs.s1]: 0.05, [session.seqs.s2]: 0.06, [session.seqs.s3]: 0.07 })
+  // 记录 fakeJudge 实际收到的问题个数，用来证明"确实切成了多批"
+  const batchSizes = []
+  const baseBatch = judge.batch
+  // 让假 judge 也尊重请求预算：每条陈述都**单独成批**（模拟 maxRequestTokens 极小）。
+  // 真 client 的 batch() 会按 token 预算切；这里直接按题切，等价于预算只装得下 1 题。
+  judge.batch = (state, questions, limits) => {
+    if (limits?.maxRequestTokens > 1) return baseBatch(state, questions, limits)
+    const out = Object.keys(questions).map((id) => ({ [id]: questions[id] }))
+    for (const b of out) batchSizes.push(Object.keys(b).length)
+    return out
+  }
+  // 强制每题一批（把预算压到 0，batch() 里每题都会单独成批）
+  mod.apply(ctx, {
+    ...PLUGIN_CFG,
+    dryRun: true,
+    maxRequestTokens: 1,
+  }, { judge })
+
+  const agentRef = { agent: { session, options: {} } }
+  await ctx.handlers.get('agent/pre-step')(agentRef, () => {})
+
+  const statusTool = ctx.registeredTools.find((t) => t?.name === 'jev_prune_status')
+  const statusText = String(await statusTool.execute({}, agentRef))
+  const judgedMatch = /判定 (\d+) 次/.exec(statusText)
+  const judgedCount = judgedMatch ? Number(judgedMatch[1]) : -1
+
+  // 前提成立性检查：必须真的切成了多批，否则这条测试说明不了问题
+  check('前提：请求预算被压到每题一批（否则本测试无意义）',
+    batchSizes.length >= 2,
+    `批数=${batchSizes.length} 各批题数=${JSON.stringify(batchSizes)}`)
+  check('批次循环不重复计数：3 条候选跨多批时判定数不得 >3（旧实现按批数虚报）',
+    judgedCount === 3,
+    `实际判定数=${judgedCount}（批数 ${batchSizes.length}）`)
 }
 
 // ---------------------------------------------------------------- 汇总

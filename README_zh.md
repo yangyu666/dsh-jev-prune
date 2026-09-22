@@ -110,12 +110,41 @@ node wire_profile.mjs <DSH_HOME> <profile名>
 | `compactQuantile` | `0.34` | 两轴各取尾部的比例，取交集 |
 | `minCandidatesForRelative` | `4` | 相对分位的**最小总体规模**；低于它则降级为绝对下限模式（见下），**不是**直接放弃 |
 | `floorThreshold` / `minCandidatesForFloor` | `0.2` / `3` | 降级模式用的绝对下限（明显严于 `compactThreshold`）与其最低样本量 |
-| `neverCompactTools` | 改写类工具 | 永不移出；比较时归一化（`Edit` 与 `edit` 等价） |
+| `neverCompactTools` | 改写类工具 | 第二层永不移出；比较时归一化（`Edit` 与 `edit` 等价） |
+| `neverPruneTools` | `Write` / `NotebookEdit` | **第一层**永不移出。比上一行**窄**：第一层只截断（可逆、原文仍在日志里），所以差异型编辑工具（`Edit`/`ApplyPatch`…）的参数可以裁；第二层是整对移出，所以那批工具仍然全守 |
 | `compactTools` | 只读工具集 | 白名单，**默认非空**（`DSH_READONLY_TOOLS`：`read`/`glob`/`grep`/`list`/`fetch`…，含 PowerShell 的 `getchilditem`/`selectstring` 等只读命令）；配成 `[]` 会**放宽**为只受黑名单约束——shell 调用也会被整对移出，属显式 opt-in 的不安全模式 |
 | `evidenceGuard` / `evidencePatterns` | `true` / 内置词表 | 证据守卫 |
 | `compactMinChars` / `receiptMaxRatio` | `2000` / `0.5` | 第二层经济性下限 |
+| `maxCompactionsPerPass` | `3` | 一次 pass 最多做几次压缩事务。提到 3 是为了让大上下文在**一轮**里收敛，而不是靠多轮 pre-step 慢慢挤；设成 `1` 回到旧行为 |
+| `judgeMaxRetries` / `judgeRetryBaseMs` | `2` / `300` | 判定请求的重试次数与退避基数（见下）；`0` 关闭重试 |
 | `dryRun` | `false` | 两层只判定记账、不动手 |
 | `heartbeatFile` | `''` | 状态落盘路径（宿主会吞掉插件日志，落盘是唯一的外部观测通道） |
+
+### 判定请求的重试
+
+一次网络抖动原本会让**整轮判定**作废——本次 pass 的所有候选都没有概率，两层随即静默不动。现在按失败类型区分处理：
+
+| 失败类型 | 处理 |
+|---|---|
+| 网络异常 / 超时 | **重试**，指数退避（`300ms` → `600ms`，默认最多 2 次） |
+| `429` / `5xx` | **重试**（服务端暂时不可用） |
+| 其他 `4xx`（`401` 密钥错 / `400` 请求有问题） | **不重试**，立刻抛（重试只是浪费额度） |
+| 响应缺 `answers` | **不重试**（换一次大概率还是坏响应） |
+| 外部 `signal` 已 abort | **不重试**，且不发新请求（用户中断就该停） |
+
+多个批次之间也做了容错：某个批失败不再让后续批次一起放弃，失败批数记入状态报告的 `失败批次 N 个`；只有**全部**批次都失败才当作整轮失败。
+
+### token 估算的精度
+
+`estimateTokens` 是启发式的（插件不打包 tokenizer），但常数不再靠直觉：用真实 BPE 对 22 组样本（英文散文/驼峰长词/JSON/Windows 与 Unix 路径/Git diff/中文/中英混合/代码块/日志/纯符号/十六进制/表格行/单字/空白）做过网格标定，目标取"拟合集 + 留出集"加权误差最小以防过拟合。
+
+平均绝对偏差从 **20.5% 降到 10.7%**（留出集 20.5% → 14.4%），且**方向性**修正了：旧实现在纯英文上高估 **+37%**、Unix 路径 **+44%**，而两层的门都拿它做分子/分母，等于把门都收紧了；新实现整体偏置约 **−0.3%**。`npm run check` 里有一条硬断言（MAE ≤ 15%）加上一条方向性断言，手改常数而没重跑标定会立刻失败。
+
+### 压力门的失败方向
+
+两层的压力门**同向关闭**：解析不出上下文窗口、或拿不到 token 用量（meter 缺失/抛错），**都不动作**。
+
+旧实现是不对称的——第二层解析不出阈值时不做，第一层却直接**穿透照做**；更隐蔽的是 meter 缺失时 `used` 恒为 `0`，于是 `0 < threshold` 永远成立，判定**每一轮都跑**，压力门等于不存在。对一个"省 Jev 调用钱"的门来说，"解析不出来就别花钱"才是安全方向。
 
 ### 越界配置的处理
 
@@ -174,7 +203,7 @@ cp smoke_apply.mjs <某目录>/ && cd <某目录>/ && node smoke_apply.mjs
 
 测试脚本与辅助工具（`check.js` / `smoke_apply.mjs` / `inspect_session.mjs` / `verify_real_shapes.mjs` / `wire_profile.mjs`）都随 npm 包发布，装好的包内可直接 `npm run check`。CI（`.github/workflows/ci.yml`）跑两组作业：仅 peer 依赖的快速冒烟 + 完整 DSH 依赖树的集成验证。
 
-覆盖：两个接入点的接管、两层完整裁决路径、append 协议、回执注入与**归属（fence）**、并发压缩竞态、门控分支（含反事实对照）、**文本/思考两轴分离**、**小总体降级**、**越界配置钳制**、**shell 类工具默认排除**（`pwsh Remove-Item` 回归用例）。
+覆盖：两个接入点的接管、两层完整裁决路径、append 协议、回执注入与**归属（fence）**、并发压缩竞态、门控分支（含反事实对照）、**文本/思考两轴分离**、**小总体降级**、**越界配置钳制**、**判定请求重试与批级容错**、**批次记账不重复**、**压力门同向关闭**、**token 标定精度**、**压缩配额**、**shell 类工具默认排除**（`pwsh Remove-Item` 回归用例）。
 
 **测试边界**（哪些是 CI 真正验证过的）：纯函数逻辑、假 ctx 下的接管与 append 协议、以及 integration 作业里的"真实依赖树下模块可加载 + freezeMessage 可用"。**没有**被 CI 覆盖的：真实 DSH 宿主内的服务接管、rc 版本间的事件形状漂移——这些只能在真实会话里用 `jev_probe_shapes` 校对。
 

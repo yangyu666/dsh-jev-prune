@@ -76,11 +76,34 @@ export const DEFAULT_FLOOR_THRESHOLD = 0.2
 /** 降级模式仍要求的最低样本量：低于它连"分布"都谈不上，宁可不做。 */
 export const DEFAULT_MIN_CANDIDATES_FOR_FLOOR = 3
 
-/** 永不整对移出的工具：改写型调用是承重信息（第一版实测 Jev 误删过 Edit）。比较时归一化。 */
+/**
+ * 永不**整对移出**的工具（第二层黑名单）：改写型调用是承重信息
+ * （第一版实测 Jev 误删过 Edit）。比较时归一化。
+ *
+ * 为什么必须与第一层的默认黑名单分开（issue #31）：两层的破坏性根本不同。
+ * 第一层只是**截断**——原文留在会话日志里，仍有损但可逆；
+ * 第二层是**整对移出**——调用与结果一起从 surface 上消失。
+ *
+ * 而这一组里两者兼有：`Write` / `NotebookEdit`（参数含完整内容）确实该两层都守；
+ * `Edit` / `MultiEdit` / `ApplyPatch` / `str_replace_*` / `apply_patch` 的参数
+ * 只是 **find/replace 差异**，第一层截掉的往往正是那段差异——但截断仍能靠重读文件
+ * 恢复；整对移出则会把"我改了什么"这个事实一起抹掉。
+ *
+ * 所以第二层保留全部，第一层放宽到只守"参数即内容"的那两个。
+ * 共用同一个常量会让第一层的意图（尽量多裁）被第二层的意图（尽量少删）绑住。
+ */
 export const DEFAULT_NEVER_COMPACT_TOOLS = [
   'Edit', 'Write', 'MultiEdit', 'ApplyPatch', 'NotebookEdit',
   'str_replace_editor', 'str_replace_based_edit_tool', 'apply_patch',
 ]
+
+/**
+ * 第一层（截断）永不触碰的工具。比第二层黑名单**窄**：只守住"参数本身就是内容"
+ * 的写文件类工具——截掉它们的入参等于把写进去的内容丢了，且日志里未必还有第二份。
+ * 差异型编辑工具（Edit 等）的参数是 diff，第一层截断后靠重读文件可以恢复，
+ * 因此不在这里（第二层仍然守）。
+ */
+export const DEFAULT_NEVER_PRUNE_TOOLS = ['Write', 'NotebookEdit']
 
 /**
  * 证据守卫的默认词表。命中即**不整对删除**（仍允许第一层截断，那是有损但可逆的）。

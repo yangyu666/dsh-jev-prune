@@ -12,7 +12,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { estimateTokens } from './jev.js'
+import { JevClient, JevError, estimateTokens } from './jev.js'
 import { countChars, decideAction, parseLimit, pruneSessionWithJev, sliceWithBudget } from './prune.js'
 import {
   DEFAULT_COMPACT_TOOLS,
@@ -57,18 +57,50 @@ import {
 const here = dirname(fileURLToPath(import.meta.url))
 
 // ---------------------------------------------------------------- token 估算
-// 词 = 1 + ⌊(len-1)/6⌋：6 个字母 → 1；12 个字母 → 2
+// 常数由真实 BPE 标定（见 jev.js 的 TOKEN_ESTIMATE_CONSTANTS 注释）。
+// 英文词 ≤ 6 字母 → 0.9 片，向上取整后是 1
 assert.equal(estimateTokens('abcdef'), 1)
+// 12 字母 → 0.9 + 6×0.16 = 1.86 → ceil = 2
 assert.equal(estimateTokens('abcdefghijkl'), 2)
-// 数字串 = len/2：4 位数字 → 2
-assert.equal(estimateTokens('1234'), 2)
-// 其他字符各 0.9：4 个符号 → ceil(3.6) = 4
-assert.equal(estimateTokens('....'), 4)
+// 数字串按 1.8 片/位分组：4 位 → 4/1.8 = 2.22 → ceil = 3
+assert.equal(estimateTokens('1234'), 3)
+// 符号成串按 0.65/字符：4 个 → 2.6 → ceil = 3
+assert.equal(estimateTokens('....'), 3)
 // 混排的实际量级：JSON 密集文本不能被明显低估
 const jsonish = '{"file_path": "/server/src/game/betting.ts", "limit": 1000}'
 const got = estimateTokens(jsonish)
 assert.ok(got >= 20 && got <= 60, `JSON 估算应在合理区间，实际 ${got}`)
 assert.equal(estimateTokens(''), 0)
+
+// 空串与纯空白都要落到 0/1 的边界，不能变成 0 除或 NaN
+assert.equal(estimateTokens(''), 0)
+assert.ok(estimateTokens(' ') >= 1, '纯空白至少要算 1（下游会拿它当除数）')
+
+// 标定效果（issue #33 回归）：对真实 BPE 的平均绝对偏差必须压住。
+// 这里的参考值是 gpt-tokenizer 在 22 组样本上的实测结果，硬编码成期望区间——
+// 如果有人手改常数而没重跑标定，这条会立刻失败。
+const CALIBRATION_CASES = [
+  // [文本, 真实 token 数（gpt-tokenizer 实测）]
+  ['The compaction layer removes spent read-only tool calls from the session surface and replaces them with a deterministic receipt generated entirely by code. '.repeat(3), 79],
+  ['estimateTokens computeEligibleSeqs selectReceiptRanges renderReceipt DEFAULT_NEVER_COMPACT_TOOLS '.repeat(4), 73],
+  ['这段代码在第二层压缩里负责把已经花掉的只读探查整对移出，并注入一份完全由代码生成的确定性回执，不含任何模型推断。'.repeat(3), 130],
+  ['第二层 second layer 调用 compactRegion(start, end, agent) 后由宿主动态派发 summarize，回执 receipt 必须小于原区间的 receiptMaxRatio。'.repeat(3), 114],
+  ['2026-09-22T02:58:00.579Z INFO seq=4213 chars=16489 tokens=4112 ratio=0.3421 status=ok\n'.repeat(5), 190],
+]
+let tokenAbsDrift = 0
+for (const [text, real] of CALIBRATION_CASES) {
+  tokenAbsDrift += Math.abs(estimateTokens(text) - real) / real
+}
+const tokenMae = tokenAbsDrift / CALIBRATION_CASES.length
+if (!(tokenMae <= 0.15)) {
+  throw new Error(`token 估算平均绝对偏差 ${(tokenMae * 100).toFixed(1)}% 超过 15%（标定已失效？）`)
+}
+
+// 方向性：估算不能系统性偏大（把两层的门都收紧）。
+// 旧实现在英文与路径上 +37%/+44%，正是这条要防的。
+const englishProse = CALIBRATION_CASES[0][0]
+assert.ok(estimateTokens(englishProse) / 79 - 1 <= 0.15,
+  `纯英文必须不显著高估（实际 ${estimateTokens(englishProse)} vs 真实 79）`)
 
 // ---------------------------------------------------------------- 事件构造
 function userEvent(seq, text) {
@@ -1320,7 +1352,8 @@ const run = ({ events, cache, cfg, threshold }) => {
 
   // ②f 计数类下界不能是 0（配 0 等于把功能关掉，那是布尔开关的职责）
   assert.equal(resolveConfig({ minHistoryLines: 0 }).minHistoryLines, 8)
-  assert.equal(resolveConfig({ maxCompactionsPerPass: 0 }).maxCompactionsPerPass, 1)
+  assert.equal(resolveConfig({ maxCompactionsPerPass: 0 }).maxCompactionsPerPass, 3,
+    '越界的配额回落默认值 3（issue #35 把默认从 1 提到 3）')
   assert.equal(resolveConfig({ minCandidatesForRelative: 1 }).minCandidatesForRelative,
     DEFAULT_MIN_CANDIDATES_FOR_RELATIVE, '相对分位至少要 2 条才谈得上"排序"')
 
@@ -1359,6 +1392,155 @@ const run = ({ events, cache, cfg, threshold }) => {
     if (typeof min !== 'number') continue
     assert.equal(clampConfigNumber(key, min - 1, 0, null)[1], true,
       `${key}：低于 schema 下界 ${min} 的值在钳制层也必须被判为越界`)
+  }
+}
+
+// ------------------------------------------- Jev 客户端：可重试失败与退避（issue #34）
+// 旧实现单次失败就丢掉整轮判定：一次网络抖动 → 本次 pass 全部候选没有概率 →
+// 两层静默不动。这里把"该重试的重试、不该重试的立刻放弃"两件事都钉住。
+{
+  const okBody = { answers: { q1: { noul: 0.12 } }, usage: { input_tokens: 10, output_tokens: 2 } }
+  const okResponse = () => ({ ok: true, status: 200, text: async () => JSON.stringify(okBody) })
+
+  // 1) 网络层异常（fetch 抛错）→ 重试；第二次成功
+  {
+    let calls = 0
+    const client = new JevClient({
+      apiKey: 'k',
+      maxRetries: 2,
+      retryBaseMs: 0,
+      fetchImpl: async () => {
+        calls += 1
+        if (calls === 1) throw new Error('ECONNRESET')
+        return okResponse()
+      },
+    })
+    const out = await client.ask('state', { q1: 'x' })
+    assert.equal(out.q1, 0.12, '重试后应拿到概率')
+    assert.equal(calls, 2, '网络异常应重试一次')
+    assert.equal(client.retries, 1)
+  }
+
+  // 2) 5xx → 重试；429 → 重试
+  for (const status of [500, 503, 429]) {
+    let calls = 0
+    const client = new JevClient({
+      apiKey: 'k',
+      maxRetries: 2,
+      retryBaseMs: 0,
+      fetchImpl: async () => {
+        calls += 1
+        if (calls === 1) return { ok: false, status, text: async () => 'boom' }
+        return okResponse()
+      },
+    })
+    const out = await client.ask('state', { q1: 'x' })
+    assert.equal(out.q1, 0.12, `${status} 之后应重试成功`)
+    assert.equal(calls, 2)
+  }
+
+  // 3) 4xx（密钥错 / 请求本身有问题）→ **不重试**，立刻抛
+  for (const status of [400, 401, 403, 404]) {
+    let calls = 0
+    const client = new JevClient({
+      apiKey: 'k',
+      maxRetries: 3,
+      retryBaseMs: 0,
+      fetchImpl: async () => {
+        calls += 1
+        return { ok: false, status, text: async () => 'nope' }
+      },
+    })
+    await assert.rejects(() => client.ask('state', { q1: 'x' }), JevError)
+    assert.equal(calls, 1, `${status} 不该重试（实际发了 ${calls} 次）`)
+    assert.equal(client.retries, 0)
+  }
+
+  // 4) 响应缺 answers → 不重试（换一次大概率还是坏响应）
+  {
+    let calls = 0
+    const client = new JevClient({
+      apiKey: 'k',
+      maxRetries: 3,
+      retryBaseMs: 0,
+      fetchImpl: async () => {
+        calls += 1
+        return { ok: true, status: 200, text: async () => JSON.stringify({ usage: {} }) }
+      },
+    })
+    await assert.rejects(() => client.ask('state', { q1: 'x' }), /缺少 answers/)
+    assert.equal(calls, 1, '形状错误不该重试')
+  }
+
+  // 5) 一直失败 → 尝试次数 = maxRetries + 1（不多不少），并记录 lastError
+  {
+    let calls = 0
+    const client = new JevClient({
+      apiKey: 'k',
+      maxRetries: 2,
+      retryBaseMs: 0,
+      fetchImpl: async () => {
+        calls += 1
+        return { ok: false, status: 503, text: async () => 'down' }
+      },
+    })
+    await assert.rejects(() => client.ask('state', { q1: 'x' }), JevError)
+    assert.equal(calls, 3, 'maxRetries=2 表示最多 3 次尝试')
+    assert.equal(client.retries, 2)
+    assert.ok(client.lastError.length > 0, 'lastError 要留下原因')
+  }
+
+  // 6) 外部 signal 已 abort → 一次都不发（用户中断不该触发重试）
+  {
+    let calls = 0
+    const client = new JevClient({
+      apiKey: 'k',
+      maxRetries: 3,
+      retryBaseMs: 0,
+      fetchImpl: async () => {
+        calls += 1
+        throw new Error('should not be called')
+      },
+    })
+    const ac = new AbortController()
+    ac.abort()
+    await assert.rejects(() => client.ask('state', { q1: 'x' }, { signal: ac.signal }), /中断/)
+    assert.equal(calls, 0, 'abort 后不应发起请求')
+  }
+
+  // 7) 请求中途被中断 → 不重试
+  {
+    let calls = 0
+    const client = new JevClient({
+      apiKey: 'k',
+      maxRetries: 3,
+      retryBaseMs: 0,
+      fetchImpl: async () => {
+        calls += 1
+        throw new Error('aborted by signal')
+      },
+    })
+    const ac = new AbortController()
+    const promise = client.ask('state', { q1: 'x' }, { signal: ac.signal })
+    ac.abort()
+    await assert.rejects(() => promise, /中断/)
+    assert.equal(calls, 1, '被中断时只发一次，不继续重试')
+  }
+
+  // 8) maxRetries=0 时退化为旧行为（不重试），确保配置可关
+  {
+    let calls = 0
+    const client = new JevClient({
+      apiKey: 'k',
+      maxRetries: 0,
+      retryBaseMs: 0,
+      fetchImpl: async () => {
+        calls += 1
+        throw new Error('boom')
+      },
+    })
+    await assert.rejects(() => client.ask('state', { q1: 'x' }), JevError)
+    assert.equal(calls, 1, 'maxRetries=0 应退化为单次尝试')
   }
 }
 

@@ -112,12 +112,41 @@ node wire_profile.mjs <DSH_HOME> <profile-name>
 | `compactQuantile` | `0.34` | The trailing fraction taken on each of the two axes; the intersection is used |
 | `minCandidatesForRelative` | `4` | Minimum population for relative quantiles; below it the mode **degrades** to an absolute floor (see below) rather than giving up |
 | `floorThreshold` / `minCandidatesForFloor` | `0.2` / `3` | Absolute floor used in the degraded mode (materially stricter than `compactThreshold`) and its minimum sample size |
-| `neverCompactTools` | write-type tools | Never moved out; comparison is normalized (`Edit` ≡ `edit`) |
+| `neverCompactTools` | write-type tools | Layer 2 never moves these out; comparison is normalized (`Edit` ≡ `edit`) |
+| `neverPruneTools` | `Write` / `NotebookEdit` | Layer **1** never touches these. Narrower than the row above on purpose: layer 1 only truncates (reversible, the original stays in the session log), so the arguments of diff-style editors (`Edit`/`ApplyPatch`…) are fair game; layer 2 removes the pair outright, so it keeps guarding all of them |
 | `compactTools` | read-only set | Allow-list, **non-empty by default** (`DSH_READONLY_TOOLS`: `read`/`glob`/`grep`/`list`/`fetch`… plus PowerShell read-only cmdlets such as `getchilditem`/`selectstring`). Setting it to `[]` relaxes the gate to the deny-list only — shell calls then become movable too, which is an explicit opt-in into an unsafe mode |
 | `evidenceGuard` / `evidencePatterns` | `true` / built-in list | Evidence guard |
 | `compactMinChars` / `receiptMaxRatio` | `2000` / `0.5` | Layer 2 economical floors |
+| `maxCompactionsPerPass` | `3` | How many compaction transactions one pass may run. Raised to 3 so a large context converges in a **single** pass instead of being squeezed across many pre-steps; set to `1` for the old behaviour |
+| `judgeMaxRetries` / `judgeRetryBaseMs` | `2` / `300` | Retry count and backoff base for judge requests (see below); `0` disables retries |
 | `dryRun` | `false` | Both layers only judge and account; nothing is changed |
 | `heartbeatFile` | `''` | Where to persist state (the host swallows plugin logs, so a file is the only external observation channel) |
+
+### Retrying judge requests
+
+A single network hiccup used to void the **entire round** of judging — no candidate got a probability and both layers silently did nothing. Failures are now classified:
+
+| Failure | Handling |
+|---|---|
+| Network error / timeout | **Retry** with exponential backoff (`300ms` → `600ms`, up to 2 retries by default) |
+| `429` / `5xx` | **Retry** (server temporarily unavailable) |
+| Other `4xx` (`401` bad key, `400` malformed request) | **No retry** — immediately fatal; retrying only burns quota |
+| Response missing `answers` | **No retry** (a retry would most likely return the same broken body) |
+| External `signal` already aborted | **No retry**, and no new request is issued |
+
+Batches are isolated too: one failed batch no longer discards the remaining ones, and the count shows up as `失败批次 N 个` in the status report. Only when **every** batch fails is the round treated as failed.
+
+### Token-estimate accuracy
+
+`estimateTokens` is a heuristic (the plugin ships no tokenizer), but its constants are no longer guesses: they were grid-searched against a real BPE tokenizer over 22 samples (English prose, camelCase identifiers, JSON, Windows and Unix paths, git diffs, Chinese, mixed Chinese/English, code blocks, logs, pure punctuation, hex/UUID, table rows, single glyphs, whitespace), scoring on a **weighted fit + holdout** objective to avoid overfitting.
+
+Mean absolute error drops from **20.5% to 10.7%** (holdout 20.5% → 14.4%), and the **direction** was corrected: the old formula over-estimated pure English by **+37%** and Unix paths by **+44%**, and since both layers use this value in a ratio, it was tightening both gates. The new estimate is essentially unbiased (−0.3%). `npm run check` carries a hard assertion (MAE ≤ 15%) plus a direction assertion, so hand-editing the constants without re-running the calibration fails immediately.
+
+### Pressure-gate failure direction
+
+Both layers now fail **closed** and in the same direction: if the context window cannot be resolved, or the token usage cannot be measured (meter missing or throwing), **neither layer acts**.
+
+The old behaviour was asymmetric — layer 2 skipped when it could not resolve a threshold, while layer 1 simply **fell through and proceeded**; more subtly, a missing meter left `used` at `0`, so `0 < threshold` was always true and judging ran **every single round**, i.e. the gate did not exist. For a gate whose purpose is to avoid spending Jev calls, "if we cannot tell, do not spend" is the safe direction.
 
 ### Out-of-range configuration
 
@@ -175,7 +204,7 @@ cp smoke_apply.mjs <some-dir>/ && cd <some-dir>/ && node smoke_apply.mjs
 
 The test scripts and helper tools (`check.js` / `smoke_apply.mjs` / `inspect_session.mjs` / `verify_real_shapes.mjs` / `wire_profile.mjs`) all ship with the npm package, so a plain `npm run check` works inside an installed copy. CI (`.github/workflows/ci.yml`) runs two jobs: a fast smoke job on the peer dependencies alone, and an integration job on the full DSH dependency tree.
 
-Coverage: the takeover of both interception points, the full decision path of both layers, the append protocol, receipt injection and its **ownership (fence)**, concurrent-compaction races, every gating branch (with counterfactual controls), the **text/`reasoning` split**, **small-population degradation**, **out-of-range config clamping**, and **shell-type tools being excluded by default** (the `pwsh Remove-Item` regression case).
+Coverage: the takeover of both interception points, the full decision path of both layers, the append protocol, receipt injection and its **ownership (fence)**, concurrent-compaction races, every gating branch (with counterfactual controls), the **text/`reasoning` split**, **small-population degradation**, **out-of-range config clamping**, **judge retries and per-batch isolation**, **non-duplicated batch accounting**, **pressure gates failing closed in the same direction**, **token-estimate calibration**, the **compaction quota**, and **shell-type tools being excluded by default** (the `pwsh Remove-Item` regression case).
 
 **Test boundaries** (what CI actually verifies): pure-function logic, takeover and the append protocol under a fake ctx, plus — in the integration job — "the plugin module loads against the real dependency tree and `freezeMessage` is available". **Not** covered by CI: service takeover inside a live DSH host and event-shape drift between rc versions — verify those with `jev_probe_shapes` in a real session.
 
