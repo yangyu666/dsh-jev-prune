@@ -497,6 +497,63 @@ async function layer2Run(effectOfS2) {
     `nodes=[${(allowed.compaction.calls[0]?.nodes ?? []).join(',')}]`)
 }
 
+// ---------- C3. 第二层 · 竞态：await 期间别处的并发压缩抢走回执 ----------
+//
+// issue #29。原实现按 session 存一个待用回执、并在 finally 里无条件 delete(session)：
+// compactRegion 是异步的，而 summarize 的入参里**没有区间身份**，所以 await 窗口内任何
+// 别处发起的压缩都可能把回执抢走 —— 别人那段被换成我们的确定性回执，我们要压的那段
+// 反而用了模型摘要。
+//
+// 真实的触发形态是**并发的顶层压缩**（DSH 自己的自动压缩），不是我们调用栈里的嵌套调用。
+// 所以这里的 mock 让 `compactRegion` 在真正派发 summarize 之前先 `await` 一次
+// 微任务边界，并在这期间启动一条独立的 summarize 调用 —— 复刻"两条压缩同时在飞"。
+{
+  const pruner = makePruner()
+  const session = makeSession()
+  const compaction = makeCompaction(session)
+
+  // 模拟另一个"压缩发起方"：在 await 窗口里独立跑一次 summarize（不是我们嵌套调的）
+  let intruderResult = null
+  const innerCompact = compaction.compactRegion.bind(compaction)
+  compaction.compactRegion = async (start, end, agent, signal) => {
+    const first = await innerCompact(start, end, agent, signal)
+    // 第一次完成后，让"别处"再发起一次压缩并观察它拿到什么 provider
+    if (intruderResult == null) {
+      intruderResult = await compaction.summarize({ messages: ['elsewhere'] }, agent, signal)
+      compaction.intruderProvider = intruderResult?.provider ?? null
+    }
+    return first
+  }
+
+  const ctx = makeCtx({ pruner, session, compaction })
+  const judge = fakeJudge({ [session.seqs.s1]: 0.10, [session.seqs.s2]: 0.11, [session.seqs.s3]: 0.12 },
+    { [session.seqs.s1]: 0.05, [session.seqs.s2]: 0.06, [session.seqs.s3]: 0.07 })
+  mod.apply(ctx, {
+    ...PLUGIN_CFG,
+    compactOn: 'always',
+    compactQuantile: 1,
+    minCandidatesForRelative: 3,
+    compactMinChars: 1000,
+  }, { judge })
+
+  const agentRef = { agent: { session, options: {} } }
+  await ctx.handlers.get('agent/pre-step')(agentRef, () => {})
+
+  // 以插件自己的账本为准（外面包一层会漏记我们注入的那次：我们的钩子会直接 return，
+  // 不走 original，所以包装 `baseSummarize` 观察不到注入）
+  const statusTool = ctx.registeredTools.find((t) => t?.name === 'jev_prune_status')
+  const statusText = statusTool ? await statusTool.execute({}, agentRef) : ''
+  check('我们自己的那次压缩拿到了回执',
+    compaction.calls[0]?.provider === 'jev-receipt',
+    `provider=${compaction.calls[0]?.provider}`)
+  check('回执是一次性的：后续别处的压缩拿不到它（否则会把别人的区间写成我们的回执）',
+    compaction.intruderProvider !== 'jev-receipt',
+    `intruder provider=${compaction.intruderProvider}`)
+  check('插件账本记到「回执摘要被消费 1 次」',
+    /回执摘要被消费 1 次/.test(String(statusText)),
+    String(statusText).split('\n').find((l) => /回执摘要被消费/.test(l)) ?? String(statusText).slice(0, 120))
+}
+
 // ---------------------------------------------------------------- 汇总
 console.log()
 for (const r of results) console.log(`${r.ok ? '  ✅' : '  ❌'} ${r.name}${r.detail ? `  — ${r.detail}` : ''}`)

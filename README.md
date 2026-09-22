@@ -52,6 +52,22 @@ Probabilities are consumed as **relative quantiles**, never as a fixed threshold
 
 **Degradation on small populations.** Read-only tools are often a minority in write/execute-heavy sessions (measured: 1 in 6), which can leave a quantile population of only two or three items — too few for ordering to mean anything. Rather than giving up, the mode degrades to an **absolute floor**: both axes must fall below `floorThreshold` (default `0.2`, materially stricter than `compactThreshold`, compensating for the missing relative information). If the population is below `minCandidatesForFloor` (default `3`), nothing is moved out — one or two samples are not a distribution. Degradation is always reported in the report and the heartbeat; it never happens silently.
 
+## Receipt ownership (fence)
+
+Layer 2 injects through a short pipeline: the plugin renders a receipt → stores it in `pendingReceipt` → calls `compactRegion` → DSH calls back into `summarize`, where the receipt is handed over.
+
+The trouble is that `compactRegion` is **asynchronous**, and `summarize` receives **no range identity** — it cannot tell which compaction it is being invoked for. So if anything else (say DSH's own automatic compaction) starts a compaction while we are awaiting, both share the same session-keyed slot: **that other span gets replaced by our receipt, and the span we meant to compact falls back to a model summary.** Both histories are corrupted, and neither side reports an error.
+
+The fix issues an **ownership token** (fencing token) per compaction, with three constraints:
+
+| Mechanism | Effect |
+|---|---|
+| Ownership token | The producer bumps `fenceCounter` and records `activeFence`; `summarize` injects only when `entry.fence === activeFence` |
+| Claim-once | `entry.claimed` latches, so repeated `summarize` calls within one compaction cannot double-inject |
+| Ownership check | After `compactRegion` returns, the token is verified; if it was taken over we set `action.fenceLost = true` and **never report a false success** |
+
+`finally` clears **only our own** token — the original implementation deleted the session entry unconditionally, which wiped another compaction's pending receipt. Takeovers are counted in `receiptFenceMisses` and surfaced in the status report when non-zero; in that case the span falls back to a model summary, which is the safe direction.
+
 ## Requirements
 
 - Node `^22.19.0 || >=24.0.0`
@@ -159,7 +175,7 @@ cp smoke_apply.mjs <some-dir>/ && cd <some-dir>/ && node smoke_apply.mjs
 
 The test scripts and helper tools (`check.js` / `smoke_apply.mjs` / `inspect_session.mjs` / `verify_real_shapes.mjs` / `wire_profile.mjs`) all ship with the npm package, so a plain `npm run check` works inside an installed copy. CI (`.github/workflows/ci.yml`) runs two jobs: a fast smoke job on the peer dependencies alone, and an integration job on the full DSH dependency tree.
 
-Coverage: the takeover of both interception points, the full decision path of both layers, the append protocol, receipt injection, every gating branch (with counterfactual controls), and **shell-type tools being excluded by default** (the `pwsh Remove-Item` regression case).
+Coverage: the takeover of both interception points, the full decision path of both layers, the append protocol, receipt injection and its **ownership (fence)**, concurrent-compaction races, every gating branch (with counterfactual controls), the **text/`reasoning` split**, **small-population degradation**, **out-of-range config clamping**, and **shell-type tools being excluded by default** (the `pwsh Remove-Item` regression case).
 
 **Test boundaries** (what CI actually verifies): pure-function logic, takeover and the append protocol under a fake ctx, plus — in the integration job — "the plugin module loads against the real dependency tree and `freezeMessage` is available". **Not** covered by CI: service takeover inside a live DSH host and event-shape drift between rc versions — verify those with `jev_probe_shapes` in a real session.
 

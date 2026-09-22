@@ -481,6 +481,14 @@ export function apply(ctx, config, deps = {}) {
     compactedSeqs: 0,
     compactedChars: 0,
     receiptSummaries: 0,
+    /**
+     * 回执因**竞态**没能注入的次数（issue #29）。
+     *
+     * 为什么必须单独计数：竞态的表现是"回执被别处的并发压缩抢走"，而结果看起来
+     * 只是"这次压缩用了模型摘要"——与"我们没打算压缩它"完全无法区分。
+     * 不复数上报的话，这个 bug 只能靠读代码发现。
+     */
+    receiptFenceMisses: 0,
     compactSkipped: 0,
     lastCompactNote: '',
   }
@@ -738,8 +746,29 @@ export function apply(ctx, config, deps = {}) {
   // 内部是通过 `this.summarize(...)` **动态派发**的 —— 所以在实例上猴补丁它就够了，
   // 不需要 fork 后端、也不需要另写一个 CompactionEngine。
   //
-  // 补丁只认「我们自己刚放进 pending 的那一次调用」：带 5 分钟有效期，
-  // 且无论成功失败都在 finally 里清掉，避免影响别处（例如自动压缩）的摘要生成。
+  // ⚠️ 竞态（issue #29）：`compactRegion` 是异步的，`summarize` 的入参里**没有区间身份**
+  // （只有 `input` / `agent` / `signal`，我们无法从中看出"这次摘要对应哪个区间"）。
+  // 所以只要按 session 存一个待用回执，在 `await compactRegion(...)` 期间**任何**别处
+  // 发起的压缩（DSH 自己的自动压缩、另一条并发路径）都会调到 summarize，把回执抢走——
+  // 结果是"别人那段被换成了我们的确定性回执，而我们要压的那段反而用了模型摘要"。
+  //
+  // 修法分两层，缺一不可：
+  //   ① **归属令牌（fencing token）**：每次 compactRegion 前发一个新令牌，并把它记在
+  //      `activeFence` 上。summarize 只在「当前 activeFence === 待用回执的令牌」时才注入——
+  //      即证明"这次 summarize 是在我们那次 compactRegion 的调用栈/时序内发生的"。
+  //      await 期间若被别处的调用抢先，activeFence 会被对方改写，我们自然不注入。
+  //   ② **一次性领取（claim-once）**：回执被消费后立刻 delete，且令牌是一次性的，
+  //      防止同一次压缩里 summarize 被调用多次时重复注入。
+  //   ③ **归属校验（owner check）**：compactRegion 返回后核对令牌是否仍属于本次调用，
+  //      不属于则说明中途被打断，如实记进 action，不谎报成功。
+  let fenceCounter = 0
+  /**
+   * 当前"活跃"的压缩令牌。每次我们要调 compactRegion 时自增并置为最新值；
+   * summarize 只在待用回执的令牌与之相等时才注入。它是"归属证明"：
+   * 我们那次 compactRegion 里面派发的 summarize 一定看到自己的令牌，
+   * 而 await 期间被别处抢先发起的压缩会把它改写成对方的令牌。
+   */
+  let activeFence = 0
   const pendingReceipt = new WeakMap()
 
   function summaryService() {
@@ -761,14 +790,27 @@ export function apply(ctx, config, deps = {}) {
     const original = compaction.summarize.bind(compaction)
     compaction.summarize = async (input, agent, signal) => {
       const entry = pendingReceipt.get(agent?.session)
-      if (entry != null && Date.now() - entry.at < 5 * 60 * 1000) {
-        pendingReceipt.delete(agent.session)
+      // 三道闸都要过才算"这是我们的那一次"（issue #29）：
+      //   · entry 存在、未过期
+      //   · 未被领取（claimed）—— 同一次压缩里 summarize 若被多次调用，只注入一次
+      //   · 令牌仍是当前活跃令牌 —— 证明这次 summarize 发生在我们那次 compactRegion 之内，
+      //     而不是被 await 期间别处的并发压缩抢先调用
+      if (entry != null
+        && !entry.claimed
+        && entry.fence === activeFence
+        && Date.now() - entry.at < 5 * 60 * 1000) {
+        entry.claimed = true
         stats.receiptSummaries += 1
         return {
           summary: [{ type: 'text', text: entry.text }],
           provider: 'jev-receipt',
           model: 'deterministic',
         }
+      }
+      // 不是我们的：如实退回原实现，绝不吞掉别人的摘要。
+      // 若 entry 存在但令牌不匹配，说明恰好撞上竞态 —— 记一笔，让"回执被抢"可观测。
+      if (entry != null && !entry.claimed && entry.fence !== activeFence) {
+        stats.receiptFenceMisses += 1
       }
       return original(input, agent, signal)
     }
@@ -970,9 +1012,20 @@ export function apply(ctx, config, deps = {}) {
         continue
       }
 
-      pendingReceipt.set(session, { text: receipt, at: Date.now() })
+      // 发一个一次性令牌并抢占 activeFence（issue #29）。
+      // 之后若别处的并发压缩改写了 activeFence，我们这次的 summarize 就不会注入回执，
+      // 也就不会把别人的区间替换成我们的回执——那是原实现最危险的失败模式。
+      const fence = (fenceCounter += 1)
+      activeFence = fence
+      pendingReceipt.set(session, { text: receipt, at: Date.now(), fence, claimed: false })
       try {
         const result = await compaction.compactRegion(range.start, range.end, agent, options.signal)
+        // 归属校验：compactRegion 返回时令牌若已被别人改写，说明这次压缩中途被打断
+        // （或我们的回执被别人消费了）。此时不能谎报成功——如实记下来。
+        if (activeFence !== fence) {
+          stats.receiptFenceMisses += 1
+          action.fenceLost = true
+        }
         done += 1
         stats.compactions += 1
         stats.compactedSeqs += result?.shadowedSeqs?.length ?? spanSeqs.length
@@ -988,7 +1041,11 @@ export function apply(ctx, config, deps = {}) {
         action.error = error?.message ?? String(error)
         report.actions.push(action)
       } finally {
-        pendingReceipt.delete(session)
+        // 只清理**自己**的令牌：若期间已被别人改写，那个令牌归对方管，不要去动它
+        // （原实现无论谁覆盖都无条件 delete(session)，会把别人的待用回执一起清掉）
+        const current = pendingReceipt.get(session)
+        if (current?.fence === fence) pendingReceipt.delete(session)
+        if (activeFence === fence) activeFence = 0
       }
     }
 
@@ -1092,7 +1149,11 @@ export function apply(ctx, config, deps = {}) {
       `第二层：summarize=${summaryHook.installed ? '已接管' : `未接管(${summaryHook.reason || '未尝试'})`}   `
         + `compactOn=${cfg.compactOn}   ${cfg.compactMode}${cfg.compactMode === 'relative' ? `(quantile=${cfg.compactQuantile})` : `(<${cfg.compactThreshold})`}`,
       `第二层：回执压缩 ${stats.compactions} 段 / 移出 ${stats.compactedSeqs} 节点 / 省约 ${stats.compactedChars} 字符   `
-        + `回执摘要被消费 ${stats.receiptSummaries} 次   压力跳过 ${stats.compactSkipped} 次`,
+        + `回执摘要被消费 ${stats.receiptSummaries} 次   压力跳过 ${stats.compactSkipped} 次`
+        // 竞态计数只在非零时出现：它是异常路径，常态下不该占版面（issue #29）
+        + (stats.receiptFenceMisses > 0
+          ? `   ⚠️ 回执因并发压缩被抢 ${stats.receiptFenceMisses} 次（已退回模型摘要，未污染他人区间）`
+          : ''),
       `工具名：索引 ${nameProbe.indexSize} 条，解析成功 ${nameProbe.resolved} / 失败 ${nameProbe.unresolved}   `
         + `compactTools=${cfg.compactTools.length === 0 ? '[]（只用黑名单）' : JSON.stringify(cfg.compactTools)}`,
       `本会话工具名：${nameProbe.names.length > 0 ? nameProbe.names.join(', ') : '（无）'}`,

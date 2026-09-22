@@ -50,6 +50,22 @@ DSH 自带的上下文回收是**纯体积**的：工具结果超过阈值就掐
 
 **小总体降级。** 只读工具在写/执行密集的会话里常常只占少数（实测只读 1/6），此时分位总体可能只有两三条——排序没有意义。这种情况**不是直接放弃**，而是降级为绝对下限模式：要求两轴**同时**低于 `floorThreshold`（默认 `0.2`，比 `compactThreshold` 明显更严，用来补偿"没有相对信息"这个缺口）。若样本连 `minCandidatesForFloor`（默认 3）都不到，则仍然不做——一两条谈不上分布。降级发生时会在报告与心跳里给出说明，不会静默发生。
 
+## 回执归属（fence）
+
+第二层的注入路径是：插件算出回执 → 存进 `pendingReceipt` → 调 `compactRegion` → DSH 在内部回调 `summarize`，插件在那里把回执交出去。
+
+问题在于 `compactRegion` 是**异步**的，而 `summarize` 的入参里**没有区间身份**——它不知道"这次回调属于哪一段压缩"。于是 `await` 期间若别处（例如 DSH 自己的自动压缩）也发起一次压缩，两边会共用同一个按 session 键的待用槽位：**别人那段被换成我们的回执，我们要压的那段反而用了模型摘要**。两边的历史都被改坏，而且都不报错。
+
+修法是给每次压缩发一张**归属令牌**（fencing token），三重约束：
+
+| 机制 | 作用 |
+|---|---|
+| 归属令牌 | 生产端 `fenceCounter` 自增、`activeFence` 记住"当前属于谁"；`summarize` 只在 `entry.fence === activeFence` 时注入 |
+| 一次性领取 | `entry.claimed` 置位后不再交出，同一次压缩中 `summarize` 被多次调用也不会重复注入 |
+| 归属校验 | `compactRegion` 返回后核对令牌；若已被抢走则记 `action.fenceLost = true`，**不谎报成功** |
+
+`finally` 里只清理**自己**的令牌（原实现无条件 `delete(session)` 会把别人的待用回执一并清掉）。被抢的次数计入 `receiptFenceMisses`，非零时在状态报告里显式提示——此时该区间退回模型摘要，属于安全侧降级。
+
 ## 环境要求
 
 - Node `^22.19.0 || >=24.0.0`
@@ -158,7 +174,7 @@ cp smoke_apply.mjs <某目录>/ && cd <某目录>/ && node smoke_apply.mjs
 
 测试脚本与辅助工具（`check.js` / `smoke_apply.mjs` / `inspect_session.mjs` / `verify_real_shapes.mjs` / `wire_profile.mjs`）都随 npm 包发布，装好的包内可直接 `npm run check`。CI（`.github/workflows/ci.yml`）跑两组作业：仅 peer 依赖的快速冒烟 + 完整 DSH 依赖树的集成验证。
 
-覆盖：两个接入点的接管、两层完整裁决路径、append 协议、回执注入、门控分支（含反事实对照）、**shell 类工具默认排除**（`pwsh Remove-Item` 回归用例）。
+覆盖：两个接入点的接管、两层完整裁决路径、append 协议、回执注入与**归属（fence）**、并发压缩竞态、门控分支（含反事实对照）、**文本/思考两轴分离**、**小总体降级**、**越界配置钳制**、**shell 类工具默认排除**（`pwsh Remove-Item` 回归用例）。
 
 **测试边界**（哪些是 CI 真正验证过的）：纯函数逻辑、假 ctx 下的接管与 append 协议、以及 integration 作业里的"真实依赖树下模块可加载 + freezeMessage 可用"。**没有**被 CI 覆盖的：真实 DSH 宿主内的服务接管、rc 版本间的事件形状漂移——这些只能在真实会话里用 `jev_probe_shapes` 校对。
 
