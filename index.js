@@ -396,8 +396,21 @@ const CONFIG_RANGES = {
  * `fallback`（即默认值）——因为"改了多少"在这个语义下不可解释，"打到默认"才可解释。
  * 这正是 `Number.isFinite` 而不是 `typeof === 'number'` 的理由：`typeof NaN === 'number'`。
  */
-export function clampConfigNumber(key, value, fallback, onWarn) {
-  const [lo, hi] = CONFIG_RANGES[key] ?? [Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY]
+/**
+ * `keepMode` 的白名单校验（review 修复）：此前是 `z.string()` + `?? 'budget'`，
+ * 拼错（如 `'budgt'`）会静默穿过两层校验直达 `planTrims`——而 `planTrims` 对
+ * 未知模式返回 null，等于**静默退回旧行为**，与仓库"越界配置必须留痕"的约定相悖。
+ * schemastery 没有 enum 构造器（const/union 语义均不符），故按 #28 的
+ * "回落默认 + configWarnings 留痕"模式在这里做白名单。
+ */
+export function resolveKeepMode(raw, onWarn) {
+  if (raw == null || raw === '') return 'budget'
+  if (raw === 'budget' || raw === 'absolute') return raw
+  onWarn?.(`配置 keepMode=${JSON.stringify(String(raw))} 不在 ['budget','absolute'] 内 → 已改为 'budget'（拼错的模式会静默退回旧行为，必须留痕）`)
+  return 'budget'
+}
+
+export function clampConfigNumber(key, value, fallback, onWarn) {  const [lo, hi] = CONFIG_RANGES[key] ?? [Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY]
   const warn = (kind, got) => {
     onWarn?.(`配置 ${key}=${got} 非法（${kind}）→ 已改为 ${fallback}（合法区间 ${lo}~${hi}）`)
     return fallback
@@ -424,7 +437,7 @@ export function resolveConfig(config = {}) {
     baseUrl: config.baseUrl ?? 'https://api.typesafe.ai/v1/systemone',
     preserveRecent: clampConfigNumber('preserveRecent', config.preserveRecent, 4, (w) => warnings.push(w))[0],
     keepThreshold: clampConfigNumber('keepThreshold', config.keepThreshold, 0.5, (w) => warnings.push(w))[0],
-    keepMode: config.keepMode ?? 'budget',
+    keepMode: resolveKeepMode(config.keepMode, (w) => warnings.push(w)),
     keepFloorThreshold: clampConfigNumber('keepFloorThreshold', config.keepFloorThreshold, 0.2, (w) => warnings.push(w))[0],
     minCandidatesForBudget: clampConfigNumber('minCandidatesForBudget', config.minCandidatesForBudget, 4, (w) => warnings.push(w))[0],
     volumeBudgetThresholdChars: clampConfigNumber('volumeBudgetThresholdChars', config.volumeBudgetThresholdChars, 8192, (w) => warnings.push(w))[0],

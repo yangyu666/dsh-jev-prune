@@ -44,7 +44,11 @@ jobs:
       - name: Install full DSH dependency tree
         run: |
           npm ci --no-audit --no-fund
-          npm install --no-save --no-audit --no-fund @deepseek-ai/dsh@next
+          # 钉到 TESTED_DSH_VERSION，不用浮动 @next：2026-09-22 实测，上游把 next
+          # 升到 0.1.5-rc.3 时配套子包（dsh-client-ui-sidebar-documentpreview@^0.1.5-rc.3）
+          # 尚未发布，ETARGET 直接打断安装——任何 PR 在那个窗口都会挂 CI，且失败与
+          # PR 内容无关。版本对齐应覆盖 CI 的宿主安装（issue #19 同理）。
+          npm install --no-save --no-audit --no-fund @deepseek-ai/dsh@0.1.5-rc.2
       - name: Make plugin resolvable as its package name
         run: |
           mkdir -p node_modules/dsh-jev-prune

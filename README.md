@@ -184,7 +184,7 @@ With `resultExcerptChars` (default `240`), each result line in the state carries
 2. **salient lines**: constant identifiers (`THRESHOLD_DISCOUNT_PCT`, `E2001_BASE_IMAGE`), assignments/keys (`timeout = 4800`), file paths — the critical config line in a 20 KB module is neither at the head nor an error, and rule 1 alone missed it (measured: judging outcomes identical to no excerpt at all), plus
 3. a middle-line fallback for pure-prose results (the middle is exactly what "cut the middle" loses).
 
-The excerpt is hard-bounded per result and counted against the state budget, so it cannot blow up the request size. Note the interaction with `budget` mode: excerpts shift *probabilities*; only the ranking-based decision converts better information into *different trimming*. Under a fixed threshold both A/B arms behaved identically — the excerpt's value presupposes the ranking rule.
+The excerpt is hard-bounded per result and counted against the state budget, so it cannot blow up the request size. One trade-off to know: excerpts **share** the fixed `maxStateTokens` budget with history lines — at ~70 tokens per excerpted result, a 100-result session spends ~28% of the default 25k-token budget on excerpts, and the squeeze logic compensates by dropping more history lines. If you run very long sessions, raise `maxStateTokens` (Jev's ceiling is 32k) or lower `resultExcerptChars` rather than disabling excerpts entirely. Note the interaction with `budget` mode: excerpts shift *probabilities*; only the ranking-based decision converts better information into *different trimming*. Under a fixed threshold both A/B arms behaved identically — the excerpt's value presupposes the ranking rule.
 
 ### Judgement observability (heartbeat)
 

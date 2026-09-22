@@ -1507,6 +1507,17 @@ const run = ({ events, cache, cfg, threshold }) => {
   }
   assert.equal(resolveConfig({})[CONFIG_WARNINGS].length, 0, '全部合法的配置不得产生告警')
 
+  // keepMode 白名单（review 修复）：拼错的模式必须回落 budget 并留痕，不得静默穿过
+  {
+    const bad = resolveConfig({ keepMode: 'budgt' })
+    assert.equal(bad.keepMode, 'budget', '拼错的 keepMode 应回落 budget')
+    assert.ok(bad[CONFIG_WARNINGS].some((w) => w.includes('keepMode')), 'keepMode 回落必须留下 configWarnings')
+    const good = resolveConfig({ keepMode: 'absolute' })
+    assert.equal(good.keepMode, 'absolute')
+    assert.equal(good[CONFIG_WARNINGS].length, 0, '合法 keepMode 不告警')
+  }
+
+
   // 合法值必须原样保留（钳制不能顺手改掉正常配置）
   const ok = resolveConfig({ preserveRecent: 0, headChars: 0, maxStepTextChars: 5000, receiptMaxRatio: 1 })
   assert.equal(ok.preserveRecent, 0, '0 是合法值（不保护最近区），不得被当成缺省')
