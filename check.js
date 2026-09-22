@@ -44,6 +44,7 @@ import {
   sessionEvents,
   toolNameOf,
 } from './state.js'
+import { Config, isCompactableTool, resolveConfig } from './index.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -1056,6 +1057,80 @@ const run = ({ events, cache, cfg, threshold }) => {
     for (const m of text.matchAll(/from\s+'\.\/([^']+)'/g)) {
       assert.ok(existsSync(join(here, m[1])), `${file} 里 ./${m[1]} 指向不存在的文件`)
     }
+  }
+}
+
+// ---------------------------------------------------------------- 分位总体的可压缩性（外部审查）
+
+{
+  // 背景：第一层的判定缓存复用 selectCandidates 的候选，那份候选只排除黑名单
+  // （第一层没有白名单），所以 shell 之类不可整对移出的调用也会进缓存。
+  // 第二层若直接拿整份缓存当分位总体，尾部名额会被这些节点占掉、随后又被工具门
+  // 全部拒绝 → 静默少压缩。下面三组断言把口径钉住。
+
+  const cfg = { compactTools: ['read', 'glob'], neverCompactTools: DEFAULT_NEVER_COMPACT_TOOLS }
+
+  assert.equal(isCompactableTool('read', cfg), true, '白名单内的只读工具可移出')
+  assert.equal(isCompactableTool('pwsh', cfg), false, '白名单外的 shell 不可移出')
+  assert.equal(isCompactableTool('edit', cfg), false, '黑名单优先于白名单')
+  assert.equal(isCompactableTool('Edit', cfg), false, '黑名单比较要归一化（Edit ≡ edit）')
+
+  // compactTools=[] 是显式的不安全模式：只受黑名单约束
+  const relaxed = { compactTools: [], neverCompactTools: DEFAULT_NEVER_COMPACT_TOOLS }
+  assert.equal(isCompactableTool('pwsh', relaxed), true, '放宽模式下 shell 变成可移出')
+  assert.equal(isCompactableTool('edit', relaxed), false, '放宽模式下黑名单仍然生效')
+
+  // 尾部名额不应被不可移出的节点占满：6 条 shell（更“过期”）+ 4 条 read
+  const mk = (seq, tool, p, e) => ({ seq, tool, prob: p, effectProb: e })
+  const verdicts = [
+    mk(1, 'pwsh', 0.10, 0.05), mk(2, 'pwsh', 0.11, 0.06), mk(3, 'pwsh', 0.12, 0.07),
+    mk(4, 'pwsh', 0.13, 0.08), mk(5, 'pwsh', 0.14, 0.09), mk(6, 'pwsh', 0.15, 0.10),
+    mk(7, 'read', 0.40, 0.30), mk(8, 'read', 0.45, 0.35), mk(9, 'read', 0.50, 0.40), mk(10, 'read', 0.55, 0.45),
+  ]
+  const filtered = verdicts.filter((v) => isCompactableTool(v.tool, cfg))
+  const eligible = computeEligibleSeqs(filtered, { quantile: 0.34, minCandidates: 4 })
+  assert.deepEqual([...eligible], [7], '过滤后尾部应落在可移出的 read 上，而不是被 shell 占满')
+  assert.equal(computeEligibleSeqs(verdicts, { quantile: 0.34, minCandidates: 4 }).size > 0, true,
+    '不过滤时仍会给出（无用的）尾部——这正是需要过滤的原因')
+}
+
+// ---------------------------------------------------------------- 判定值的有效性（外部审查）
+
+{
+  // typeof NaN === 'number'，所以用 typeof 过滤会让 NaN 混进总体；而排序比较
+  // (a-b) 返回 NaN 被 V8 当作“相等”不换位，NaN 项便按数组位置混进尾部。
+  const v = [
+    { seq: 1, prob: NaN, effectProb: 0.10 },
+    { seq: 2, prob: 0.40, effectProb: 0.20 },
+    { seq: 3, prob: 0.50, effectProb: 0.30 },
+    { seq: 4, prob: 0.60, effectProb: 0.40 },
+    { seq: 5, prob: 0.70, effectProb: 0.50 },
+  ]
+  const r = computeEligibleSeqs(v, { quantile: 0.34, minCandidates: 4 })
+  assert.equal(r.has(1), false, 'NaN 判定值不得被选为可整对移出')
+
+  const withUndefined = v.map((x) => (x.seq === 1 ? { seq: 1, prob: undefined, effectProb: null } : x))
+  assert.equal(computeEligibleSeqs(withUndefined, { quantile: 0.34, minCandidates: 4 }).has(1), false,
+    'undefined/null 判定值同样不得入选')
+}
+
+// ---------------------------------------------------------------- 配置兜底完整性（外部审查）
+
+{
+  // 维护约定（见 index.js resolveConfig 注释）：Config schema 的每个 default 都必须
+  // 在 resolveConfig 里有对应兜底。这条约定此前只写在注释里、没有测试固化，
+  // 结果 baseUrl 悄悄漏掉。这里把它变成断言。
+  const schemaKeys = Object.keys(Config?.dict ?? {})
+  assert.ok(schemaKeys.length > 0, '应能枚举出 Config schema 的键')
+
+  const resolved = resolveConfig({})
+  const missing = schemaKeys.filter((key) => !(key in resolved))
+  assert.deepEqual(missing, [], `resolveConfig 缺少这些键的兜底：${missing.join(', ')}`)
+
+  // 未经 schemastery 归一化时，所有布尔/数组/数值键都必须有确定值（不能是 undefined）
+  const empty = resolveConfig({})
+  for (const key of schemaKeys) {
+    assert.notEqual(empty[key], undefined, `${key} 在未归一化配置下不得为 undefined`)
   }
 }
 
