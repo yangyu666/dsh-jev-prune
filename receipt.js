@@ -271,7 +271,10 @@ export function computeEligibleSeqs(verdicts, { quantile, minCandidates }) {
     throw new Error(`compactQuantile 非法：${quantile}（必须是 0~1 的有限数值；配置留空/解析成 null 都会走到这里）`)
   }
   const usable = (verdicts ?? []).filter(
-    (v) => typeof v?.prob === 'number' && typeof v?.effectProb === 'number',
+    // 必须用 Number.isFinite：typeof NaN === 'number'，用 typeof 会让 NaN 混进总体，
+    // 而排序比较 (a-b) 返回 NaN 时被 V8 当作"相等"不换位 → NaN 项按**数组位置**
+    // 混进尾部，可能被选中做整对移出。口径与上面的 quantile 校验统一。
+    (v) => Number.isFinite(v?.prob) && Number.isFinite(v?.effectProb),
   )
   // 相对分位需要一个总体；样本太小则排序没有意义 → 宁可不做
   if (usable.length < Math.max(2, minCandidates ?? 4)) return new Set()

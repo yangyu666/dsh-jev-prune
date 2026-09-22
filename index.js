@@ -34,7 +34,7 @@ import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 import { JevClient, estimateTokens } from './jev.js'
-import { JEV_PRUNE_MARKER, parseLimit, pruneSessionWithJev } from './prune.js'
+import { JEV_PRUNE_MARKER, isToolIn, parseLimit, pruneSessionWithJev } from './prune.js'
 import {
   DEFAULT_COMPACT_TOOLS,
   DEFAULT_EVIDENCE_PATTERNS,
@@ -244,6 +244,9 @@ export function resolveConfig(config = {}) {
     enabled: config.enabled ?? true,
     apiKey: config.apiKey ?? '',
     model: config.model ?? 'jev-latest',
+    // 维护约定：Config schema 的每个 default 都必须在这里有对应兜底（本键此前遗漏；
+    // 影响为零是因为 JevClient 的默认参数会在 undefined 时生效，但约定不该靠下游兜底）。
+    baseUrl: config.baseUrl ?? 'https://api.typesafe.ai/v1/systemone',
     preserveRecent: config.preserveRecent ?? 4,
     keepThreshold: config.keepThreshold ?? 0.5,
     headChars: config.headChars ?? 600,
@@ -284,6 +287,26 @@ export function resolveConfig(config = {}) {
     heartbeatFile: config.heartbeatFile ?? '',
     logLevel: config.logLevel ?? 'info',
   }
+}
+
+/**
+ * 一个工具名是否**有可能**被第二层整对移出。口径必须与 `selectReceiptRanges`
+ * 里的工具门逐条一致，否则分位总体与实际可压缩集合不符。
+ *
+ * 为什么需要它：第一层的判定缓存复用了 `selectCandidates` 的结果，而那份候选只
+ * 排除 `neverPruneTools`（黑名单）——第一层没有白名单，所以 shell 之类不可整对
+ * 移出的调用也会正常进缓存。若第二层直接拿整份缓存当分位总体，这些节点的概率
+ * 会占掉 `compactQuantile` 的尾部名额，随后又被工具门全部拒绝 → **第二层静默地
+ * 少压缩**（尾部全被不可移出的工具占满时，表现为 0 段可压）。
+ *
+ * @param {string} tool 工具名
+ * @param {{compactTools:string[], neverCompactTools:string[]}} cfg
+ * @returns {boolean}
+ */
+export function isCompactableTool(tool, cfg) {
+  if (isToolIn(cfg.neverCompactTools, tool)) return false
+  if (cfg.compactTools.length > 0 && !isToolIn(cfg.compactTools, tool)) return false
+  return true
 }
 
 // ------------------------------------------------------------------ 主插件
@@ -737,8 +760,10 @@ export function apply(ctx, config, deps = {}) {
     }
     const surface = [...session.surface.nodes]
     const onSurface = new Set(surface)
+    // 分位总体必须只含**可整对移出**的节点：判定的缓存同时服务第一层（无白名单），
+    // 若把白名单外/黑名单内的节点也算进总体，尾部名额会被它们占掉后被工具门白拒。
     const verdicts = [...cache.entries()]
-      .filter(([seq]) => onSurface.has(seq))
+      .filter(([seq, value]) => onSurface.has(seq) && isCompactableTool(value.tool, cfg))
       .map(([seq, value]) => ({ seq, ...value }))
     report.verdicts = verdicts.length
 
