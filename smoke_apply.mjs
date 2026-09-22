@@ -625,6 +625,31 @@ async function layer2Run(effectOfS2) {
   await ctx3.handlers.get('agent/pre-step')({ agent: { session: session3, options: {} } }, () => {})
   check('用量低于绝对阈值时第一层不发请求', judge3.requests === 0, `实际发出 ${judge3.requests} 次`)
 
+  // G4（PR #28 review 回归）：绝对阈值 + meter 缺失 → **必须照常判定**。
+  // 绝对阈值不需要 meter，早期实现却在 `!measured` 处直接 return，
+  // 于是宿主没注册 tokenMeter 时第一层永久静默失效（比旧行为更糟）。
+  //
+  // 注意：必须从 ctx.get 里摘掉 tokenMeter。只设 `ctx.tokenMeter = undefined`
+  // 是**无效的**——插件走的是 `ctx.get('tokenMeter')`，仍会读到那个对象，
+  // 于是这条断言在回退修复后依然变绿（我在反向验证时踩到过这个坑）。
+  {
+    const p = makePruner()
+    const s = makeSession()
+    const c = makeCompaction(s)
+    const cx = makeCtx({ pruner: p, session: s, compaction: c })
+    const realGet = cx.get
+    cx.get = (n) => (n === 'tokenMeter' ? null : realGet(n)) // 真正让 meter 消失
+    const j = fakeJudge(
+      { [s.seqs.s1]: 0.05, [s.seqs.s2]: 0.05, [s.seqs.s3]: 0.05 },
+      { [s.seqs.s1]: 0.05, [s.seqs.s2]: 0.05, [s.seqs.s3]: 0.05 },
+    )
+    mod.apply(cx, { ...PLUGIN_CFG, judgeOn: 'pressure', softLimit: 1 }, { judge: j })
+    await cx.handlers.get('agent/pre-step')({ agent: { session: s, options: {} } }, () => {})
+    check('绝对阈值下 meter 缺失时第一层仍照常判定（不因拿不到用量而关闭功能）',
+      j.requests > 0,
+      `实际发出 ${j.requests} 次（0 表示功能被静默关掉了）`)
+  }
+
   const pruner4 = makePruner()
   const session4 = makeSession()
   const compaction4 = makeCompaction(session4)

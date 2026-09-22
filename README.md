@@ -75,6 +75,7 @@ The fix issues an **ownership token** (fencing token) per compaction, with three
 - A TypeSafe API key (`TYPESAFE_API_KEY` environment variable)
 - Runtime peer dependencies: `@deepseek-ai/schemastery`, `@deepseek-ai/dsh-tools` (provided by the host)
 - Optional dynamic dependency: `freezeMessage` from `@deepseek-ai/dsh-llm` (falls back to a shallow copy when absent; the plugin keeps working)
+- Host services consumed: `toolResultPruner`, `compaction`, `tools`, `commands`, `llm`, and **`tokenMeter`**. `tokenMeter` is used by the pressure gates; if your host does not register it, ratio-based gating cannot compare anything — set `softLimit` / `compactSoftLimit` to an **absolute token count**, or use `judgeOn: 'always'` / `compactOn: 'always'` (see *Pressure-gate failure direction*). A missing meter never silently disables a layer: the gate is left un-armed for that pass and the reason is logged at `warn` level.
 
 **Version alignment**: the peer range for `@deepseek-ai/dsh-tools` is `^0.1.5-rc.2` — the tested version `0.1.5-rc.2` sits on npm's `next` tag, not `latest`. A lockfile is committed (devDependencies pin the tested versions), so `npm ci` reproduces the exact test conditions.
 
@@ -136,17 +137,25 @@ A single network hiccup used to void the **entire round** of judging — no cand
 
 Batches are isolated too: one failed batch no longer discards the remaining ones, and the count shows up as `失败批次 N 个` in the status report. Only when **every** batch fails is the round treated as failed.
 
+**Counter semantics** (clarified in the PR #28 review): `client.lastRetries` is reset at the start of every `ask` and is what the status report shows, while `client.retries` is the lifetime total for the client (useful for "has this client ever had to retry?"). `client.requests` counts **HTTP attempts actually issued**, including failed ones, so the identity `requests === successful asks + retries` holds. Using the lifetime counter as if it described the current pass would make the report show `重试 N 次` forever after a single hiccup, with N only ever climbing.
+
 ### Token-estimate accuracy
 
 `estimateTokens` is a heuristic (the plugin ships no tokenizer), but its constants are no longer guesses: they were grid-searched against a real BPE tokenizer over 22 samples (English prose, camelCase identifiers, JSON, Windows and Unix paths, git diffs, Chinese, mixed Chinese/English, code blocks, logs, pure punctuation, hex/UUID, table rows, single glyphs, whitespace), scoring on a **weighted fit + holdout** objective to avoid overfitting.
 
-Mean absolute error drops from **20.5% to 10.7%** (holdout 20.5% → 14.4%), and the **direction** was corrected: the old formula over-estimated pure English by **+37%** and Unix paths by **+44%**, and since both layers use this value in a ratio, it was tightening both gates. The new estimate is essentially unbiased (−0.3%). `npm run check` carries a hard assertion (MAE ≤ 15%) plus a direction assertion, so hand-editing the constants without re-running the calibration fails immediately.
+Mean absolute error drops from **20.5% to 10.7%** (holdout 20.5% → 14.4%), and the **direction** was corrected: the old formula over-estimated pure English by **+37%** and Unix paths by **+44%**, and since both layers use this value in a ratio, it was tightening both gates. The new estimate is essentially unbiased (−0.3%).
+
+`npm run check` asserts accuracy against a **holdout set** (5 samples that took no part in the fit, with reference lengths measured from the real tokenizer; current MAE 5.5%): a hard `MAE ≤ 15%` bound plus a directional assertion that English prose must not be over-estimated. **This distinction matters** (corrected in the PR #28 review): the first version reused the calibration data itself, which made the assertion a tautology — it could only catch "someone hand-edited the constants", never "the constants overfit the fitting set". With a real holdout, pushing `wordSlope` to 0.9 jumps the MAE to 38.7% and fails immediately. (Also: the holdout reference lengths must be **measured** with the real tokenizer, not estimated — 4 of the 5 values I first hand-wrote were off by more than 10%, i.e. the assertion would have been built on wrong numbers.)
 
 ### Pressure-gate failure direction
 
-Both layers now fail **closed** and in the same direction: if the context window cannot be resolved, or the token usage cannot be measured (meter missing or throwing), **neither layer acts**.
+Both layers fail **closed** and in the same direction: **when the threshold itself cannot be computed** (a `ratio` soft limit with an unresolvable context window), **neither layer acts**.
 
 The old behaviour was asymmetric — layer 2 skipped when it could not resolve a threshold, while layer 1 simply **fell through and proceeded**; more subtly, a missing meter left `used` at `0`, so `0 < threshold` was always true and judging ran **every single round**, i.e. the gate did not exist. For a gate whose purpose is to avoid spending Jev calls, "if we cannot tell, do not spend" is the safe direction.
+
+**The boundary** (corrected during the PR #28 review): failing closed justifies declining to spend, but it must not turn into silently switching the feature off. When the soft limit is an **absolute token count** (`softLimit: 3000`), the threshold comes straight from `limit.value` and **the meter is irrelevant** — so if the meter is missing or throws, the gate is simply left **un-armed for that pass** (reported as `压力门本次不设防` at `warn` level) and judging proceeds. An earlier revision of this PR required a successful measurement unconditionally, which turned "stop wasting money" into "the first layer never runs again" for any host that does not register `tokenMeter` — strictly worse than the bug it was fixing. `smoke_apply.mjs` pins both directions.
+
+Note that `tokenMeter` is a **host-provided** service; if your host does not expose it, configure `softLimit` as an absolute token count (or set `judgeOn: 'always'` / `compactOn: 'always'`) rather than relying on ratio-based pressure gating.
 
 ### Out-of-range configuration
 
@@ -204,7 +213,7 @@ cp smoke_apply.mjs <some-dir>/ && cd <some-dir>/ && node smoke_apply.mjs
 
 The test scripts and helper tools (`check.js` / `smoke_apply.mjs` / `inspect_session.mjs` / `verify_real_shapes.mjs` / `wire_profile.mjs`) all ship with the npm package, so a plain `npm run check` works inside an installed copy. CI (`.github/workflows/ci.yml`) runs two jobs: a fast smoke job on the peer dependencies alone, and an integration job on the full DSH dependency tree.
 
-Coverage: the takeover of both interception points, the full decision path of both layers, the append protocol, receipt injection and its **ownership (fence)**, concurrent-compaction races, every gating branch (with counterfactual controls), the **text/`reasoning` split**, **small-population degradation**, **out-of-range config clamping**, **judge retries and per-batch isolation**, **non-duplicated batch accounting**, **pressure gates failing closed in the same direction**, **token-estimate calibration**, the **compaction quota**, and **shell-type tools being excluded by default** (the `pwsh Remove-Item` regression case).
+Coverage: the takeover of both interception points, the full decision path of both layers, the append protocol, receipt injection and its **ownership (fence)**, concurrent-compaction races, every gating branch (with counterfactual controls), the **text/`reasoning` split**, **small-population degradation**, **out-of-range config clamping**, **judge retries and per-batch isolation** (including per-pass vs lifetime counter semantics), **non-duplicated batch accounting**, **pressure gates failing closed in the same direction while still acting when the threshold is an absolute count**, **token-estimate calibration against a holdout set**, the **compaction quota**, and **shell-type tools being excluded by default** (the `pwsh Remove-Item` regression case).
 
 **Test boundaries** (what CI actually verifies): pure-function logic, takeover and the append protocol under a fake ctx, plus — in the integration job — "the plugin module loads against the real dependency tree and `freezeMessage` is available". **Not** covered by CI: service takeover inside a live DSH host and event-shape drift between rc versions — verify those with `jev_probe_shapes` in a real session.
 

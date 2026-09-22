@@ -656,6 +656,13 @@ export function apply(ctx, config, deps = {}) {
     // **穿透**（照做）；更隐蔽的是 meter 缺失/抛错时 `used` 恒为 0，
     // 于是 `0 < threshold` 永远成立 → 判定**每一轮都跑**，压力门等于不存在。
     // 对一个"省 Jev 调用钱"的门来说，"解析不出来就别花钱"才是安全方向。
+    //
+    // 但"关闭"只对**真的算不出来**的情形成立（PR #28 review 修正）：
+    // `softLimit` 配成绝对 token 数时，threshold 由 limit.value 直接给出，
+    // **根本不需要 meter**。早期实现在这里无条件要求 `measured`，于是绝对阈值
+    // 分支也被挡掉——把"该省的钱省下来"升级成了"功能静默消失"，
+    // 比旧行为更糟。所以只要阈值本身能定出来（`threshold != null`），
+    // meter 不可用就只是"压力门降级为不设防"，而不是"什么都不做"。
     if (cfg.judgeOn !== 'always') {
       const meter = ctx.get('tokenMeter')
       let used = 0
@@ -677,19 +684,18 @@ export function apply(ctx, config, deps = {}) {
         ? (windowTokens == null ? null : Math.floor(windowTokens * limit.value))
         : limit.value
       if (threshold == null) {
-        // 与第二层同向：解析不出阈值就不做判定，不花钱
+        // 阈值算不出来（ratio 模式 + 窗口未知）→ 与第二层同向：不做判定，不花钱
         stats.skipped += fresh.length
         stats.lastNote = '解析不出上下文窗口，第一层保守跳过（与第二层同向）'
         log('info', stats.lastNote)
         return
       }
       if (!measured) {
-        stats.skipped += fresh.length
-        stats.lastNote = '拿不到 token 用量（meter 缺失或抛错），第一层保守跳过（与第二层同向）'
-        log('info', stats.lastNote)
-        return
-      }
-      if (used < threshold) {
+        // 阈值能定出来但拿不到用量 → 无法比较，只能不设防地继续。
+        // 这里**不 return**：绝对阈值分支下 meter 本来就无关，return 等于把功能关掉。
+        stats.lastNote = `拿不到 token 用量（meter 缺失或抛错），压力门本次不设防（阈值 ${threshold}）`
+        log('warn', stats.lastNote)
+      } else if (used < threshold) {
         stats.skipped += fresh.length
         return
       }
@@ -1029,11 +1035,12 @@ export function apply(ctx, config, deps = {}) {
         return report
       }
       if (!measured) {
-        report.blocked = '拿不到 token 用量（meter 缺失或抛错），保守跳过第二层'
-        stats.compactSkipped += 1
-        return report
-      }
-      if (used < threshold) {
+        // 与第一层同口径（PR #28 review）：阈值能定出来时不因 meter 缺失而放弃，
+        // 只是压力门本次不设防。绝对阈值分支下 meter 本来就无关，
+        // 早期实现无条件 return 会把"保守"变成"功能静默消失"。
+        report.blocked = `拿不到 token 用量（meter 缺失或抛错），压力门本次不设防（阈值 ${threshold}）`
+        log('warn', report.blocked)
+      } else if (used < threshold) {
         report.blocked = `压力不足（${used} < ${threshold}）`
         stats.compactSkipped += 1
         return report
@@ -1262,10 +1269,17 @@ export function apply(ctx, config, deps = {}) {
         + `Jev 保留 ${stats.keptByJev} / Jev 裁掉 ${stats.prunedByJev} / 按体积兜底裁 ${stats.prunedByVolume}`
         + `（最近区保护 ${stats.keptByTail} / 黑名单保护 ${stats.keptByBlacklist} 不计入 Jev）`,
       `第一层：累计省下 ${stats.savedChars} 字符   压力门控跳过 ${stats.skipped} 次   错误 ${stats.errors} 次`,
-      // 批次失败与重试计数只在异常时出现（issue #34）：常态下不该占版面
-      ...(stats.judgeBatchFailures > 0 || judge.retries > 0
-        ? [`判定请求：重试 ${judge.retries ?? 0} 次   失败批次 ${stats.judgeBatchFailures} 个`
+      // 批次失败与重试计数只在异常时出现（issue #34）：常态下不该占版面。
+      // 口径修正（PR #28 review）：这里要的是"最近一次 pass 重试了几次"（lastRetries），
+      // 而不是 client 从建起来到现在的累计量——后者一旦抖动过就永久 >0，
+      // 会让这一行在之后每一份报告里都出现，且数字只增不减。
+      ...(stats.judgeBatchFailures > 0 || judge.lastRetries > 0
+        ? [`判定请求：重试 ${judge.lastRetries ?? 0} 次   失败批次 ${stats.judgeBatchFailures} 个`
           + (judge.lastError ? `   最近错误：${judge.lastError}` : '')]
+        : []),
+      // 累计重试只在真的发生过时出现，且与上面区分开，避免把历史当成现状
+      ...(judge.retries > 0 && judge.lastRetries === 0
+        ? [`判定请求：本 pass 无重试（本会话累计重试 ${judge.retries} 次、累计请求 ${judge.requests} 次）`]
         : []),
       `第二层：summarize=${summaryHook.installed ? '已接管' : `未接管(${summaryHook.reason || '未尝试'})`}   `
         + `compactOn=${cfg.compactOn}   ${cfg.compactMode}${cfg.compactMode === 'relative' ? `(quantile=${cfg.compactQuantile})` : `(<${cfg.compactThreshold})`}`,

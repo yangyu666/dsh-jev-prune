@@ -154,8 +154,25 @@ export class JevClient {
     this.maxRetries = Number.isFinite(maxRetries) && maxRetries >= 0 ? Math.floor(maxRetries) : 2
     this.retryBaseMs = Number.isFinite(retryBaseMs) && retryBaseMs >= 0 ? retryBaseMs : 300
     this.fetchImpl = fetchImpl ?? globalThis.fetch
+    /**
+     * 累计**发出的 HTTP 尝试次数**（含最终失败的那些）。
+     *
+     * 口径说明（PR #28 review）：此前它只累加**成功**的尝试，于是"重试 2 次后成功"
+     * 被记成 1 次请求，与真实网络活动不符，也让 `retries` 看起来像凭空冒出来的。
+     * 现在计的是"真的打出去了几次"，与 `retries`（重试了几次）严格满足
+     * `requests === 成功的 ask 数 + retries`。
+     */
     this.requests = 0
+    /**
+     * 累计重试次数（跨 ask 的**历史总量**）。
+     *
+     * 注意：这是累计量，不是"本次 ask 重试了几次"。想知道最近一次 ask 的情况请读
+     * `lastRetries`（每次 ask 开头重置），想判断"这个 client 从建起来到现在重试过没有"
+     * 才读它。把它当 per-ask 用会导致状态报告一旦抖动过就**永久**显示"重试 N 次"。
+     */
     this.retries = 0
+    /** 最近一次 ask 内的重试次数（每次 ask 进入时归零） */
+    this.lastRetries = 0
     this.usage = { input_tokens: 0, output_tokens: 0 }
     this.lastError = ''
   }
@@ -233,12 +250,18 @@ export class JevClient {
     if (!this.ready || ids.length === 0) return {}
     if (options.signal?.aborted) throw new JevError('判定已被中断（signal 已 abort）')
 
+    // 每次 ask 重置"本次重试了几次"（PR #28 review）：累计量留在 this.retries 里，
+    // 状态报告要的是"这一次"，否则一旦抖动过一次就永久显示"重试 N 次"。
+    this.lastRetries = 0
+    this.lastError = ''
+
     let lastError = null
     for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
       if (options.signal?.aborted) throw new JevError('判定已被中断（signal 已 abort）')
+      // 计入真实网络活动：失败尝试也真的打出去了，不该被漏掉
+      this.requests += 1
       try {
         const body = await this.#attempt(state, questions, ids, options)
-        this.requests += 1
         const usage = body?.usage ?? {}
         this.usage.input_tokens += Number(usage.input_tokens ?? 0)
         this.usage.output_tokens += Number(usage.output_tokens ?? 0)
@@ -258,6 +281,7 @@ export class JevClient {
         const retryable = error instanceof JevError ? error.retryable : true
         if (!retryable || attempt === this.maxRetries || options.signal?.aborted) break
         this.retries += 1
+        this.lastRetries += 1
         // 指数退避；被中断时立即结束等待（不白等）
         await sleep(this.retryBaseMs * 2 ** attempt, options.signal)
       }

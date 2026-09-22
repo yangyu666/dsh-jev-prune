@@ -73,32 +73,36 @@ assert.ok(got >= 20 && got <= 60, `JSON 估算应在合理区间，实际 ${got}
 assert.equal(estimateTokens(''), 0)
 
 // 空串与纯空白都要落到 0/1 的边界，不能变成 0 除或 NaN
-assert.equal(estimateTokens(''), 0)
 assert.ok(estimateTokens(' ') >= 1, '纯空白至少要算 1（下游会拿它当除数）')
 
 // 标定效果（issue #33 回归）：对真实 BPE 的平均绝对偏差必须压住。
-// 这里的参考值是 gpt-tokenizer 在 22 组样本上的实测结果，硬编码成期望区间——
-// 如果有人手改常数而没重跑标定，这条会立刻失败。
-const CALIBRATION_CASES = [
-  // [文本, 真实 token 数（gpt-tokenizer 实测）]
-  ['The compaction layer removes spent read-only tool calls from the session surface and replaces them with a deterministic receipt generated entirely by code. '.repeat(3), 79],
-  ['estimateTokens computeEligibleSeqs selectReceiptRanges renderReceipt DEFAULT_NEVER_COMPACT_TOOLS '.repeat(4), 73],
-  ['这段代码在第二层压缩里负责把已经花掉的只读探查整对移出，并注入一份完全由代码生成的确定性回执，不含任何模型推断。'.repeat(3), 130],
-  ['第二层 second layer 调用 compactRegion(start, end, agent) 后由宿主动态派发 summarize，回执 receipt 必须小于原区间的 receiptMaxRatio。'.repeat(3), 114],
-  ['2026-09-22T02:58:00.579Z INFO seq=4213 chars=16489 tokens=4112 ratio=0.3421 status=ok\n'.repeat(5), 190],
+//
+// ⚠️ 留出集原则（PR #28 review）：这些样本**不得**参与常数拟合。
+// 早期版本直接复用了标定数据本身，于是断言退化成同义反复——它必然通过，
+// 只能防"手改常数"，完全防不了"过拟合到拟合集"。
+// 下面这组是标定时**留出**的样本（gpt-tokenizer 实测值），常数没见过它们，
+// 所以 MAE 超过阈值真的说明泛化坏了。
+const HOLDOUT_CASES = [
+  // [文本, 真实 token 数（gpt-tokenizer 实测，未参与拟合）]
+  ['There is a substantial difference between a plausible-sounding explanation and a verified one; the former is cheap, the latter is not. '.repeat(3), 79],
+  ['DEFAULT_NEVER_PRUNE_TOOLS DEFAULT_NEVER_COMPACT_TOOLS resolveConfig clampConfigNumber CONFIG_RANGES CONFIG_WARNINGS '.repeat(3), 76],
+  ['这个插件的第一层只做截断（可逆），第二层会把调用与结果整对移出（破坏性），所以两层的黑名单必须分开维护。'.repeat(3), 120],
+  ['await client.ask(state, questions, { signal }) 之后要检查 lastRetries lastError 与 requests，不能用累计量判断"这一次"是否重试过。'.repeat(3), 105],
+  ['2026-09-22T02:58:00.579Z WARN meter=missing threshold=3000 measured=false action=proceed\n'.repeat(5), 150],
 ]
 let tokenAbsDrift = 0
-for (const [text, real] of CALIBRATION_CASES) {
+for (const [text, real] of HOLDOUT_CASES) {
   tokenAbsDrift += Math.abs(estimateTokens(text) - real) / real
 }
-const tokenMae = tokenAbsDrift / CALIBRATION_CASES.length
+const tokenMae = tokenAbsDrift / HOLDOUT_CASES.length
 if (!(tokenMae <= 0.15)) {
-  throw new Error(`token 估算平均绝对偏差 ${(tokenMae * 100).toFixed(1)}% 超过 15%（标定已失效？）`)
+  throw new Error(`token 估算在留出集上的平均绝对偏差 ${(tokenMae * 100).toFixed(1)}% 超过 15%`
+    + `（标定过拟合或常数被手改？）`)
 }
 
 // 方向性：估算不能系统性偏大（把两层的门都收紧）。
 // 旧实现在英文与路径上 +37%/+44%，正是这条要防的。
-const englishProse = CALIBRATION_CASES[0][0]
+const englishProse = HOLDOUT_CASES[0][0]
 assert.ok(estimateTokens(englishProse) / 79 - 1 <= 0.15,
   `纯英文必须不显著高估（实际 ${estimateTokens(englishProse)} vs 真实 79）`)
 
@@ -1419,6 +1423,18 @@ const run = ({ events, cache, cfg, threshold }) => {
     assert.equal(out.q1, 0.12, '重试后应拿到概率')
     assert.equal(calls, 2, '网络异常应重试一次')
     assert.equal(client.retries, 1)
+    assert.equal(client.lastRetries, 1, '本次 ask 重试了 1 次')
+    assert.equal(client.requests, 2, 'requests 计入失败尝试：2 次尝试都真的发出去了')
+    // 口径一致性（PR #28 review）：requests = 成功 ask 数 + 重试数
+    assert.equal(client.requests, 1 + client.retries, 'requests 必须等于成功次数 + 重试次数')
+
+    // 关键回归（PR #28 review）：累计量不得被当成"本次"用。
+    // 上一次 ask 重试过，这一次完全顺利 → lastRetries 必须归零，
+    // 否则状态报告会从此永久显示"重试 N 次"。
+    client.fetchImpl = okResponse
+    await client.ask('state', { q1: 'x' })
+    assert.equal(client.lastRetries, 0, '新的 ask 顺利时应报 lastRetries=0')
+    assert.equal(client.retries, 1, '累计量保留历史（供"这个 client 重试过没有"判断）')
   }
 
   // 2) 5xx → 重试；429 → 重试
@@ -1454,6 +1470,8 @@ const run = ({ events, cache, cfg, threshold }) => {
     await assert.rejects(() => client.ask('state', { q1: 'x' }), JevError)
     assert.equal(calls, 1, `${status} 不该重试（实际发了 ${calls} 次）`)
     assert.equal(client.retries, 0)
+    assert.equal(client.lastRetries, 0)
+    assert.equal(client.requests, 1, '不可重试的失败也真的发过一次请求')
   }
 
   // 4) 响应缺 answers → 不重试（换一次大概率还是坏响应）
@@ -1487,6 +1505,9 @@ const run = ({ events, cache, cfg, threshold }) => {
     await assert.rejects(() => client.ask('state', { q1: 'x' }), JevError)
     assert.equal(calls, 3, 'maxRetries=2 表示最多 3 次尝试')
     assert.equal(client.retries, 2)
+    assert.equal(client.lastRetries, 2)
+    assert.equal(client.requests, 3, '全部失败的 3 次尝试都要计入 requests')
+    assert.equal(client.requests, client.retries + 1, '口径：尝试数 = 重试数 + 1')
     assert.ok(client.lastError.length > 0, 'lastError 要留下原因')
   }
 
