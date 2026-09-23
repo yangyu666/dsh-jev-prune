@@ -404,13 +404,6 @@ const CONFIG_RANGES = {
 }
 
 /**
- * 按区间表钳制配置值；越界时通过 `onWarn` 报告**改动前后**的值。
- *
- * 返回 `[钳制后的值, 是否发生过钳制]`。非有限值（NaN / Infinity / 字符串）一律回落到
- * `fallback`（即默认值）——因为"改了多少"在这个语义下不可解释，"打到默认"才可解释。
- * 这正是 `Number.isFinite` 而不是 `typeof === 'number'` 的理由：`typeof NaN === 'number'`。
- */
-/**
  * `keepMode` 的白名单校验（review 修复）：此前是 `z.string()` + `?? 'budget'`，
  * 拼错（如 `'budgt'`）会静默穿过两层校验直达 `planTrims`——而 `planTrims` 对
  * 未知模式返回 null，等于**静默退回旧行为**，与仓库"越界配置必须留痕"的约定相悖。
@@ -424,7 +417,15 @@ export function resolveKeepMode(raw, onWarn) {
   return 'budget'
 }
 
-export function clampConfigNumber(key, value, fallback, onWarn) {  const [lo, hi] = CONFIG_RANGES[key] ?? [Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY]
+/**
+ * 按区间表钳制配置值；越界时通过 `onWarn` 报告**改动前后**的值。
+ *
+ * 返回 `[钳制后的值, 是否发生过钳制]`。非有限值（NaN / Infinity / 字符串）一律回落到
+ * `fallback`（即默认值）——因为"改了多少"在这个语义下不可解释，"打到默认"才可解释。
+ * 这正是 `Number.isFinite` 而不是 `typeof === 'number'` 的理由：`typeof NaN === 'number'`。
+ */
+export function clampConfigNumber(key, value, fallback, onWarn) {
+  const [lo, hi] = CONFIG_RANGES[key] ?? [Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY]
   const warn = (kind, got) => {
     onWarn?.(`配置 ${key}=${got} 非法（${kind}）→ 已改为 ${fallback}（合法区间 ${lo}~${hi}）`)
     return fallback
@@ -787,7 +788,20 @@ export function apply(ctx, config, deps = {}) {
     // P0-3：把"没判定"的原因也落盘。此前这条路径是完全静默的——judged=0 时无法区分
     // "门没开"（有 lastGate）/"没有候选"（有 surface 但都不可判）/"session 形态不对"，
     // 而这三者的处置完全不同。
-    if (session?.surface?.nodes == null || judge.ready === false) {
+    // session 真的可能不存在：宿主在会话挂上之前也会发 pre-step，而 compactPass 对同一
+    // 情况的处置是 `report.blocked = '没有活动会话'`——契约就是"优雅退出"，不是抛错。
+    //
+    // ⚠️ 必须与下面那个分支分开判断：`WeakMap.set` 的键必须是对象，`set(undefined)` 会抛
+    // `TypeError: Invalid value used as weak map key`。抛出点落在 pre-step 的 try 里，
+    // 会被吞成 `stats.errors` / `最近（第一层）: 判定失败：…`——第一层行为其实没坏，
+    // 只有账本在说谎（与 #29 的 startRequests 同一类缺陷）。所以守卫不能省：
+    // 条件写 `session?.` 却在这一行无条件 set，等于把"受支持的路径"变成"抛错路径"。
+    if (session == null) {
+      stats.judgePassSkipped = (stats.judgePassSkipped ?? 0) + 1
+      stats.lastJudgeSkipReason = '没有活动会话'
+      return
+    }
+    if (session.surface?.nodes == null || judge.ready === false) {
       // 早退也刷新压力比例（review 反馈）：否则沿用上一轮的值，陈旧。
       pressureRatios.set(session, 0)
       stats.judgePassSkipped = (stats.judgePassSkipped ?? 0) + 1
@@ -1528,7 +1542,16 @@ export function apply(ctx, config, deps = {}) {
       stats.lastBudget == null
         ? '第一层预算：尚未裁剪'
         : `第一层预算：${stats.lastBudget.note}`,
-      `第一层：累计省下 ${stats.savedChars} 字符   压力门控跳过 ${stats.skipped} 次   错误 ${stats.errors} 次`,
+      // 口径：stats.skipped 累加的是**候选个数**（`+= fresh.length`），不是事件次数。
+      // 这里的量词必须写"个"，否则 7 个候选被同一道门挡下会显示成"跳过 7 次"，
+      // 与旁边同为计数的 `errors N 次`、以及事件计数的 `judgePassSkipped` 混淆。
+      `第一层：累计省下 ${stats.savedChars} 字符   压力门控跳过候选 ${stats.skipped} 个   错误 ${stats.errors} 次`,
+      // P0-3 记下的"为什么一次都没判定"此前只落进心跳 JSON，人类可读的这份报告里没有——
+      // 而 judged=0 时它恰恰是唯一有价值的一行：不引用它，「门没开 / 没有候选 /
+      // session 形态不对」三者完全不可区分，只能靠猜。仅在"零判定且确实跳过过"时出现。
+      ...((stats.judged ?? 0) === 0 && (stats.judgePassSkipped ?? 0) > 0
+        ? [`判定 pass：已跳过 ${stats.judgePassSkipped} 次；最近原因：${stats.lastJudgeSkipReason ?? '（未记录）'}`]
+        : []),
       // 批次失败与重试计数只在异常时出现（issue #34）：常态下不该占版面。
       // 口径修正（PR #28 review）：这里要的是"最近一次 pass 重试了几次"（lastRetries），
       // 而不是 client 从建起来到现在的累计量——后者一旦抖动过就永久 >0，
@@ -1674,6 +1697,18 @@ export function apply(ctx, config, deps = {}) {
           for (const p of out.pruned) lines.push(`  s${p.originalSeq} (${p.callId ?? '?'})  ${p.charsBefore} → ${p.charsAfter} 字符`)
         } else if (judgedSeqs.length === 0) {
           lines.push('没有任何判定，所以全部退回按体积裁决。判定发生在 agent/pre-step；若刚才是首轮，先再做一次工具调用让判定跑起来。')
+          // P0-3 记下的"为什么没判定"此前只落进心跳 JSON，人类可读的状态里看不到——
+          // 而"judged=0 时无法区分门没开/没有候选/session 形态不对"正是它要解决的。
+          // 这两个字段是唯一的事实来源，就地引用，不要再让使用者去猜。
+          const skipCount = stats.judgePassSkipped ?? 0
+          if (skipCount > 0) {
+            lines.push(`判定 pass 已跳过 ${skipCount} 次；最近原因：${stats.lastJudgeSkipReason ?? '（未记录）'}`)
+          }
+          if (stats.lastGate?.skip === true) {
+            lines.push(`压力门快照：used=${stats.lastGate.used} measured=${stats.lastGate.measured}`
+              + ` window=${stats.lastGate.windowTokens} threshold=${stats.lastGate.threshold ?? '算不出'}`
+              + `（${stats.lastGate.reason || '未知'}）`)
+          }
         }
         return lines.join('\n')
       },

@@ -82,7 +82,15 @@ jobs:
         run: |
           node -e "const v = require('@deepseek-ai/dsh/package.json').version; if (v !== '0.1.5-rc.2') { console.error('宿主树应为 0.1.5-rc.2，实际 ' + v); process.exit(1) }"
           echo "host = @deepseek-ai/dsh@$(node -p "require('@deepseek-ai/dsh/package.json').version")"
-      - name: Checks against real DSH tree
+      # ⚠️ 命名更正（review 复查）：这一步跑在**仓库根**，因此 Node 从根目录向上解析模块——
+      # 拿到的是根 `node_modules`（根 devDependencies 钉了 dsh-llm/dsh-tools/schemastery
+      # @0.1.5-rc.2 及其传递依赖，约 18 个包），**不是** ci/dsh-host 那棵 585 包的 fixture 树。
+      # 所以它证明的是"在真实 dsh-llm 下跑通"，不等于"在完整宿主树下跑通"——原步骤名
+      # （Checks against real DSH tree）会让人以为后者。真正用到 fixture 的是上面两条
+      # 带 `working-directory: ci/dsh-host` 的步骤（模块可加载 + 宿主版本号断言）。
+      # 完整宿主包（@deepseek-ai/dsh 及其内置 compaction 束）只在跑 A/B 对照时才需要，
+      # 届时由 harness 从 fixture 树里解析。
+      - name: Repeat checks against the root dependency tree (real dsh-llm, not the host fixture)
         run: |
           node check.js
           node smoke_apply.mjs

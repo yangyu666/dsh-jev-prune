@@ -812,6 +812,43 @@ async function layer2Run(effectOfS2) {
 }
 
 
+// ---------- K. session 缺失时必须优雅退出，不得留下被吞掉的错误 ----------
+// judgePass 的第一道早退条件写的是 `session?.surface?.nodes == null`——**显式容忍**
+// session 不存在（宿主在会话挂上之前也会发 pre-step），compactPass 对同一情况的处置是
+// `report.blocked = '没有活动会话'`，所以这是项目自己声明的受支持路径。
+//
+// 但早退分支里那句 `pressureRatios.set(session, 0)` 是**无条件**的，而 WeakMap 的键必须
+// 是对象：`set(undefined)` 抛 `TypeError: Invalid value used as weak map key`。抛出点
+// 落在 pre-step 的 try 里 → 被吞成 `stats.errors += 1` 与
+// `最近（第一层）: 判定失败：…`。第一层行为其实没坏，只有账本在说谎——与 #29 同一个模式，
+// 也正是这个 PR 想消灭的那类"静默失效"。
+//
+// 断言方式刻意走**真实路径**：不是直接调 judgePass，而是发一次不带 session 的 pre-step，
+// 再读插件自己的状态报告。否则测的又是"我以为的东西"。
+{
+  const pruner = makePruner()
+  const session = makeSession()
+  const compaction = makeCompaction(session)
+  const ctx = makeCtx({ pruner, session, compaction })
+  const judge = fakeJudge({}, {})
+  mod.apply(ctx, { ...PLUGIN_CFG }, { judge })
+
+  // agent 没有 session —— 第一道早退条件为真
+  await ctx.handlers.get('agent/pre-step')({ agent: {}, options: {} }, () => {})
+
+  const statusTool = ctx.registeredTools.find((t) => t?.name === 'jev_prune_status')
+  const text = String(await statusTool.execute({}, { agent: { session, options: {} } }))
+  check('session 缺失时判定 pass 不得抛错（WeakMap.set(undefined) 回归）',
+    !/Invalid value used as weak map key/.test(text),
+    text.split('\n').filter((l) => /判定失败|Invalid/.test(l)).join(' | ') || '未发现')
+  check('session 缺失时不得被计入错误（错误 1 次）',
+    !/错误 [1-9]/.test(text),
+    text.split('\n').filter((l) => /错误/.test(l)).join(' | ') || '未发现错误行')
+  check('session 缺失应被如实记成"跳过"，而不是静默',
+    /没有活动会话/.test(text),
+    text.split('\n').filter((l) => /跳过|活动会话/.test(l)).join(' | ') || '未记录跳过原因')
+}
+
 // ---------------------------------------------------------------- 汇总
 console.log()
 for (const r of results) console.log(`${r.ok ? '  ✅' : '  ❌'} ${r.name}${r.detail ? `  — ${r.detail}` : ''}`)
