@@ -143,6 +143,20 @@ export const inject = ['tools', 'toolResultPruner']
 /** 裁剪标记与裁剪机制从 prune.js 复用（那边才能被单测覆盖）。 */
 export { JEV_PRUNE_MARKER }
 
+/**
+ * 已废弃键的 schema 默认值。
+ *
+ * 为什么要把默认值提出来：宿主（cordis）会先用 `Config` schema 校验用户配置、
+ * **把默认值填进去**，再把结果传给 `apply()`（见 cordis 的 `resolveConfig(runtime, config)`
+ * → `Config['~standard'].validate(config).value`）。所以到了我们这里，
+ * "用户没配" 与 "用户配成了默认值" 已经**不可区分** —— 两者都是 8192 / 0。
+ *
+ * ⇒ 这两个废弃键的告警只能靠"值 ≠ 默认值"来判断"用户是否真的显式改过"。
+ * 直接判 `!= null` 会让**每一个用户、每一次运行**都被报"你配置了废弃键"（实测确认）。
+ */
+export const DEFAULT_VOLUME_BUDGET_THRESHOLD_CHARS = 8192
+export const DEFAULT_BUDGET_MIN_CHARS = 0
+
 export const Config = z.object({
   enabled: z.boolean().default(true),
   /** TypeSafe key；留空则读环境变量 TYPESAFE_API_KEY */
@@ -168,9 +182,9 @@ export const Config = z.object({
   /** budget 模式：候选少于此数则降级为绝对下限（小样本上排序没有意义） */
   minCandidatesForBudget: z.number().min(1).default(4),
   /** @deprecated 已废弃：budget 模式改为压力分位（ratio 由 judgePass 自动算），不再错定体积规则。保留仅为向后兼容。 */
-  volumeBudgetThresholdChars: z.number().min(0).default(8192),
+  volumeBudgetThresholdChars: z.number().min(0).default(DEFAULT_VOLUME_BUDGET_THRESHOLD_CHARS),
   /** @deprecated 已废弃：同上，保留仅为向后兼容。 */
-  budgetMinChars: z.number().min(0).default(0),
+  budgetMinChars: z.number().min(0).default(DEFAULT_BUDGET_MIN_CHARS),
   /** 值得动手的最小收益（与 sliceWithBudget 的 minGain 同口径；小于它不进候选池） */
   minGainChars: z.number().min(0).default(40),
   /** 最近 N 个 surface 节点永不裁剪（含正在进行的工具调用） */
@@ -427,6 +441,19 @@ export function clampConfigNumber(key, value, fallback, onWarn) {  const [lo, hi
 
 export function resolveConfig(config = {}) {
   const warnings = []
+  // 废弃键的运行时信号（review 反馈）：只标 @deprecated 会让用户配了却静默空转，
+  // 违反仓库"静默退回必须留痕"的约定（resolveKeepMode 同理）。
+  //
+  // ⚠️ 判据必须是"值 ≠ 默认值"，不能是 `!= null`：宿主已经用 schema 填过默认值，
+  // 到了这里 `undefined` 不可能出现（实测：空配置也会被报"配置了废弃键"）。
+  // 代价是"显式写成默认值"不会告警 —— 那种写法本来也是空操作，不算漏报。
+  if (config.volumeBudgetThresholdChars != null
+    && config.volumeBudgetThresholdChars !== DEFAULT_VOLUME_BUDGET_THRESHOLD_CHARS) {
+    warnings.push('配置 volumeBudgetThresholdChars 已废弃（budget 模式改为压力分位，由 judgePass 每轮自动计算），该键不再生效')
+  }
+  if (config.budgetMinChars != null && config.budgetMinChars !== DEFAULT_BUDGET_MIN_CHARS) {
+    warnings.push('配置 budgetMinChars 已废弃（同上），该键不再生效')
+  }
   return {
     ...config,
     enabled: config.enabled ?? true,
@@ -440,8 +467,8 @@ export function resolveConfig(config = {}) {
     keepMode: resolveKeepMode(config.keepMode, (w) => warnings.push(w)),
     keepFloorThreshold: clampConfigNumber('keepFloorThreshold', config.keepFloorThreshold, 0.2, (w) => warnings.push(w))[0],
     minCandidatesForBudget: clampConfigNumber('minCandidatesForBudget', config.minCandidatesForBudget, 4, (w) => warnings.push(w))[0],
-    volumeBudgetThresholdChars: clampConfigNumber('volumeBudgetThresholdChars', config.volumeBudgetThresholdChars, 8192, (w) => warnings.push(w))[0],
-    budgetMinChars: clampConfigNumber('budgetMinChars', config.budgetMinChars, 0, (w) => warnings.push(w))[0],
+    volumeBudgetThresholdChars: clampConfigNumber('volumeBudgetThresholdChars', config.volumeBudgetThresholdChars, DEFAULT_VOLUME_BUDGET_THRESHOLD_CHARS, (w) => warnings.push(w))[0],
+    budgetMinChars: clampConfigNumber('budgetMinChars', config.budgetMinChars, DEFAULT_BUDGET_MIN_CHARS, (w) => warnings.push(w))[0],
     minGainChars: clampConfigNumber('minGainChars', config.minGainChars, 40, (w) => warnings.push(w))[0],
     resultExcerptChars: clampConfigNumber('resultExcerptChars', config.resultExcerptChars, 240, (w) => warnings.push(w))[0],
     headChars: clampConfigNumber('headChars', config.headChars, 600, (w) => warnings.push(w))[0],
@@ -733,6 +760,10 @@ export function apply(ctx, config, deps = {}) {
   }
 
   // ---------------------------------------------------------- 判定 pass（异步）
+  // contextWindow 按 provider+model 缓存：模型信息是静态的，每轮都问 llm 是浪费。
+  // 方案 B（压力门移到 fresh 检查前）要求即使 fresh=0 也每轮算 ratio，所以这个缓存
+  // 让"每轮算"不再有额外开销。只缓存非 null 结果，失败/null 时下次重试，与未缓存行为一致。
+  const windowCache = new Map()
   async function resolveWindow(agent) {
     try {
       const header = agent.session?.requestHeader?.()?.config
@@ -740,8 +771,12 @@ export function apply(ctx, config, deps = {}) {
       const model = header?.model || agent.options?.model
       const llm = ctx.get('llm')
       if (llm == null || !provider || !model || typeof llm.resolveModelInfo !== 'function') return null
+      const key = `${provider}\u0000${model}`
+      if (windowCache.has(key)) return windowCache.get(key)
       const info = await llm.resolveModelInfo(provider, model)
-      return info?.context?.contextWindow ?? null
+      const windowTokens = info?.context?.contextWindow ?? null
+      if (windowTokens != null) windowCache.set(key, windowTokens)
+      return windowTokens
     } catch {
       return null
     }
@@ -753,6 +788,8 @@ export function apply(ctx, config, deps = {}) {
     // "门没开"（有 lastGate）/"没有候选"（有 surface 但都不可判）/"session 形态不对"，
     // 而这三者的处置完全不同。
     if (session?.surface?.nodes == null || judge.ready === false) {
+      // 早退也刷新压力比例（review 反馈）：否则沿用上一轮的值，陈旧。
+      pressureRatios.set(session, 0)
       stats.judgePassSkipped = (stats.judgePassSkipped ?? 0) + 1
       stats.lastJudgeSkipReason = judge.ready === false ? 'judge 未就绪' : 'session.surface.nodes 不可用'
       return
@@ -772,16 +809,6 @@ export function apply(ctx, config, deps = {}) {
     })
     const cache = decisionsOf(session)
     const fresh = candidates.filter((c) => !cache.has(c.seq))
-    if (fresh.length === 0) {
-      // P0-3：区分"没有候选"与"候选都已判定过"——前者说明筛选条件把结果全排除了
-      // （preserveRecent / 黑名单 / 已裁标记），需要看见 surface 规模才能判断是否配置过紧。
-      stats.judgePassSkipped = (stats.judgePassSkipped ?? 0) + 1
-      stats.lastJudgeSkipReason = candidates.length === 0
-        ? `无候选（surface ${surface.length} 节点：可能全落在最近区/黑名单/已裁剪）`
-        : `候选全部已判定（候选 ${candidates.length}，缓存 ${cache.size}）`
-      return
-    }
-
     // 压力门控：不到软阈值就不花 Jev 的钱
     //
     // 失败方向（issue #32）：第一层与第二层的压力门必须**同向关闭**。
@@ -796,6 +823,11 @@ export function apply(ctx, config, deps = {}) {
     // 分支也被挡掉——把"该省的钱省下来"升级成了"功能静默消失"，
     // 比旧行为更糟。所以只要阈值本身能定出来（`threshold != null`），
     // meter 不可用就只是"压力门降级为不设防"，而不是"什么都不做"。
+    //
+    // 方案 B：压力门**移到 fresh 检查之前**。这样即使 fresh=0（没有新候选），ratio 也是
+    // "当前"压力缺口比例，不是清成 0（会"该裁不裁"）也不是沿用旧值（陈旧）。代价是
+    // fresh=0 的轮次也多调一次 resolveWindow（已按 provider+model 缓存）/ meter.measure
+    // （本地计算），可忽略。
     // P0-1 修正：压力缺口比例（0~1）。judgePass 算出后缓存给 pruneSession 决定「这一轮裁多少」。
     // 默认 0 = 不裁（失败方向：算不出压力就不动手）。
     let pressureRatio = 0
@@ -857,6 +889,18 @@ export function apply(ctx, config, deps = {}) {
       pressureRatio = 0.5
     }
     pressureRatios.set(session, pressureRatio)
+
+    if (fresh.length === 0) {
+      // 早退②：没有新候选。ratio 已在上面每轮算好（压力门在 fresh 检查之前），
+      // 这里不需要再 set 0——pruneSession 拿到的是"当前"压力比例，不是陈旧的。
+      // P0-3：区分"没有候选"与"候选都已判定过"——前者说明筛选条件把结果全排除了
+      // （preserveRecent / 黑名单 / 已裁标记），需要看见 surface 规模才能判断是否配置过紧。
+      stats.judgePassSkipped = (stats.judgePassSkipped ?? 0) + 1
+      stats.lastJudgeSkipReason = candidates.length === 0
+        ? `无候选（surface ${surface.length} 节点：可能全落在最近区/黑名单/已裁剪）`
+        : `候选全部已判定（候选 ${candidates.length}，缓存 ${cache.size}）`
+      return
+    }
 
     const goal = recentGoal(sessionEvents(session))
     const { state, fitted, stateTokens } = buildJevState({

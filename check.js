@@ -1521,6 +1521,38 @@ const run = ({ events, cache, cfg, threshold }) => {
     assert.equal(good[CONFIG_WARNINGS].length, 0, '合法 keepMode 不告警')
   }
 
+  // 废弃键的运行时信号（review 反馈）：显式配置 volumeBudgetThresholdChars / budgetMinChars
+  // 必须推 configWarnings，否则用户配了却静默空转（与 keepMode 的留痕约定一致）。
+  //
+  // ⚠️ 必须走**宿主的真实取配置路径**：cordis 会先用 Config schema 校验用户配置、把默认值
+  // 填进去，再把结果交给 apply()（`resolveConfig(runtime, config).value`）。直接调
+  // `resolveConfig({...})` 传的是**没有默认值**的裸对象，测不到那个差异 ——
+  // 第一版断言就是这么写的，于是"空配置也被报废弃"这个回归它完全看不见。
+  const viaHost = (userCfg) => {
+    const r = Config['~standard'].validate(userCfg)
+    assert.ok(!r.issues, `schema 不应拒绝 ${JSON.stringify(userCfg)}`)
+    return resolveConfig(r.value)
+  }
+  {
+    // ① 关键回归：用户什么都没配 → 不得告警（schema 填的默认值不是"用户配置"）
+    const none = viaHost({})
+    assert.equal(none[CONFIG_WARNINGS].length, 0,
+      `空配置不得报废弃键（宿主已填默认值，实测会误报）：${JSON.stringify(none[CONFIG_WARNINGS])}`)
+    // ② 配了无关的键 → 同样不得告警
+    const unrelated = viaHost({ dryRun: true })
+    assert.equal(unrelated[CONFIG_WARNINGS].length, 0, '只配无关键不得报废弃键')
+    // ③ 真的改了废弃键的值 → 必须留痕
+    const changed1 = viaHost({ volumeBudgetThresholdChars: 5000 })
+    assert.ok(changed1[CONFIG_WARNINGS].some((w) => w.includes('volumeBudgetThresholdChars')),
+      '改了 volumeBudgetThresholdChars 必须留痕')
+    const changed2 = viaHost({ budgetMinChars: 100 })
+    assert.ok(changed2[CONFIG_WARNINGS].some((w) => w.includes('budgetMinChars')),
+      '改了 budgetMinChars 必须留痕')
+    // ④ 显式写成默认值 = 空操作，不告警（代价可接受，注释里写明）
+    const asDefault = viaHost({ volumeBudgetThresholdChars: 8192, budgetMinChars: 0 })
+    assert.equal(asDefault[CONFIG_WARNINGS].length, 0, '显式写成默认值属空操作，不告警')
+  }
+
 
   // 合法值必须原样保留（钳制不能顺手改掉正常配置）
   const ok = resolveConfig({ preserveRecent: 0, headChars: 0, maxStepTextChars: 5000, receiptMaxRatio: 1 })
