@@ -111,7 +111,7 @@ const dshVersionMatches = dshVersion === 'unknown'
  * 静态导入一旦解析不到，整个插件会加载失败（连带 DSH 起不来）；
  * 动态导入失败只退化成一个浅拷贝，插件照常工作。
  */
-let freezeMessageImpl = (message) => message
+let freezeMessageImpl = (message) => ({ ...message })
 let freezeLoaded = false
 
 async function loadFreeze() {
@@ -165,6 +165,8 @@ export const Config = z.object({
   baseUrl: z.string().default('https://api.typesafe.ai/v1/systemone'),
   /** P(保留) ≥ 该值 → 不裁（budget 模式下这是**保护上限**：达到即不进候选池） */
   keepThreshold: z.number().min(0).max(1).default(0.5),
+  /** always 模式（judgeOn: 'always'）没有压力信号时的固定裁剪比例：裁掉候选池这个比例的字符增益（0.5 = 一半）。pressure 模式下由缺口自动算，与此无关。 */
+  alwaysTrimRatio: z.number().min(0).max(1).default(0.5),
   /**
    * 第一层裁决模式（P0-1）：
    *   · `budget`（默认）——"**裁多少**"由**压力缺口比例**决定（ratio = (used − threshold)/window，
@@ -365,6 +367,7 @@ const CONFIG_RANGES = {
   // 概率 / 比例：越界会让判据恒真或恒假
   keepThreshold: [0, 1],
   keepFloorThreshold: [0, 1],
+  alwaysTrimRatio: [0, 1],
   compactQuantile: [0, 1],
   compactThreshold: [0, 1],
   floorThreshold: [0, 1],
@@ -465,6 +468,7 @@ export function resolveConfig(config = {}) {
     baseUrl: config.baseUrl ?? 'https://api.typesafe.ai/v1/systemone',
     preserveRecent: clampConfigNumber('preserveRecent', config.preserveRecent, 4, (w) => warnings.push(w))[0],
     keepThreshold: clampConfigNumber('keepThreshold', config.keepThreshold, 0.5, (w) => warnings.push(w))[0],
+    alwaysTrimRatio: clampConfigNumber('alwaysTrimRatio', config.alwaysTrimRatio, 0.5, (w) => warnings.push(w))[0],
     keepMode: resolveKeepMode(config.keepMode, (w) => warnings.push(w)),
     keepFloorThreshold: clampConfigNumber('keepFloorThreshold', config.keepFloorThreshold, 0.2, (w) => warnings.push(w))[0],
     minCandidatesForBudget: clampConfigNumber('minCandidatesForBudget', config.minCandidatesForBudget, 4, (w) => warnings.push(w))[0],
@@ -899,8 +903,8 @@ export function apply(ctx, config, deps = {}) {
           : 0
       }
     } else {
-      // always 模式没有压力信号，固定裁掉池子一半增益（可后续配成独立配置项）。
-      pressureRatio = 0.5
+      // always 模式没有压力信号，按配置的固定比例裁（默认 0.5 = 裁掉池子一半增益）。
+      pressureRatio = cfg.alwaysTrimRatio
     }
     pressureRatios.set(session, pressureRatio)
 

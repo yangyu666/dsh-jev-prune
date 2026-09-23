@@ -103,6 +103,7 @@ node wire_profile.mjs <DSH_HOME> <profile名>
 | `model` | `jev-latest` | 判断模型 |
 | `keepMode` | `budget` | 第一层裁决模式。`budget`：*裁多少*由压力缺口比例定、*裁哪些*由 Jev 排序定（见下文）；`absolute`：旧的固定阈值行为 |
 | `keepThreshold` | `0.5` | 第一层：`absolute` 模式下 `P(保留)` ≥ 该值不裁；`budget` 模式下只是**保护上限**（达到它的一条都不进候选池） |
+| `alwaysTrimRatio` | `0.5` | 第一层：**仅**在 `judgeOn: 'always'` 下使用的固定裁剪比例（该模式没有压力信号可推）。预算 = 候选池总字符增益 × 该比例；`pressure` 模式由缺口自动算，与此键无关 |
 | `volumeBudgetThresholdChars` | `8192` | ⚠️ **已废弃**（保留仅为兼容）：早期 `budget` 模式把预算错定在体积规则上，现已改为压力缺口比例，此键不再生效 |
 | `keepFloorThreshold` / `minCandidatesForBudget` | `0.2` / `4` | `budget` 模式小样本降级：判定候选不足 4 条时，只有 `P(保留) < 0.2` 的结果可裁（与第二层同款降级形态） |
 | `budgetMinChars` | `0` | ⚠️ **已废弃**（保留仅为兼容）：同上，不再生效 |
@@ -256,7 +257,7 @@ cp smoke_apply.mjs <某目录>/ && cd <某目录>/ && node smoke_apply.mjs
 
 测试脚本与辅助工具（`check.js` / `smoke_apply.mjs` / `inspect_session.mjs` / `verify_real_shapes.mjs` / `wire_profile.mjs`）都随 npm 包发布，装好的包内可直接 `npm run check`。CI（`.github/workflows/ci.yml`）跑两组作业：仅 peer 依赖的快速冒烟 + 完整 DSH 依赖树的集成验证。
 
-覆盖：两个接入点的接管、两层完整裁决路径、append 协议、回执注入与**归属（fence）**、并发压缩竞态、门控分支（含反事实对照）、**文本/思考两轴分离**、**小总体降级**、**越界配置钳制**、**判定请求重试与批级容错**（含"本次"与"累计"两种计数口径）、**批次记账不重复**、**压力门同向关闭但在绝对阈值下仍照常动作**、**token 标定在留出集上的精度**、**压缩配额**、**shell 类工具默认排除**（`pwsh Remove-Item` 回归用例）。
+覆盖：两个接入点的接管、两层完整裁决路径、append 协议、回执注入与**归属（fence）**、并发压缩竞态、门控分支（含反事实对照）、**文本/思考两轴分离**、**小总体降级**、**越界配置钳制**、**判定请求重试与批级容错**（含"本次"与"累计"两种计数口径）、**批次记账不重复**、**压力门同向关闭但在绝对阈值下仍照常动作**、**token 标定在留出集上的精度**、**压缩配额**、**`alwaysTrimRatio` 真的在改变预算**（含"确实走了预算路径而非小总体降级"的前提断言）、**session 缺失时优雅退出而非抛错**、**shell 类工具默认排除**（`pwsh Remove-Item` 回归用例）。
 
 **测试边界**（哪些是 CI 真正验证过的）：纯函数逻辑、假 ctx 下的接管与 append 协议、以及 integration 作业里的"真实依赖树下模块可加载 + freezeMessage 可用"。**没有**被 CI 覆盖的：真实 DSH 宿主内的服务接管、rc 版本间的事件形状漂移——这些只能在真实会话里用 `jev_probe_shapes` 校对。
 

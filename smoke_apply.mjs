@@ -849,6 +849,71 @@ async function layer2Run(effectOfS2) {
     text.split('\n').filter((l) => /跳过|活动会话/.test(l)).join(' | ') || '未记录跳过原因')
 }
 
+
+// ---------- L. alwaysTrimRatio 必须真的生效（新增配置项的行为断言） ----------
+// 这个键是 `judgeOn: 'always'` 时替代硬编码 0.5 的固定裁剪比例。配置项最危险的失败模式
+// 是"进了 schema 但没人读"（静默空转）——schema / CONFIG_RANGES / resolveConfig 三处
+// 一致（已有元断言）**排不掉**这种失败，只有行为断言能：改这个值，裁剪量必须跟着变。
+//
+// 构造上有两个坑，都是实测踩出来的，写在这里免得下次重踩：
+//   ① 候选数必须 ≥ minCandidatesForBudget（默认 4）——只有 3 条时 P0-2 的小总体降级会
+//      接管，直接走"绝对下限"、完全不看比例，于是三个比例给出同一个结果，
+//      看起来像"这个配置项没生效"，其实是走了另一条路径。故用 6 步会话 + 前提断言。
+//   ② compactOn 必须是 pressure——若是 always，第二层会在 pre-step 里把节点整对移出，
+//      第一层就没东西可裁，探针会看到恒为 0 的假结果。
+{
+  const plan6 = [
+    { tool: 'Read', args: { file_path: 'server/src/game/river.ts' }, chars: 6000 },
+    { tool: 'Grep', args: { pattern: 'basePot' }, chars: 4000 },
+    { tool: 'Glob', args: { pattern: '*.ts', path: 'server/src' }, chars: 6000 },
+    { tool: 'Read', args: { file_path: 'server/src/game/turn.ts' }, chars: 5000 },
+    { tool: 'Grep', args: { pattern: 'potOdds' }, chars: 4500 },
+    { tool: 'Glob', args: { pattern: '*.json', path: 'server/config' }, chars: 3000 },
+  ]
+  const pruneWithRatio = async (ratio) => {
+    const pruner = makePruner()
+    const session = makeSession(plan6)
+    const compaction = makeCompaction(session)
+    const ctx = makeCtx({ pruner, session, compaction })
+    // ⚠️ 不能用 session.steps —— 假会话只暴露前 3 步（见 makeSession），
+    // 6 步计划里后 3 步拿不到概率就会被排除出候选，于是又只剩 3 条、撞上小总体降级。
+    // 从 surface 推全部 tool/result 节点才是完整候选集。
+    const resultSeqs = session.surface.nodes.filter((seq) => session.eventAt(seq)?.type === 'tool/result')
+    const probs = Object.fromEntries(resultSeqs.map((seq) => [seq, 0.05]))
+    const judge = fakeJudge(probs, probs)
+    mod.apply(ctx, { ...PLUGIN_CFG, judgeOn: 'always', compactOn: 'pressure', alwaysTrimRatio: ratio }, { judge })
+    const agentRef = { agent: { session, options: {} } }
+    await ctx.handlers.get('agent/pre-step')(agentRef, () => {})
+    // 直接走 DSH 每步真正调用、且已被插件接管的那个接缝
+    const out = pruner.pruneSession(session)
+    const statusTool = ctx.registeredTools.find((t) => t?.name === 'jev_prune_status')
+    const statusText = String(await statusTool.execute({}, agentRef))
+    return { out, statusText }
+  }
+
+  const r0 = await pruneWithRatio(0)
+  const rHalf = await pruneWithRatio(0.5)
+  const r1 = await pruneWithRatio(1)
+
+  // 前提：确实走了"预算（压力分位）"路径，而不是小总体降级或体积兜底
+  check('前提：走的是预算路径而非小总体降级（否则本测试无意义）',
+    /压力分位/.test(r1.statusText) && !/降级绝对下限/.test(r1.statusText),
+    r1.statusText.split('\n').find((l) => /第一层预算/.test(l)) ?? '（无预算行）')
+
+  check('alwaysTrimRatio=0 → 一条都不裁（缺口为 0 就不动手）',
+    r0.out.pruned.length === 0,
+    `实际裁了 ${r0.out.pruned.length} 条 / ${r0.out.charsRemoved} 字符`)
+  check('alwaysTrimRatio 单调生效：0.5 与 1 都真的裁了东西',
+    rHalf.out.charsRemoved > 0 && r1.out.charsRemoved > 0,
+    `0.5 → ${rHalf.out.charsRemoved} 字符 / 1 → ${r1.out.charsRemoved} 字符`)
+  check('alwaysTrimRatio=1 裁得比 0.5 多（比例真的进了预算）',
+    r1.out.charsRemoved > rHalf.out.charsRemoved,
+    `0.5 → ${rHalf.out.charsRemoved} 字符 / 1 → ${r1.out.charsRemoved} 字符`)
+  check('alwaysTrimRatio=1 裁满全池（6 条）',
+    r1.out.pruned.length === plan6.length,
+    `实际 ${r1.out.pruned.length} / 期望 ${plan6.length}`)
+}
+
 // ---------------------------------------------------------------- 汇总
 console.log()
 for (const r of results) console.log(`${r.ok ? '  ✅' : '  ❌'} ${r.name}${r.detail ? `  — ${r.detail}` : ''}`)
