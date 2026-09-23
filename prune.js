@@ -161,44 +161,49 @@ export function planTrims(nodes, cfg = {}) {
   const keepCeiling = cfg.keepThreshold ?? 0.5
   const floor = cfg.keepFloorThreshold ?? 0.2
   const minCandidates = cfg.minCandidatesForBudget ?? 4
-  const volumeThreshold = cfg.volumeBudgetThresholdChars ?? 8192
   const minGain = cfg.minGainChars ?? 40
+  // 压力缺口比例（judgePass 传入，0~1）：0 = 无缺口不裁，1 = 裁掉池子全部增益。
+  // 缺失/非法一律钳到 0（失败方向：解析不出压力就不动手，与两层的门控口径一致）。
+  const ratio = Math.min(1, Math.max(0, Number(cfg.pressureRatio) || 0))
 
   const eligible = nodes.filter((n) => !n.inTail && !n.blacklisted && n.verdict != null
     && n.gain >= minGain && n.chars >= (cfg.minCharsToPrune ?? 400))
   const ceilingProtected = eligible.filter((n) => typeof n.prob === 'number' && n.prob >= keepCeiling)
-  const pool = eligible.filter((n) => !(typeof n.prob === 'number' && n.prob >= keepCeiling))
+  // 修 null 排序 bug：prob 缺失（result 轴批次失败）时**不进池子**，更不能被当成 0 优先裁。
+  const pool = eligible.filter((n) => typeof n.prob === 'number' && n.prob < keepCeiling)
 
   if (pool.length === 0) {
-    return { mode: 'budget', selected: new Set(), budget: 0, spent: 0, poolSize: 0, keptByCeiling: ceilingProtected.length, note: '无可裁候选（全部落在保护上限之上或不可裁）' }
+    return { mode: 'budget', selected: [], budget: 0, spent: 0, poolSize: 0, keptByCeiling: ceilingProtected.length, ratio, note: '无可裁候选（全部落在保护上限之上或不可裁）' }
   }
 
   // 小样本：排序没有意义 → 降级为绝对下限（与第二层 floor 分支同口径）
   if (pool.length < minCandidates) {
-    const selected = new Set(pool.filter((n) => typeof n.prob === 'number' && n.prob < floor).map((n) => n.seq))
-    const spent = pool.filter((n) => selected.has(n.seq)).reduce((s, n) => s + n.gain, 0)
+    const selected = pool.filter((n) => n.prob < floor).map((n) => n.seq)
+    const spent = pool.filter((n) => n.prob < floor).reduce((s, n) => s + n.gain, 0)
     return {
-      mode: 'floor', selected, budget: 0, spent, poolSize: pool.length, keptByCeiling: ceilingProtected.length,
-      note: `候选仅 ${pool.length} 条（< ${minCandidates}）→ 降级绝对下限：只裁 prob < ${floor} 的 ${selected.size} 条`,
+      mode: 'floor', selected, budget: 0, spent, poolSize: pool.length, keptByCeiling: ceilingProtected.length, ratio,
+      note: `候选仅 ${pool.length} 条（< ${minCandidates}）→ 降级绝对下限：只裁 prob < ${floor} 的 ${selected.length} 条`,
     }
   }
 
-  // 预算 = 体积规则本会省下的量（只看超过体积阈值的结果；gain 按实际会省的算）
-  const budget = Math.max(
-    nodes.filter((n) => n.chars > volumeThreshold && n.gain > 0).reduce((s, n) => s + n.gain, 0),
-    cfg.budgetMinChars ?? 0,
-  )
+  // 预算 = 压力缺口比例 × 池子总增益。「裁多少」与「能裁的是谁」落在同一个总体（pool），
+  // 不再锚定体积规则（那是 #30 自查里"方向反了"的根源）。
+  const totalGain = pool.reduce((s, n) => s + n.gain, 0)
+  const budget = ratio * totalGain
+  if (!(budget > 0)) {
+    return { mode: 'budget', selected: [], budget: 0, spent: 0, poolSize: pool.length, keptByCeiling: ceilingProtected.length, ratio, note: `压力缺口为 0（ratio=${ratio}）→ 不裁` }
+  }
   const sorted = [...pool].sort((a, b) => (a.prob - b.prob) || (a.seq - b.seq))
-  const selected = new Set()
+  const selected = []
   let spent = 0
   for (const node of sorted) {
     if (spent >= budget) break
-    selected.add(node.seq)
+    selected.push(node.seq)
     spent += node.gain
   }
   return {
-    mode: 'budget', selected, budget, spent, poolSize: pool.length, keptByCeiling: ceilingProtected.length,
-    note: `预算 ${budget} 字符（体积规则口径）→ 从 ${pool.length} 条候选中按概率升序裁 ${selected.size} 条，省 ${spent}`,
+    mode: 'budget', selected, budget, spent, poolSize: pool.length, keptByCeiling: ceilingProtected.length, ratio,
+    note: `压力分位 ${(ratio * 100).toFixed(1)}%（预算 ${Math.round(budget)} 字符）→ 从 ${pool.length} 条候选中按概率升序裁 ${selected.length} 条，省 ${spent}`,
   }
 }
 
@@ -248,7 +253,10 @@ export function pruneSessionWithJev({ pruner, session, cache, cfg, stats, freeze
 
   // ---- 阶段二：全局计划（仅 budget 模式返回非 null） ----
   const plan = planTrims(nodes, cfg)
-  const planned = plan?.selected ?? null
+  // selected 现在是数组（可 JSON 序列化，修落盘丢失），这里转 Set 供 has() 用。
+  // 注意：plan 非 null 时即使 selected 为空数组也必须得到非 null 的 planned（空 Set = 不裁任何节点），
+  // 不能退回 absolute 分支——那会窄带下 verdict.keep 全 false 导致全裁。
+  const planned = plan != null ? new Set(plan.selected) : null
   const decisions = []
 
   for (const node of nodes) {

@@ -153,23 +153,23 @@ export const Config = z.object({
   keepThreshold: z.number().min(0).max(1).default(0.5),
   /**
    * 第一层裁决模式（P0-1）：
-   *   · `budget`（默认）——"**裁多少**"由体积规则决定（budget = 超过 volumeBudgetThresholdChars
-   *     的结果按我们的 head/tail 裁剪本可省下的字符总量），"**裁哪些**"由 Jev 概率**排序**决定
-   *     （从最低开始裁，裁到省够 budget 即停）；`keepThreshold` 退居保护上限。
+   *   · `budget`（默认）——"**裁多少**"由**压力缺口比例**决定（ratio = (used − threshold)/window，
+   *     由 judgePass 每轮自动算并缓存；预算 = ratio × 候选池总字符增益），"**裁哪些**"由 Jev 概率
+   *     **排序**决定（从最低开始裁，裁到省够预算即停）；`keepThreshold` 退居保护上限。
    *   · `absolute` —— 旧行为：逐节点 `prob >= keepThreshold` 判。
    * 为什么必须换：实测 Jev 概率是**窄带**（真实会话 42/42 条低于 0.5、P50=0.13），
    * 固定 0.5 会把所有判定过的结果都判成"可裁"；而纯相对分位又会"每轮必裁固定比例"
    * （不需要压缩时也在动刀，且比例与宿主需要腾多少空间无关）。两条路都不成立，
-   * 所以拆成正交的两件事：省多少 = 体积规则，裁哪些 = Jev 排序。
+   * 所以拆成正交的两件事：省多少 = 压力缺口，裁哪些 = Jev 排序。
    */
   keepMode: z.string().default('budget'),
   /** budget 模式小样本降级用的绝对下限（口径与第二层 floorThreshold 一致） */
   keepFloorThreshold: z.number().min(0).max(1).default(0.2),
   /** budget 模式：候选少于此数则降级为绝对下限（小样本上排序没有意义） */
   minCandidatesForBudget: z.number().min(1).default(4),
-  /** 预算口径：超过该体积的结果才计入"体积规则本会省下多少"（默认 8192 = DSH 自带裁剪器的真实默认阈值） */
+  /** @deprecated 已废弃：budget 模式改为压力分位（ratio 由 judgePass 自动算），不再错定体积规则。保留仅为向后兼容。 */
   volumeBudgetThresholdChars: z.number().min(0).default(8192),
-  /** 预算下限（0 = 严格跟随体积规则；正数表示即使体积规则省不到也至少腾出这么多） */
+  /** @deprecated 已废弃：同上，保留仅为向后兼容。 */
   budgetMinChars: z.number().min(0).default(0),
   /** 值得动手的最小收益（与 sliceWithBudget 的 minGain 同口径；小于它不进候选池） */
   minGainChars: z.number().min(0).default(40),
@@ -545,6 +545,11 @@ export function apply(ctx, config, deps = {}) {
 
   /** session → Map(结果 seq → {keep, prob, effectProb, chars, tool}) */
   const decisions = new WeakMap()
+  /**
+   * session → 压力缺口比例（0~1）。judgePass（异步，能拿到 used/window）算好存这里，
+   * pruneSession（同步，DSH 调）读它来决定「这一轮裁多少」。读不到 = 0 = 不裁。
+   */
+  const pressureRatios = new WeakMap()
   const stats = {
     judged: 0,
     requests: 0,
@@ -698,14 +703,14 @@ export function apply(ctx, config, deps = {}) {
         // 落盘的原因是"钳制"本身就是一种静默行为差异，必须以可观测的方式留痕。
         configWarnings: cfg[CONFIG_WARNINGS] ?? [],
         keepThreshold: cfg.keepThreshold,
-        // P0-1/P0-3：第一层的裁决模式与预算口径（判据落盘，否则"为什么没裁"不可复核）
+        // P0-1/P0-3：第一层的裁决模式与压力分位口径（判据落盘，否则"为什么没裁"不可复核）
         keep: {
           mode: cfg.keepMode,
           keepThreshold: cfg.keepThreshold,
           floor: cfg.keepFloorThreshold,
           minCandidates: cfg.minCandidatesForBudget,
-          volumeThresholdChars: cfg.volumeBudgetThresholdChars,
-          budgetMinChars: cfg.budgetMinChars,
+          // 压力缺口比例由 judgePass 每轮算好，裁剪时随 lastPrune.budget 一起落盘；
+          // volumeBudgetThresholdChars / budgetMinChars 已废弃（保留仅为兼容），不再出现在这里。
         },
         stateExcerptChars: cfg.resultExcerptChars,
         preserveRecent: cfg.preserveRecent,
@@ -791,6 +796,9 @@ export function apply(ctx, config, deps = {}) {
     // 分支也被挡掉——把"该省的钱省下来"升级成了"功能静默消失"，
     // 比旧行为更糟。所以只要阈值本身能定出来（`threshold != null`），
     // meter 不可用就只是"压力门降级为不设防"，而不是"什么都不做"。
+    // P0-1 修正：压力缺口比例（0~1）。judgePass 算出后缓存给 pruneSession 决定「这一轮裁多少」。
+    // 默认 0 = 不裁（失败方向：算不出压力就不动手）。
+    let pressureRatio = 0
     if (cfg.judgeOn !== 'always') {
       const meter = ctx.get('tokenMeter')
       let used = 0
@@ -819,6 +827,7 @@ export function apply(ctx, config, deps = {}) {
       }
       if (threshold == null) {
         // 阈值算不出来（ratio 模式 + 窗口未知）→ 与第二层同向：不做判定，不花钱
+        pressureRatios.set(session, 0)
         stats.skipped += fresh.length
         stats.lastGate = { ...stats.lastGate, skip: true, reason: '窗口未知（ratio 模式算不出阈值）' }
         stats.lastNote = '解析不出上下文窗口，第一层保守跳过（与第二层同向）'
@@ -828,15 +837,26 @@ export function apply(ctx, config, deps = {}) {
       if (!measured) {
         // 阈值能定出来但拿不到用量 → 无法比较，只能不设防地继续。
         // 这里**不 return**：绝对阈值分支下 meter 本来就无关，return 等于把功能关掉。
+        // ratio 算不出缺口 → 保持 0（不裁），由块后的统一 set 落盘。
         stats.lastGate = { ...stats.lastGate, reason: 'meter 不可用，本次不设防' }
         stats.lastNote = `拿不到 token 用量（meter 缺失或抛错），压力门本次不设防（阈值 ${threshold}）`
         log('warn', stats.lastNote)
       } else if (used < threshold) {
+        pressureRatios.set(session, 0)
         stats.skipped += fresh.length
         stats.lastGate = { ...stats.lastGate, skip: true, reason: `压力不足（${used} < ${threshold}）` }
         return
+      } else {
+        // 通过压力门：缺口 = used - threshold（token），比例 = 缺口 / 窗口。窗口未知时保守 0。
+        pressureRatio = windowTokens != null && windowTokens > 0
+          ? Math.min(1, Math.max(0, (used - threshold) / windowTokens))
+          : 0
       }
+    } else {
+      // always 模式没有压力信号，固定裁掉池子一半增益（可后续配成独立配置项）。
+      pressureRatio = 0.5
     }
+    pressureRatios.set(session, pressureRatio)
 
     const goal = recentGoal(sessionEvents(session))
     const { state, fitted, stateTokens } = buildJevState({
@@ -971,7 +991,7 @@ export function apply(ctx, config, deps = {}) {
       pruner,
       session,
       cache: decisions.get(session),
-      cfg: { ...cfg, marker: JEV_PRUNE_MARKER },
+      cfg: { ...cfg, marker: JEV_PRUNE_MARKER, pressureRatio: pressureRatios.get(session) ?? 0 },
       stats,
       freeze: freezeMessageImpl,
       toolNameOf: (event) => toolNameOf(event, nameByCallId),
@@ -1438,7 +1458,7 @@ export function apply(ctx, config, deps = {}) {
           ? '  ⚠️ 版本系列不匹配——事件字段可能已变，请先跑一次 jev_probe_shapes 核对'
           : ''),
       `第一层 模式=${cfg.keepMode}${cfg.keepMode === 'budget'
-        ? `（预算口径：>${cfg.volumeBudgetThresholdChars} 字符的结果按 head/tail 本可省的量；保护上限 prob≥${cfg.keepThreshold}）`
+        ? `（压力分位：裁掉池子总增益的「压力缺口比例」，由 judgePass 每轮自动计算；保护上限 prob≥${cfg.keepThreshold}）`
         : `（绝对阈值 keep≥${cfg.keepThreshold}）`}   preserveRecent=${cfg.preserveRecent}   minChars=${cfg.minCharsToPrune}   摘录=${cfg.resultExcerptChars}字符`,
       // 越界配置被钳制时必须显式列出：否则"我配了却没生效"会被误当成插件 bug（issue #28）
       ...(cfg[CONFIG_WARNINGS]?.length > 0

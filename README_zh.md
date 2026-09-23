@@ -101,11 +101,11 @@ node wire_profile.mjs <DSH_HOME> <profile名>
 |---|---|---|
 | `enabled` | `true` | 总开关 |
 | `model` | `jev-latest` | 判断模型 |
-| `keepMode` | `budget` | 第一层裁决模式。`budget`：*裁多少*由体积规则定、*裁哪些*由 Jev 排序定（见下文）；`absolute`：旧的固定阈值行为 |
+| `keepMode` | `budget` | 第一层裁决模式。`budget`：*裁多少*由压力缺口比例定、*裁哪些*由 Jev 排序定（见下文）；`absolute`：旧的固定阈值行为 |
 | `keepThreshold` | `0.5` | 第一层：`absolute` 模式下 `P(保留)` ≥ 该值不裁；`budget` 模式下只是**保护上限**（达到它的一条都不进候选池） |
-| `volumeBudgetThresholdChars` | `8192` | `budget` 模式：结果的可省字符（`chars − head − tail`）只在超过该值时计入裁剪预算——与 DSH 原生裁剪阈值对齐，插件的省量目标正好等于原生体积规则本会释放的空间 |
+| `volumeBudgetThresholdChars` | `8192` | ⚠️ **已废弃**（保留仅为兼容）：早期 `budget` 模式把预算错定在体积规则上，现已改为压力缺口比例，此键不再生效 |
 | `keepFloorThreshold` / `minCandidatesForBudget` | `0.2` / `4` | `budget` 模式小样本降级：判定候选不足 4 条时，只有 `P(保留) < 0.2` 的结果可裁（与第二层同款降级形态） |
-| `budgetMinChars` | `0` | `budget` 模式：裁剪节省低于该值的结果跳过 |
+| `budgetMinChars` | `0` | ⚠️ **已废弃**（保留仅为兼容）：同上，不再生效 |
 | `resultExcerptChars` | `240` | 第一层：写入判定 state 的每条结果摘录预算（见下文）；`0` 恢复盲判的 `ok, N chars` 行 |
 | `preserveRecent` | `4` | 最近 N 个 surface 节点两层都不碰 |
 | `headChars` / `tailChars` | `600` / `200` | 第一层裁剪保留的头/尾字符数 |
@@ -160,13 +160,13 @@ node wire_profile.mjs <DSH_HOME> <profile名>
 
 另注意 `tokenMeter` 是**宿主提供**的服务；如果你的宿主不暴露它，请把 `softLimit` 配成绝对 token 数（或用 `judgeOn: 'always'` / `compactOn: 'always'`），而不要依赖比例式的压力门。
 
-### 第一层：预算匹配式裁决
+### 第一层：压力分位式裁决
 
 第一层的裁决曾经就是一个裸的固定阈值：`保留 = P(保留) ≥ 0.5`。活宿主实测击穿了这一假设：**所有被判定候选的概率全部低于 0.5**（132k token 会话里 42/42，短会话 5/5；中位数约 0.13–0.17）。Jev 的概率挤在窄带里——这正是第二层早已靠相对分位逃出来的那个坑，只是没人把教训同步到第一层。固定阈值下，第一层在真实压力下的实际行为是"**判定过的全裁**"，包括会话还需要的结果。
 
 `budget` 模式（默认）把两个问题拆开：
 
-- **裁多少**由体积规则定：预算 = 超过 `volumeBudgetThresholdChars` 的结果的可省字符总和（与 DSH 原生阈值对齐——插件的省量目标正好等于原生体积规则本会释放的空间，不多不少）。
+- **裁多少**由**压力缺口比例**定：`ratio = (used − threshold) / window`，由判定 pass 每轮自动计算（压力缺口占窗口的比例），预算 = ratio × 候选池总字符增益。缺口为 0 时一条不裁；压力越接近上限，裁得越多。
 - **裁哪些**由 Jev 定：候选按 `P(保留)` 升序裁，省够预算即停。`P(保留) ≥ keepThreshold`（0.5）是保护上限，永不进池；预算用尽后剩余候选如实记为 `keptByBudget`，既不虚报"Jev 保留"也不静默裁掉。
 - 小样本（< `minCandidatesForBudget`）时**降级**为绝对下限（`keepFloorThreshold`，0.2），而不是用两三个样本硬排序——与第二层同款降级形态。
 
@@ -190,7 +190,7 @@ node wire_profile.mjs <DSH_HOME> <profile名>
 
 | 字段 | 内容 |
 |---|---|
-| `keep` | 第一层裁决模式与参数（mode / 上限 / 下限 / 预算口径） |
+| `keep` | 第一层裁决模式与参数（mode / 上限 / 下限 / 小样本降级阈值；压力缺口比例随 `lastPrune.budget` 每轮落盘） |
 | `gate` | 最近一次压力门评估：`used` / 解析出的窗口 / 阈值 / `skip` + 原因 / 候选数 |
 | `probSummary` | `P(保留)` 分布：p10–p90、均值、高于/低于上限的计数 |
 | `probSamples` | 最近 200 个原始概率（画直方图用） |

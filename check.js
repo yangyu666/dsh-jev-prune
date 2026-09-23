@@ -567,10 +567,10 @@ const run = ({ events, cache, cfg, threshold }) => {
   assert.equal(out.pruned[0].originalSeq, 22)
 }
 
-// ================================================================ P0-1：预算匹配的裁剪选择
+// ================================================================ P0-1：压力自适应分位的裁剪选择
 // 为什么需要这一层：Jev 概率是**窄带**的（真实会话实测 42/42 条低于 0.5、P50=0.13），
 // 固定 0.5 阈值会把每一轮判定都读成"可裁"；而纯相对分位又会"每轮必裁固定比例"。
-// 所以拆成正交的两件事：**省多少**由体积规则定（预算）、**裁哪些**由概率排序定。
+// 所以拆成正交的两件事：**裁多少**由压力缺口比例定（ratio × 池子总增益）、**裁哪些**由概率排序定。
 {
   const node = (seq, chars, prob, extra = {}) => ({
     seq, index: seq, tool: 'read', chars,
@@ -579,48 +579,52 @@ const run = ({ events, cache, cfg, threshold }) => {
     ...extra,
   })
 
-  // ① 预算 = 0（没有结果超过体积阈值）→ **一条都不裁**
-  //    这是"不做无谓动作"的核心保证：体积规则本来就不会动它们，我们也别动。
+  // ① 压力缺口为 0（ratio=0）→ **一条都不裁**
   const small = [node(1, 800, 0.05), node(2, 900, 0.06), node(3, 1000, 0.07), node(4, 1100, 0.08)]
-  const zeroPlan = planTrims(small, { keepMode: 'budget' })
+  const zeroPlan = planTrims(small, { keepMode: 'budget', pressureRatio: 0 })
   assert.equal(zeroPlan.mode, 'budget')
-  assert.equal(zeroPlan.budget, 0, '没有结果超过体积阈值时预算应为 0')
-  assert.equal(zeroPlan.selected.size, 0, '预算为 0 时一条都不裁')
-  assert.match(zeroPlan.note, /预算 0 字符/)
+  assert.equal(zeroPlan.budget, 0, '无压力缺口时预算应为 0')
+  assert.equal(zeroPlan.selected.length, 0, '预算为 0 时一条都不裁')
 
-  // ② 有一条超阈值 → 预算 = 它的可省量；按概率升序裁，裁够就停
+  // ② ratio=0.5 → 预算 = 池子总增益的一半；按概率升序裁，裁够就停
   const mixed = [
-    node(10, 12000, 0.09), // 超阈值：贡献预算
+    node(10, 12000, 0.09),
     node(11, 900, 0.03),   // 概率最低
     node(12, 900, 0.04),
     node(13, 900, 0.20),
   ]
-  const plan = planTrims(mixed, { keepMode: 'budget' })
+  const plan = planTrims(mixed, { keepMode: 'budget', pressureRatio: 0.5 })
   assert.equal(plan.mode, 'budget')
-  assert.equal(plan.budget, 12000 - 50 - 30 - 6, '预算应为超阈值结果的可省字符数')
-  // 顺序即设计：先裁概率最低的小结果（11、12 各 814 字符），省不够预算时必须动到那条大的（10）
-  // ——"预算从哪来"与"先裁谁"是两件事，前者是体积规则的既成事实，后者是 Jev 排序。
-  assert.deepEqual([...plan.selected], [11, 12, 10], '按概率升序裁，裁到省够预算为止')
+  const totalGain = mixed.reduce((s, n) => s + n.gain, 0)
+  assert.equal(plan.budget, totalGain * 0.5, '预算应为池子总增益 × 压力比例')
+  // 顺序即设计：按概率升序裁，先裁低概率的小结果，省不够预算时必须动到那条大的（10）
+  assert.deepEqual(plan.selected, [11, 12, 10], '按概率升序裁，裁到省够预算为止')
   assert.ok(plan.spent >= plan.budget, '裁完必须至少省到预算量')
 
   // ③ 保护上限：prob ≥ keepThreshold 的一律不进候选池
   const protectedSet = [node(20, 12000, 0.9), node(21, 900, 0.05), node(22, 900, 0.06), node(23, 900, 0.07)]
-  const guarded = planTrims(protectedSet, { keepMode: 'budget' })
+  const guarded = planTrims(protectedSet, { keepMode: 'budget', pressureRatio: 0.5 })
   assert.equal(guarded.keptByCeiling, 1, 'prob 0.9 的应计入保护上限')
-  assert.equal(guarded.selected.has(20), false, '保护上限之上的结果绝不能被选中')
+  assert.equal(guarded.selected.includes(20), false, '保护上限之上的结果绝不能被选中')
 
   // ④ 小样本（< minCandidatesForBudget）→ 降级绝对下限，只裁 prob < floorThreshold 的
   const tiny = [node(30, 12000, 0.05), node(31, 12000, 0.30)]
-  const floored = planTrims(tiny, { keepMode: 'budget' })
+  const floored = planTrims(tiny, { keepMode: 'budget', pressureRatio: 0.5 })
   assert.equal(floored.mode, 'floor', '候选太少应降级为绝对下限')
-  assert.deepEqual([...floored.selected], [30], '降级模式只裁 prob < 0.2 的')
+  assert.deepEqual(floored.selected, [30], '降级模式只裁 prob < 0.2 的')
 
   // ⑤ keepMode 不是 budget 时返回 null（调用方退回逐节点 absolute 裁决，旧行为不变）
   assert.equal(planTrims(mixed, { keepMode: 'absolute' }), null)
   assert.equal(planTrims(mixed, undefined), null, '缺省时不得改变旧行为')
 
-  // ⑥ 整链：budget 模式下只裁"预算内"的那条，其余如实记为"预算用尽"
-  //    （候选需 ≥ minCandidatesForBudget=4，否则会先走小样本降级——见 ④）
+  // ⑤b 修 null 排序 bug：prob=null 的节点（result 轴批次失败）不得进 selected，更不该被当成 0 优先裁
+  {
+    const withNull = [node(60, 12000, null), node(61, 900, 0.05), node(62, 900, 0.06), node(63, 900, 0.07)]
+    const p = planTrims(withNull, { keepMode: 'budget', pressureRatio: 0.5 })
+    assert.equal(p.selected.includes(60), false, 'prob=null 的节点不得进 selected（失败方向：未知不裁）')
+  }
+
+  // ⑥ 整链：budget 模式下按 ratio 只裁"预算内"的那条，其余如实记为"预算用尽"
   {
     const events = [
       resultEvent(40, 'c1', 'x'.repeat(12000)),
@@ -634,7 +638,7 @@ const run = ({ events, cache, cfg, threshold }) => {
         [40, { keep: false, prob: 0.05 }], [41, { keep: false, prob: 0.06 }],
         [42, { keep: false, prob: 0.07 }], [43, { keep: false, prob: 0.08 }],
       ]),
-      cfg: { keepMode: 'budget' },
+      cfg: { keepMode: 'budget', pressureRatio: 0.25 },
     })
     assert.equal(out.pruned.length, 1, '只裁预算内的那一条')
     assert.equal(out.pruned[0].originalSeq, 40)
@@ -645,7 +649,7 @@ const run = ({ events, cache, cfg, threshold }) => {
     assert.equal(out.decisions[1].reason, 'budget-exhausted')
   }
 
-  // ⑦ 对照：`absolute` 模式（旧行为）下四条都会被裁 —— 证明省下来的是"预算"在起作用
+  // ⑦ 对照：`absolute` 模式（旧行为）下四条都会被裁 —— 证明省下来的是"分位"在起作用
   {
     const events = [
       resultEvent(50, 'c1', 'x'.repeat(12000)),

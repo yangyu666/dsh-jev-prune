@@ -103,11 +103,11 @@ node wire_profile.mjs <DSH_HOME> <profile-name>
 |---|---|---|
 | `enabled` | `true` | Master switch |
 | `model` | `jev-latest` | Judge model |
-| `keepMode` | `budget` | Layer 1 decision rule. `budget`: *how much* to trim is set by the volume rule, *which* results by Jev's ranking (see below). `absolute`: the legacy fixed-threshold behaviour |
+| `keepMode` | `budget` | Layer 1 decision rule. `budget`: *how much* to trim is set by the pressure-gap ratio, *which* results by Jev's ranking (see below). `absolute`: the legacy fixed-threshold behaviour |
 | `keepThreshold` | `0.5` | Layer 1: in `absolute` mode, `P(keep)` ≥ this means no trimming; in `budget` mode it is a **protection ceiling** only (results at or above it never enter the candidate pool) |
-| `volumeBudgetThresholdChars` | `8192` | `budget` mode: a result's savings potential (`chars − head − tail`) counts toward the trim budget only above this size — mirroring the DSH-native pruning threshold, so the plugin's savings target equals what the native volume rule would have freed |
+| `volumeBudgetThresholdChars` | `8192` | ⚠️ **Deprecated** (kept only for compatibility): early `budget` mode anchored the budget on the volume rule; it now uses the pressure-gap ratio instead, so this key no longer takes effect |
 | `keepFloorThreshold` / `minCandidatesForBudget` | `0.2` / `4` | `budget` mode small-population fallback: with fewer than 4 judged candidates, only results with `P(keep) < 0.2` are eligible (same degraded-mode shape as layer 2) |
-| `budgetMinChars` | `0` | `budget` mode: skip candidates whose trim would save less than this |
+| `budgetMinChars` | `0` | ⚠️ **Deprecated** (kept only for compatibility): same as above, no longer takes effect |
 | `resultExcerptChars` | `240` | Layer 1: per-result excerpt budget copied into the judge's state (see below); `0` restores the blind `ok, N chars` line |
 | `preserveRecent` | `4` | The most recent N surface nodes are left alone by both layers |
 | `headChars` / `tailChars` | `600` / `200` | Layer 1: how many head/tail characters a trim keeps |
@@ -162,13 +162,13 @@ The old behaviour was asymmetric — layer 2 skipped when it could not resolve a
 
 Note that `tokenMeter` is a **host-provided** service; if your host does not expose it, configure `softLimit` as an absolute token count (or set `judgeOn: 'always'` / `compactOn: 'always'`) rather than relying on ratio-based pressure gating.
 
-### Layer 1: budget-based trimming
+### Layer 1: pressure-quantile trimming
 
 The layer-1 decision used to be a bare fixed threshold: `keep = P(keep) ≥ 0.5`. Live-host measurement broke that assumption: **every judged candidate scored below 0.5** (42/42 in a 132k-token session, 5/5 in a short one; median ≈ 0.13–0.17). Jev's probabilities live in a narrow band — the exact trap layer 2 had already escaped by switching to relative quantiles, except nobody applied the lesson to layer 1. Under the fixed threshold, the first layer's real-world behaviour was *"trim everything that was judged"*, including results the session still needed.
 
 `budget` mode (the default) decouples the two questions:
 
-- **How much to trim** comes from the volume rule: the budget is the total savings potential of results that exceed `volumeBudgetThresholdChars` (mirroring the DSH-native threshold, so the plugin targets exactly what the native volume rule would have freed, no more).
+- **How much to trim** comes from the **pressure-gap ratio**: `ratio = (used − threshold) / window`, computed automatically each judge pass (the fraction of the context window that is over the soft limit); the budget is `ratio × the pool's total character savings`. Zero gap ⇒ trim nothing; the closer to the ceiling, the more is trimmed.
 - **Which results** comes from Jev: candidates are sorted by `P(keep)` ascending and trimmed until the budget is met. Results with `P(keep) ≥ keepThreshold` (0.5) are a protection ceiling and never enter the pool; candidates whose savings are already counted stop there — the rest are recorded as `预算已用尽` (`keptByBudget`) rather than silently kept or trimmed.
 - With a small population (< `minCandidatesForBudget`), the mode **degrades** to an absolute floor (`keepFloorThreshold`, 0.2) instead of inventing a ranking from 2–3 samples — the same degraded-mode shape layer 2 uses.
 

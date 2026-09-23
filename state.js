@@ -245,16 +245,35 @@ export function resultExcerpt(event, budget = 240) {
     return { line, idx, score }
   })
 
-  const picked = scored
+  // 先按评分降序选行，再**按评分顺序**分配预算（高分先占，低分行不够就被截/丢）。
+  // 修 #2：旧实现按 idx 排序后 join 再整体截断，从尾部切——于是位置靠后的高分行（报错行往往在中段）
+  // 被截掉，而与 tool_call 重复的低分元数据行（<path>）却完整保留，正好反了。
+  // 修 #3：旧实现 slice(0,budget)+'…' 是 budget+1 字符，这里改用 avail-1 留省略号，严格不超。
+  const byScore = scored
     .slice()
     .sort((a, b) => (b.score - a.score) || (a.idx - b.idx))
     .slice(0, 4)
-    .sort((a, b) => a.idx - b.idx)
-    .map((entry) => clip(entry.line))
+  const allocated = new Map()
+  let budgetLeft = budget
+  for (const entry of byScore) {
+    if (budgetLeft <= 0) break
+    const sepLen = allocated.size > 0 ? 3 : 0 // ' | ' 长度 3
+    const avail = budgetLeft - sepLen
+    if (avail < 2) break // 放不下「至少 1 字符 + 省略号」
+    const clipped = clip(entry.line)
+    const points = Array.from(clipped)
+    if (points.length <= avail) {
+      allocated.set(entry.idx, clipped)
+      budgetLeft = avail - points.length
+    } else {
+      allocated.set(entry.idx, points.slice(0, avail - 1).join('') + '…')
+      budgetLeft = 0
+    }
+  }
+  // 按原位置（idx）排序输出，保持可读性
+  const picked = [...allocated.entries()].sort((a, b) => a[0] - b[0]).map(([, t]) => t)
   if (picked.length === 0) return ''
-  let excerpt = picked.join(' | ')
-  if (Array.from(excerpt).length > budget) excerpt = Array.from(excerpt).slice(0, budget).join('') + '…'
-  return excerpt
+  return picked.join(' | ')
 }
 
 /** 最近若干条「纯文本用户消息」作为任务目标（对齐上游 goalFromMessages）。 */
@@ -419,13 +438,22 @@ export function buildJevState({ surface, eventAt, goal, context = STATE_CONTEXT,
   const budget = maxStateTokens - estimateTokens(header)
   const all = entries.flatMap((lines) => lines)
   let omitted = 0
-  while (all.length > minLines && estimateTokens(all.join('\n')) > budget) {
-    all.shift() // 从最老开始丢
+  // O(n) 预算压制（修 #4）：旧实现每次 shift 都重新 join + tokenize 整个剩余串，O(n²)；
+  // 摘录让每行从 ~40 字符涨到 ~280，N=800 时实测 992ms。这里逐行算一次 token、
+  // 增量丢头部（丢掉的从总量里减），把整轮压到 O(n)。逐行 ceil 会略高估总量，
+  // 属于安全方向（宁可多丢几行也要塞进预算）。
+  const tokens = all.map((line) => estimateTokens(line))
+  let total = tokens.reduce((s, t) => s + t, 0)
+  let start = 0
+  while (all.length - start > minLines && total > budget) {
+    total -= tokens[start]
+    start += 1
     omitted += 1
   }
-  const state = header + all.join('\n')
+  const kept = all.slice(start)
+  const state = header + kept.join('\n')
   const stateTokens = estimateTokens(state)
-  return { state, lines: all.length, omitted, fitted: stateTokens <= maxStateTokens, stateTokens }
+  return { state, lines: kept.length, omitted, fitted: stateTokens <= maxStateTokens, stateTokens }
 }
 
 /**
