@@ -13,7 +13,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { JevClient, JevError, estimateTokens } from './jev.js'
-import { countChars, decideAction, parseLimit, planTrims, pruneSessionWithJev, sliceWithBudget } from './prune.js'
+import { JEV_PRUNE_MARKER, countChars, decideAction, parseLimit, planTrims, pruneSessionWithJev, sliceWithBudget } from './prune.js'
 import {
   DEFAULT_COMPACT_TOOLS,
   DEFAULT_EVIDENCE_PATTERNS,
@@ -762,7 +762,13 @@ const run = ({ events, cache, cfg, threshold }) => {
     )
   }
   // quantile=0 的语义是字面意义"一条不取"（此前 Math.max(1,…) 反而取 1 条）
-  assert.equal(computeEligibleSeqs(verdicts, { quantile: 0, minCandidates: 4 }).size, 0)
+  let disabledNote = ''
+  assert.equal(computeEligibleSeqs(verdicts, {
+    quantile: 0,
+    minCandidates: 4,
+    onNote: (note) => { disabledNote = note },
+  }).size, 0)
+  assert.match(disabledNote, /compactQuantile=0.*关闭/, '显式关闭不能误报成“分位交集为空”')
   assert.equal(computeEligibleSeqs(verdicts.slice(0, 2), { quantile: 0, minCandidates: 4 }).size, 0,
     'quantile=0 必须在小样本降级之前生效，2 条低分候选也不得被重新选中')
 
@@ -883,6 +889,43 @@ const run = ({ events, cache, cfg, threshold }) => {
   const tiny = run({ compactMinChars: 100000 })
   assert.equal(tiny.ranges.length, 0)
   assert.equal(tiny.stats.skippedShort, 1)
+}
+
+// ---------------------------------------------------------------- replacement 来源链上的证据也必须守住
+// 第一层可能把位于正文中间的 error 截掉；第二层若只扫描 surface 上的 replacement，
+// 会误以为没有证据并把整个调用/结果对移出。
+{
+  const original = toolResult(2, 'c1', `${'a'.repeat(1200)}fatal error: hidden in middle${'b'.repeat(1200)}`)
+  const replacement = {
+    ...toolResult(3, 'c1', `${'a'.repeat(100)}${JEV_PRUNE_MARKER}${'b'.repeat(100)}`),
+    sourceEventSeqs: [2],
+  }
+  const evs = [
+    assistantWithCall(1, 'c1', 'Read', { file_path: 'hidden-error.txt' }),
+    original,
+    replacement,
+  ]
+  const at = (seq) => evs.find((event) => event.seq === seq)
+  const cache = new Map([[2, { keep: false, prob: 0.05, effectProb: 0.05, chars: 2500, tool: 'Read' }]])
+  const { ranges, stats } = selectReceiptRanges({
+    surface: [1, 3],
+    eventAt: at,
+    cache,
+    dropVerdict: () => true,
+    cfg: {
+      preserveRecent: 0,
+      compactTools: DEFAULT_COMPACT_TOOLS,
+      neverCompactTools: DEFAULT_NEVER_COMPACT_TOOLS,
+      evidenceGuard: true,
+      evidencePatterns: DEFAULT_EVIDENCE_PATTERNS,
+      maxStepTextChars: 240,
+      maxStepReasoningChars: 240,
+      compactMinChars: 10,
+    },
+  })
+  assert.equal(ranges.length, 0, '原始结果中被第一层截掉的 error 仍应阻止第二层整对移出')
+  assert.equal(stats.skippedGuard, 1, '来源链证据应计入 guard 排除，而不是 verdict/short')
+  assert.deepEqual(stats.guardHits[0]?.matches, ['error'])
 }
 
 // ---------------------------------------------------------------- blockedToolNames 诊断口径

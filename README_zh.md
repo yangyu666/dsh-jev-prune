@@ -41,7 +41,7 @@ DSH 自带的上下文回收是**纯体积**的：工具结果超过阈值就掐
 
 - **两轴判定取交集**：`result`（内容是否还需要）与 `effect`（调用是否改变了会话外状态）各自落在本次会话的尾部 `compactQuantile` 分位内
 - 工具不在 `neverCompactTools`（改写类调用按硬规则永不移出）
-- **证据守卫**：结果命中 `error` / `assert` / `fail` / `todo` 等词不移出（仍可被第一层截断）
+- **证据守卫**：结果命中 `error` / `assert` / `fail` / `todo` 等词不移出；若第一层已经截断结果，守卫会沿 `sourceEventSeqs` 继续扫描原始事件
 - assistant 消息的**可见文本**超过 `maxStepTextChars`、或**思考草稿**（`reasoning`）超过 `maxStepReasoningChars` 的步骤不移出。两者**分开统计**：text 长说明这一步在交代结论（该守），reasoning 长只是模型草稿写得多（不代表有承重信息）。合并成一个预算时，光靠 reasoning 长度就能把第二层静默关掉
 - 第二层不移出最近 `compactPreserveRecent` 个节点（第一层仍使用 `preserveRecent`）
 - 区间两端满足 DSH 的工具配对平衡；整段至少能省 `compactMinChars` 字符；回执 token 低于原内容的 `receiptMaxRatio`

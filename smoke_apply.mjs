@@ -1068,9 +1068,9 @@ async function layer2Run(effectOfS2) {
 // 这里保持第一层最近 4 个 surface 节点（恰好挡住最后一个 tool/result），再让第二层
 // 保留 0 个；判定范围应扩到两层里更小的窗口，因此 3 条结果都要被判定。
 {
-  const judgedWith = async (compactReceipts) => {
+  const judgedWith = async (compactReceipts, plan, overrides = {}) => {
     const pruner = makePruner()
-    const session = makeSession()
+    const session = makeSession(plan)
     const compaction = makeCompaction(session)
     const ctx = makeCtx({ pruner, session, compaction })
     const resultSeqs = session.surface.nodes.filter((q) => session.eventAt(q)?.type === 'tool/result')
@@ -1083,6 +1083,7 @@ async function layer2Run(effectOfS2) {
       compactReceipts,
       compactOn: 'always',
       compactPreserveRecent: 0,
+      ...overrides,
     }, { judge })
     const agentRef = { agent: { session, options: {} } }
     await ctx.waterfall('agent/pre-step', agentRef, () => {})
@@ -1097,6 +1098,20 @@ async function layer2Run(effectOfS2) {
     firstLayerOnly === 1, `实际 ${firstLayerOnly}`)
   check('compactPreserveRecent=0 会把判定范围扩到全部 3 条结果',
     bothLayers === 3, `实际 ${bothLayers}（若仍为 2，说明配置只展示了但没有接线）`)
+
+  const mixedTools = await judgedWith(true, [
+    { tool: 'Read', args: { file_path: 'a.ts' }, chars: 3000 },
+    { tool: 'pwsh', args: { command: 'Get-Content b.ts' }, chars: 3000 },
+    { tool: 'Read', args: { file_path: 'c.ts' }, chars: 3000 },
+  ])
+  check('第二层扩展判定窗口时不为白名单外工具付费',
+    mixedTools === 2,
+    `实际判定 ${mixedTools} 条（期望仅两条 Read；若为 3，pwsh 仍在空转）`)
+
+  const layerSpecificBlacklist = await judgedWith(true, undefined, { neverPruneTools: ['Read'] })
+  check('第一层 neverPruneTools 不得误关第二层允许的 Read 判定',
+    layerSpecificBlacklist === 3,
+    `实际判定 ${layerSpecificBlacklist} 条（期望 3；为 0 说明两层黑名单仍耦合）`)
 }
 
 // ---------------------------------------------------------------- 汇总

@@ -43,7 +43,7 @@ Moving a whole pair out of the surface is destructive, so the default is deliber
 
 - **Intersection of two axes**: `result` (is the content still needed) and `effect` (did the call change state outside the session) must *each* fall inside this session's trailing `compactQuantile`
 - The tool is not in `neverCompactTools` (write-type calls are excluded by a hard rule, never by a probability)
-- **Evidence guard**: results matching `error` / `assert` / `fail` / `todo` and friends are never moved out (layer 1 may still trim them)
+- **Evidence guard**: results matching `error` / `assert` / `fail` / `todo` and friends are never moved out. If layer 1 has already trimmed a result, the guard follows `sourceEventSeqs` and scans the original event too
 - Steps whose assistant **text** exceeds `maxStepTextChars`, or whose **`reasoning`** exceeds `maxStepReasoningChars`, are never moved out. The two are measured separately on purpose: long `text` means the step is delivering a conclusion worth keeping, while long `reasoning` is just scratch work — merging them into one budget let reasoning length alone silently shut layer 2 off
 - Anything within the most recent `compactPreserveRecent` nodes is skipped by layer 2 (layer 1 uses `preserveRecent`)
 - Both ends of the range must satisfy DSH's tool-pairing balance; the span must save at least `compactMinChars` characters; and the receipt must stay below `receiptMaxRatio` of the original content's tokens

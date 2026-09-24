@@ -19,7 +19,7 @@
  * 为什么不能随便删（实测教训，见 README）：
  *   · `Edit`/`Write` 这类改写型调用是承重信息，判错一次就丢失关键改动 → 硬规则排除
  *   · 含 error/assert/fail 等**证据词**的结果可能正是根因所在 → 证据守卫生效时不删
- *   · 落在最近 preserveRecent 个节点内的（含正在进行的调用）→ 一律不碰
+ *   · 落在最近 compactPreserveRecent 个节点内的（含正在进行的调用）→ 一律不碰
  *   · 有**副作用**的调用（写文件、提交、安装、删除）→ 结果可能很短，但"发生过"是承重的
  *
  * 工具配对平衡：镜像 DSH 的 `@deepseek-ai/dsh-compaction/tool-pairing`。
@@ -86,6 +86,29 @@ export function cachedVerdictForEvent(cache, event) {
     if (inherited != null) return inherited
   }
   return null
+}
+
+/**
+ * 证据守卫必须扫描当前结果及其完整来源链。
+ *
+ * 第一层会把超长 tool/result 替换成“头 + 标记 + 尾”；若 error/assert/fail 恰好位于
+ * 被截掉的中间，只扫描 replacement 会让第二层的确定性守卫失明。DSH 保留所有旧事件，
+ * 且 replacement 通过 sourceEventSeqs 指回它们，所以这里沿来源链取回原文。
+ */
+function resultEvidenceText(eventAt, startSeq) {
+  const pending = [startSeq]
+  const seen = new Set()
+  const texts = []
+  while (pending.length > 0) {
+    const seq = pending.pop()
+    if (seen.has(seq)) continue
+    seen.add(seq)
+    const event = eventAt(seq)
+    if (event == null) continue
+    if (event.type === 'tool/result') texts.push(resultText(event))
+    for (const sourceSeq of event.sourceEventSeqs ?? []) pending.push(sourceSeq)
+  }
+  return texts.join('\n')
 }
 
 /**
@@ -347,7 +370,10 @@ export function computeEligibleSeqs(verdicts, {
     throw new Error(`compactQuantile 非法：${quantile}（必须是 0~1 的有限数值；配置留空/解析成 null 都会走到这里）`)
   }
   // 0 是显式关闭值；必须先于小样本降级，否则低分候选会绕过开关。
-  if (quantile === 0) return new Set()
+  if (quantile === 0) {
+    onNote?.('compactQuantile=0 → 相对分位选择已显式关闭')
+    return new Set()
+  }
   const usable = (verdicts ?? []).filter(
     // 必须用 Number.isFinite：typeof NaN === 'number'，用 typeof 会让 NaN 混进总体，
     // 而排序比较 (a-b) 返回 NaN 时被 V8 当作"相等"不换位 → NaN 项按**数组位置**
@@ -514,7 +540,7 @@ export function selectReceiptRanges({ surface, eventAt, cache, dropVerdict, cfg 
     let hits = []
     if (reason == null && cfg.evidenceGuard) {
       for (const seq of resultSeqs) {
-        const scan = scanEvidence(resultText(eventAt(seq)), cfg.evidencePatterns)
+        const scan = scanEvidence(resultEvidenceText(eventAt, seq), cfg.evidencePatterns)
         if (scan.hit) {
           hits = scan.matches
           reason = 'guard'

@@ -823,21 +823,34 @@ export function apply(ctx, config, deps = {}) {
     const surface = [...session.surface.nodes]
     const eventAt = (seq) => session.eventAt(seq)
     const nameByCallId = buildToolNameIndex(sessionEvents(session))
-    // 判定缓存供两层共用。若仍按第一层较宽的 preserveRecent 选候选，第二层即使
-    // 配了更小的 compactPreserveRecent，也永远拿不到中间那批节点的两轴判定。
-    // 这里只扩大“判定”范围；第一层真正裁剪时仍由 pruneSession 的 preserveRecent 保护。
-    const judgmentPreserveRecent = cfg.compactReceipts && cfg.compactOn !== 'off'
-      ? Math.min(cfg.preserveRecent, cfg.compactPreserveRecent)
-      : cfg.preserveRecent
-    const candidates = selectCandidates({
+    // 判定缓存供两层共用，但两层的最近区与工具规则不同：
+    //   · 第一层按 preserveRecent + neverPruneTools；
+    //   · 第二层按 compactPreserveRecent + 只读白名单/neverCompactTools。
+    // 不能简单取两个最近区的 min 后仍套第一层工具规则，否则 pwsh 等节点会落在
+    // “第一层因最近区不动、第二层因工具门不动”的死区里，却仍然花钱做 Jev 判定。
+    const candidateInput = {
       surface,
       eventAt,
       events: sessionEvents(session),
-      preserveRecent: judgmentPreserveRecent,
-      neverPruneTools: cfg.neverPruneTools,
       marker: JEV_PRUNE_MARKER,
       nameByCallId,
+    }
+    const layer1Candidates = selectCandidates({
+      ...candidateInput,
+      preserveRecent: cfg.preserveRecent,
+      neverPruneTools: cfg.neverPruneTools,
     })
+    const candidatesBySeq = new Map(layer1Candidates.map((candidate) => [candidate.seq, candidate]))
+    if (cfg.compactReceipts && cfg.compactOn !== 'off') {
+      const layer2Candidates = selectCandidates({
+        ...candidateInput,
+        preserveRecent: cfg.compactPreserveRecent,
+        // 第一层黑名单不属于第二层；第二层随后按自己的白名单 + 黑名单过滤。
+        neverPruneTools: [],
+      }).filter((candidate) => isCompactableTool(candidate.tool, cfg))
+      for (const candidate of layer2Candidates) candidatesBySeq.set(candidate.seq, candidate)
+    }
+    const candidates = [...candidatesBySeq.values()].sort((a, b) => a.index - b.index)
     const cache = decisionsOf(session)
     const fresh = candidates.filter((c) => !cache.has(c.seq))
     // 压力门控：不到软阈值就不花 Jev 的钱
