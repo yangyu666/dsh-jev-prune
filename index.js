@@ -849,7 +849,12 @@ export function apply(ctx, config, deps = {}) {
     })
     const candidatesBySeq = new Map(layer1Candidates.map((candidate) => [candidate.seq, candidate]))
     const layer2CandidateSeqs = new Set()
-    if (cfg.compactReceipts && cfg.compactOn !== 'off') {
+    // 选择器被显式设为 0 时，第二层数学上不可能选中任何节点。不要再扩候选或
+    // 询问 effect 轴；第一层仍可按自己的范围正常取得 result 判定。
+    const layer2CanSelect = cfg.compactReceipts
+      && cfg.compactOn !== 'off'
+      && (cfg.compactMode === 'relative' ? cfg.compactQuantile > 0 : cfg.compactThreshold > 0)
+    if (layer2CanSelect) {
       const layer2Candidates = selectCandidates({
         ...candidateInput,
         preserveRecent: cfg.compactPreserveRecent,

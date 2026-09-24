@@ -1110,6 +1110,19 @@ async function layer2Run(effectOfS2) {
   check('compactPreserveRecent=0 会把判定范围扩到全部 3 条结果',
     bothLayers === 3, `实际 ${bothLayers}（若仍为 2，说明配置只展示了但没有接线）`)
 
+  const relativeDisabled = await judgedWith(true, undefined, { compactQuantile: 0 })
+  check('compactQuantile=0 显式关闭选择时不为第二层扩候选付费',
+    relativeDisabled === firstLayerOnly,
+    `实际判定 ${relativeDisabled} 条（第一层自身只需 ${firstLayerOnly} 条）`)
+
+  const absoluteDisabled = await judgedWith(true, undefined, {
+    compactMode: 'absolute',
+    compactThreshold: 0,
+  })
+  check('absolute 阈值=0 时不为不可能命中的第二层扩候选付费',
+    absoluteDisabled === firstLayerOnly,
+    `实际判定 ${absoluteDisabled} 条（第一层自身只需 ${firstLayerOnly} 条）`)
+
   const mixedTools = await judgedWith(true, [
     { tool: 'Read', args: { file_path: 'a.ts' }, chars: 3000 },
     { tool: 'pwsh', args: { command: 'Get-Content b.ts' }, chars: 3000 },
