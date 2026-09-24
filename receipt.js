@@ -19,7 +19,7 @@
  * 为什么不能随便删（实测教训，见 README）：
  *   · `Edit`/`Write` 这类改写型调用是承重信息，判错一次就丢失关键改动 → 硬规则排除
  *   · 含 error/assert/fail 等**证据词**的结果可能正是根因所在 → 证据守卫生效时不删
- *   · 落在最近 preserveRecent 个节点内的（含正在进行的调用）→ 一律不碰
+ *   · 落在最近 compactPreserveRecent 个节点内的（含正在进行的调用）→ 一律不碰
  *   · 有**副作用**的调用（写文件、提交、安装、删除）→ 结果可能很短，但"发生过"是承重的
  *
  * 工具配对平衡：镜像 DSH 的 `@deepseek-ai/dsh-compaction/tool-pairing`。
@@ -27,11 +27,11 @@
  * 是为了**在花钱之前**就把非法范围筛掉，而不是等 API 报错。
  */
 
-import { countChars, isToolIn, normalizeToolName } from './prune.js'
+import { cachedVerdictForEvent, countChars, isToolIn, normalizeToolName } from './prune.js'
 
 // 归一化工具在 prune.js（依赖链最底层）——两层的安全黑名单共用同一套比较。
 // 这里转出以保持既有 import 路径（check.js / 调用方）不变。
-export { isToolIn, normalizeToolName }
+export { cachedVerdictForEvent, isToolIn, normalizeToolName }
 
 /** 回执文本的识别前缀（用于判断某个 checkpoint 是不是我们写的）。 */
 export const RECEIPT_MARKER = '[已压缩 · 确定性回执]'
@@ -74,7 +74,30 @@ export const DEFAULT_MIN_CANDIDATES_FOR_RELATIVE = 4
 export const DEFAULT_FLOOR_THRESHOLD = 0.2
 
 /** 降级模式仍要求的最低样本量：低于它连"分布"都谈不上，宁可不做。 */
-export const DEFAULT_MIN_CANDIDATES_FOR_FLOOR = 3
+export const DEFAULT_MIN_CANDIDATES_FOR_FLOOR = 2
+
+/**
+ * 证据守卫必须扫描当前结果及其完整来源链。
+ *
+ * 第一层会把超长 tool/result 替换成“头 + 标记 + 尾”；若 error/assert/fail 恰好位于
+ * 被截掉的中间，只扫描 replacement 会让第二层的确定性守卫失明。DSH 保留所有旧事件，
+ * 且 replacement 通过 sourceEventSeqs 指回它们，所以这里沿来源链取回原文。
+ */
+function resultEvidenceText(eventAt, startSeq) {
+  const pending = [startSeq]
+  const seen = new Set()
+  const texts = []
+  while (pending.length > 0) {
+    const seq = pending.pop()
+    if (seen.has(seq)) continue
+    seen.add(seq)
+    const event = eventAt(seq)
+    if (event == null) continue
+    if (event.type === 'tool/result') texts.push(resultText(event))
+    for (const sourceSeq of event.sourceEventSeqs ?? []) pending.push(sourceSeq)
+  }
+  return texts.join('\n')
+}
 
 /**
  * 永不**整对移出**的工具（第二层黑名单）：改写型调用是承重信息
@@ -322,12 +345,22 @@ export function scanEvidence(text, patterns) {
  */
 export function computeEligibleSeqs(verdicts, {
   quantile, minCandidates,
-  minCandidatesForAbsolute = 3,
-  floorThreshold = 0.2,
+  // ⚠️ 必须引用导出常量，不能写字面量。此前这里是硬编码的 `3` / `0.2`，
+  // 于是改 DEFAULT_MIN_CANDIDATES_FOR_FLOOR 时**这个函数的默认值不会跟着变** ——
+  // 插件实体走 resolveConfig（读常量，行为会变），而直接调本函数的地方（含 check.js）
+  // 吃的是旧字面量，两边悄悄分叉。实测：常量改成 2 后 check.js 仍全绿，
+  // 因为它绕开了配置路径，测的是另一个数。
+  minCandidatesForAbsolute = DEFAULT_MIN_CANDIDATES_FOR_FLOOR,
+  floorThreshold = DEFAULT_FLOOR_THRESHOLD,
   onNote,
 } = {}) {
   if (!Number.isFinite(quantile) || quantile < 0 || quantile > 1) {
     throw new Error(`compactQuantile 非法：${quantile}（必须是 0~1 的有限数值；配置留空/解析成 null 都会走到这里）`)
+  }
+  // 0 是显式关闭值；必须先于小样本降级，否则低分候选会绕过开关。
+  if (quantile === 0) {
+    onNote?.('compactQuantile=0 → 相对分位选择已显式关闭')
+    return new Set()
   }
   const usable = (verdicts ?? []).filter(
     // 必须用 Number.isFinite：typeof NaN === 'number'，用 typeof 会让 NaN 混进总体，
@@ -363,9 +396,7 @@ export function computeEligibleSeqs(verdicts, {
     return new Set(floor.map((v) => v.seq))
   }
 
-  // quantile=0 的语义是字面意义"一条不取"（issue #6：此前 Math.max(1,…) 会反而取 1 条）
-  const take = quantile === 0 ? 0 : Math.max(1, Math.floor(usable.length * quantile))
-  if (take === 0) return new Set()
+  const take = Math.max(1, Math.floor(usable.length * quantile))
   const tailOf = (key) => new Set(
     [...usable]
       .sort((a, b) => (a[key] - b[key]) || (a.seq - b.seq))
@@ -374,7 +405,12 @@ export function computeEligibleSeqs(verdicts, {
   )
   const byResult = tailOf('prob')
   const byEffect = tailOf('effectProb')
-  return new Set([...byResult].filter((seq) => byEffect.has(seq)))
+  const intersection = new Set([...byResult].filter((seq) => byEffect.has(seq)))
+  if (intersection.size > 0) return intersection
+
+  const floor = usable.filter((v) => v.prob < floorThreshold && v.effectProb < floorThreshold)
+  onNote?.(`两轴尾部交集为空 → 降级为绝对下限模式：要求两轴同时 < ${floorThreshold}，命中 ${floor.length}/${usable.length} 条`)
+  return new Set(floor.map((v) => v.seq))
 }
 
 // ---------------------------------------------------------------- 范围选择
@@ -482,7 +518,7 @@ export function selectReceiptRanges({ surface, eventAt, cache, dropVerdict, cfg 
     }
     if (reason == null) {
       for (const seq of resultSeqs) {
-        const verdict = cache?.get(seq)
+        const verdict = cachedVerdictForEvent(cache, eventAt(seq))
         if (verdict == null || !dropVerdict(seq, verdict)) {
           reason = 'verdict'
           break
@@ -492,7 +528,7 @@ export function selectReceiptRanges({ surface, eventAt, cache, dropVerdict, cfg 
     let hits = []
     if (reason == null && cfg.evidenceGuard) {
       for (const seq of resultSeqs) {
-        const scan = scanEvidence(resultText(eventAt(seq)), cfg.evidencePatterns)
+        const scan = scanEvidence(resultEvidenceText(eventAt, seq), cfg.evidencePatterns)
         if (scan.hit) {
           hits = scan.matches
           reason = 'guard'

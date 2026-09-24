@@ -43,14 +43,14 @@ Moving a whole pair out of the surface is destructive, so the default is deliber
 
 - **Intersection of two axes**: `result` (is the content still needed) and `effect` (did the call change state outside the session) must *each* fall inside this session's trailing `compactQuantile`
 - The tool is not in `neverCompactTools` (write-type calls are excluded by a hard rule, never by a probability)
-- **Evidence guard**: results matching `error` / `assert` / `fail` / `todo` and friends are never moved out (layer 1 may still trim them)
+- **Evidence guard**: results matching `error` / `assert` / `fail` / `todo` and friends are never moved out. If layer 1 has already trimmed a result, the guard follows `sourceEventSeqs` and scans the original event too
 - Steps whose assistant **text** exceeds `maxStepTextChars`, or whose **`reasoning`** exceeds `maxStepReasoningChars`, are never moved out. The two are measured separately on purpose: long `text` means the step is delivering a conclusion worth keeping, while long `reasoning` is just scratch work — merging them into one budget let reasoning length alone silently shut layer 2 off
-- Anything within the most recent `preserveRecent` nodes is skipped
+- Anything within the most recent `compactPreserveRecent` nodes is skipped by layer 2 (layer 1 uses `preserveRecent`)
 - Both ends of the range must satisfy DSH's tool-pairing balance; the span must save at least `compactMinChars` characters; and the receipt must stay below `receiptMaxRatio` of the original content's tokens
 
 Probabilities are consumed as **relative quantiles**, never as a fixed threshold: the output distribution of a small judge model is narrow, and only the relative ordering *within one session* carries stable information.
 
-**Degradation on small populations.** Read-only tools are often a minority in write/execute-heavy sessions (measured: 1 in 6), which can leave a quantile population of only two or three items — too few for ordering to mean anything. Rather than giving up, the mode degrades to an **absolute floor**: both axes must fall below `floorThreshold` (default `0.2`, materially stricter than `compactThreshold`, compensating for the missing relative information). If the population is below `minCandidatesForFloor` (default `3`), nothing is moved out — one or two samples are not a distribution. Degradation is always reported in the report and the heartbeat; it never happens silently.
+**Degradation on small populations.** Read-only tools are often a minority in write/execute-heavy sessions (measured: 1 in 6), which can leave a quantile population of only two or three items — too few for ordering to mean anything. Rather than giving up, the mode degrades to an **absolute floor**: both axes must fall below `floorThreshold` (default `0.2`, materially stricter than `compactThreshold`, compensating for the missing relative information). If the population is below `minCandidatesForFloor` (default `2`), nothing is moved out — a single sample is not a distribution. The default was lowered from `3` to `2` so that the two-candidate populations that batch-read sessions really produce are not skipped outright; one sample still never acts. Degradation is always reported in the report and the heartbeat; it never happens silently.
 
 ## Receipt ownership (fence)
 
@@ -110,15 +110,16 @@ node wire_profile.mjs <DSH_HOME> <profile-name>
 | `keepFloorThreshold` / `minCandidatesForBudget` | `0.2` / `4` | `budget` mode small-population fallback: with fewer than 4 judged candidates, only results with `P(keep) < 0.2` are eligible (same degraded-mode shape as layer 2) |
 | `budgetMinChars` | `0` | ⚠️ **Deprecated** (kept only for compatibility): same as above, no longer takes effect |
 | `resultExcerptChars` | `240` | Layer 1: per-result excerpt budget copied into the judge's state (see below); `0` restores the blind `ok, N chars` line |
-| `preserveRecent` | `4` | The most recent N surface nodes are left alone by both layers |
+| `preserveRecent` | `4` | Layer 1 leaves the most recent N surface nodes alone |
 | `headChars` / `tailChars` | `600` / `200` | Layer 1: how many head/tail characters a trim keeps |
 | `minCharsToPrune` | `400` | Layer 1: anything shorter is never trimmed |
 | `judgeOn` / `softLimit` | `pressure` / `55%` | Layer 1: when to judge, and the pressure line |
 | `compactReceipts` / `compactOn` | `true` / `pressure` | Layer 2: switch and pressure line (`compactSoftLimit`, default 70%) |
 | `compactMode` | `relative` | `relative` (recommended) or `absolute` (with `compactThreshold`) |
 | `compactQuantile` | `0.34` | The trailing fraction taken on each of the two axes; the intersection is used |
+| `compactPreserveRecent` | `1` | Layer 2 leaves the most recent N surface nodes alone; independent from layer 1's wider recent window |
 | `minCandidatesForRelative` | `4` | Minimum population for relative quantiles; below it the mode **degrades** to an absolute floor (see below) rather than giving up |
-| `floorThreshold` / `minCandidatesForFloor` | `0.2` / `3` | Absolute floor used in the degraded mode (materially stricter than `compactThreshold`) and its minimum sample size |
+| `floorThreshold` / `minCandidatesForFloor` | `0.2` / `2` | Absolute floor used in the degraded mode (materially stricter than `compactThreshold`) and its minimum sample size |
 | `neverCompactTools` | write-type tools | Layer 2 never moves these out; comparison is normalized (`Edit` ≡ `edit`) |
 | `neverPruneTools` | `Write` / `NotebookEdit` | Layer **1** never touches these. Narrower than the row above on purpose: layer 1 only truncates (reversible, the original stays in the session log), so the arguments of diff-style editors (`Edit`/`ApplyPatch`…) are fair game; layer 2 removes the pair outright, so it keeps guarding all of them |
 | `compactTools` | read-only set | Allow-list, **non-empty by default** (`DSH_READONLY_TOOLS`: `read`/`glob`/`grep`/`list`/`fetch`… plus PowerShell read-only cmdlets such as `getchilditem`/`selectstring`). Setting it to `[]` relaxes the gate to the deny-list only — shell calls then become movable too, which is an explicit opt-in into an unsafe mode |
@@ -162,6 +163,32 @@ The old behaviour was asymmetric — layer 2 skipped when it could not resolve a
 **The boundary** (corrected during the PR #28 review): failing closed justifies declining to spend, but it must not turn into silently switching the feature off. When the soft limit is an **absolute token count** (`softLimit: 3000`), the threshold comes straight from `limit.value` and **the meter is irrelevant** — so if the meter is missing or throws, the gate is simply left **un-armed for that pass** (reported as `压力门本次不设防` at `warn` level) and judging proceeds. An earlier revision of this PR required a successful measurement unconditionally, which turned "stop wasting money" into "the first layer never runs again" for any host that does not register `tokenMeter` — strictly worse than the bug it was fixing. `smoke_apply.mjs` pins both directions.
 
 Note that `tokenMeter` is a **host-provided** service; if your host does not expose it, configure `softLimit` as an absolute token count (or set `judgeOn: 'always'` / `compactOn: 'always'`) rather than relying on ratio-based pressure gating.
+
+### Host compaction threshold vs. `softLimit`
+
+Layer 1 does not schedule `pruneSession` itself. The host's `compaction-basic` bundle calls it when the host reaches its own pressure threshold (`thresholdRatio`, 0.8 by default) or on context overflow. This plugin's `softLimit` controls when Jev judging starts and how large the trimming budget is; it does not replace the host threshold.
+
+In pressure mode, a layer-1 trim therefore needs both conditions:
+
+```text
+host calls pruneSession
+AND
+used tokens exceed softLimit (so the pressure-gap budget is greater than zero)
+```
+
+Keep `softLimit` at or below the host's `thresholdRatio` unless the delayed behaviour is intentional. For example, with host `thresholdRatio: 0.8` and plugin `softLimit: 90%`, host calls between 80% and 90% produce a zero plugin budget; trimming starts only after usage reaches 90%. With the default `softLimit: 55%`, judging is ready before the host's normal 80% compaction call.
+
+For `@deepseek-ai/dsh-llm-deepseek@0.1.5-rc.2`, configure a smaller context window on the matching model entry:
+
+```yaml
+- id: llm-deepseek
+  config:
+    models:
+      - id: deepseek-flash
+        contextWindow: 10000
+```
+
+Setting only `defaultContextWindow` does not override catalog models that already carry their own `contextWindow`; the model entry wins. If the plugin cannot resolve the effective window, ratio-based gates stop and report the reason instead of guessing.
 
 ### Layer 1: pressure-quantile trimming
 
@@ -240,6 +267,7 @@ In normal operation both layers are driven automatically by context pressure; no
 - **Structure by code, semantics by the model**: write-type calls and the recent window are guaranteed by hard rules, never entrusted to a probability
 - **The shadow-price protocol is aligned verbatim** with DSH's `compaction/prune` + `surfaceOp: replace`, so pure consumers can reuse the same token accounting
 - **Slices by Unicode code point**, never splitting a surrogate pair; token estimation uses a per-word correction algorithm that works for mixed CJK/Latin text
+- **Hook ordering is load-bearing**: the judge hook is `prepend`ed (`ctx.on(..., true)`) so it runs **before the base bundle's `compaction-basic`**. That package is the *only* caller of `pruner.pruneSession` (both call sites live in it — `:888` for context-overflow, `:902` for pressure), so it is also the only place layer 1's verdicts get consumed. Registered without `prepend`, pruning would read the *previous* round's verdicts and every fresh result would fall back to the size rules — layer 1 silently inert, no error anywhere. `smoke_apply.mjs` block **M** pins this by observing the judge counter at the moment `pruneSession` is called.
 
 ## Testing
 
@@ -258,7 +286,9 @@ cp smoke_apply.mjs <some-dir>/ && cd <some-dir>/ && node smoke_apply.mjs
 
 The test scripts and helper tools (`check.js` / `smoke_apply.mjs` / `inspect_session.mjs` / `verify_real_shapes.mjs` / `wire_profile.mjs`) all ship with the npm package, so a plain `npm run check` works inside an installed copy. CI (`.github/workflows/ci.yml`) runs two jobs: a fast smoke job on the peer dependencies alone, and an integration job on the full DSH dependency tree.
 
-Coverage: the takeover of both interception points, the full decision path of both layers, the append protocol, receipt injection and its **ownership (fence)**, concurrent-compaction races, every gating branch (with counterfactual controls), the **text/`reasoning` split**, **small-population degradation**, **out-of-range config clamping**, **judge retries and per-batch isolation** (including per-pass vs lifetime counter semantics), **non-duplicated batch accounting**, **pressure gates failing closed in the same direction while still acting when the threshold is an absolute count**, **token-estimate calibration against a holdout set**, the **compaction quota**, **`alwaysTrimRatio` actually moving the budget** (with a precondition assert that the run took the budget path and not the small-population fallback), **a missing session exiting gracefully instead of throwing**, and **shell-type tools being excluded by default** (the `pwsh Remove-Item` regression case).
+Coverage: the takeover of both interception points, the full decision path of both layers, the append protocol, receipt injection and its **ownership (fence)**, concurrent-compaction races, every gating branch (with counterfactual controls), the **text/`reasoning` split**, **small-population degradation**, **out-of-range config clamping**, **judge retries and per-batch isolation** (including per-pass vs lifetime counter semantics), **non-duplicated batch accounting**, **pressure gates failing closed in the same direction while still acting when the threshold is an absolute count**, **token-estimate calibration against a holdout set**, the **compaction quota**, **`alwaysTrimRatio` actually moving the budget** (with a precondition assert that the run took the budget path and not the small-population fallback), **a missing session exiting gracefully instead of throwing**, **the judge hook being prepended ahead of the base bundle's `compaction-basic`** (observed at the exact moment `pruneSession` is called), **a skipped layer-2 pass recording *why* it was skipped** (the blocked reason plus the per-reason exclusion counts — previously only the success path wrote a note, so the one path you actually need to debug was the one that stayed silent), **the degraded-mode floor pinned at both readings** (the mechanism, with the floor passed explicitly, *and* the default — the exported constant is now the single source of truth, so it can no longer diverge from `computeEligibleSeqs`'s own defaults), and **shell-type tools being excluded by default** (the `pwsh Remove-Item` regression case).
+
+The fake `ctx` in `smoke_apply.mjs` mirrors cordis's **listener model**, not just its method names: multiple listeners per event, `prepend`, and `waterfall` ordering — where a listener that never calls `next()` vetoes the rest of the chain, including the host's built-in behaviour. Modelling it as a one-handler-per-event map hid the ordering contract completely: two listeners silently overwrote each other, and the prepend flag was ignored.
 
 **Test boundaries** (what CI actually verifies): pure-function logic, takeover and the append protocol under a fake ctx, plus — in the integration job — "the plugin module loads against the real dependency tree and `freezeMessage` is available". **Not** covered by CI: service takeover inside a live DSH host and event-shape drift between rc versions — verify those with `jev_probe_shapes` in a real session.
 

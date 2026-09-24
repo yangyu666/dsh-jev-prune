@@ -13,7 +13,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { JevClient, JevError, estimateTokens } from './jev.js'
-import { countChars, decideAction, parseLimit, planTrims, pruneSessionWithJev, sliceWithBudget } from './prune.js'
+import { JEV_PRUNE_MARKER, countChars, decideAction, parseLimit, planTrims, pruneSessionWithJev, sliceWithBudget } from './prune.js'
 import {
   DEFAULT_COMPACT_TOOLS,
   DEFAULT_EVIDENCE_PATTERNS,
@@ -24,6 +24,7 @@ import {
   RECEIPT_MARKER,
   balancedAfter,
   balancedBefore,
+  cachedVerdictForEvent,
   computeCuts,
   computeEligibleSeqs,
   isToolIn,
@@ -178,6 +179,18 @@ assert.equal(seqs.includes(9), false, '最近区不应进候选')
 // 已经裁过的节点要能识别
 assert.equal(looksPruned(eventAt(10), '已裁剪'), true)
 assert.equal(looksPruned(eventAt(3), '已裁剪'), false)
+const layer2Candidates = selectCandidates({
+  surface,
+  eventAt,
+  events,
+  preserveRecent: 0,
+  neverPruneTools: [],
+  marker: '已裁剪',
+  nameByCallId: nameIndex,
+  includePruned: true,
+})
+assert.equal(layer2Candidates.some((candidate) => candidate.seq === 10), true,
+  '第二层必须能在缓存丢失后重新判定已裁 replacement')
 
 // ---------------------------------------------------------------- 问题措辞
 const questions = questionsFor(candidates)
@@ -567,6 +580,41 @@ const run = ({ events, cache, cfg, threshold }) => {
   assert.equal(out.pruned[0].originalSeq, 22)
 }
 
+// ⑨ 第一层 replacement 的新 seq 必须继承旧判定，且已经裁过的内容不得再次走 fallback。
+// 真实日志里出现过新 seq + chars=848 + no-verdict-fallback，根因就是这里只按新 seq 直查。
+{
+  const original = resultEvent(72, 'c10', 'j'.repeat(5000))
+  const replacement = {
+    ...resultEvent(90, 'c10', `j`.repeat(400) + marker + `j`.repeat(300)),
+    sourceEventSeqs: [72],
+  }
+  const session = fakeSession([original, replacement])
+  session.surface.nodes = [90]
+  let fallbackCalls = 0
+  const pruner = fakePruner(100)
+  const originalPruneContent = pruner.pruneContent
+  pruner.pruneContent = (...args) => {
+    fallbackCalls += 1
+    return originalPruneContent(...args)
+  }
+  const stats = freshStats()
+  const out = pruneSessionWithJev({
+    pruner,
+    session,
+    cache: new Map([[72, { keep: false, prob: 0.05, effectProb: 0.05 }]]),
+    cfg: { ...baseCfg, keepMode: 'budget', pressureRatio: 1 },
+    stats,
+    freeze: (message) => message,
+    toolNameOf: () => 'Read',
+    callIdOf: (event) => event.data.message.source.callId,
+  })
+  assert.equal(out.pruned.length, 0, '已经裁过的 replacement 不应再次裁剪')
+  assert.equal(fallbackCalls, 0, 'replacement 应沿 sourceEventSeqs 命中判定，不得走体积 fallback')
+  assert.equal(out.decisions[0]?.prob, 0.05, '第一层计划应读到旧 seq 的 Jev 概率')
+  assert.equal(out.decisions[0]?.reason, 'already-pruned')
+  assert.equal(out.plan?.selected.includes(90), false, '已裁 replacement 不得占用本轮裁剪预算')
+}
+
 // ================================================================ P0-1：压力自适应分位的裁剪选择
 // 为什么需要这一层：Jev 概率是**窄带**的（真实会话实测 42/42 条低于 0.5、P50=0.13），
 // 固定 0.5 阈值会把每一轮判定都读成"可裁"；而纯相对分位又会"每轮必裁固定比例"。
@@ -731,9 +779,19 @@ const run = ({ events, cache, cfg, threshold }) => {
 
   // 小总体分支（issue #27 修复）：此前样本不足**直接返回空集** → 第二层在只读占比低的
   // 会话里静默不工作。现在改为降级到绝对下限模式，但下限阈值明显更严（0.2）。
-  // 这里样本=2（三条里取两条），低于 minCandidatesForFloor(3) → 仍然不做。
-  assert.equal(computeEligibleSeqs(verdicts.slice(0, 2), { quantile: 0.5, minCandidates: 4 }).size, 0,
-    '样本低于 minCandidatesForFloor 时仍不得做整对移出（1~2 条谈不上分布）')
+  //
+  // ⚠️ 这里必须分成**两个口径**测。原断言只用默认配置测 k=2 → 期望 0，而
+  // `computeEligibleSeqs` 的默认参数曾是硬编码字面量 `3` / `0.2`，与导出的
+  // `DEFAULT_MIN_CANDIDATES_FOR_FLOOR` / `DEFAULT_FLOOR_THRESHOLD` **分叉**：
+  // 常量改成 2 之后插件实体（走 resolveConfig，读常量）行为已变，而这行断言吃的是旧字面量、
+  // 依然全绿 —— 它测的是一个真实配置路径上不存在的数。现在默认值引用常量，
+  // 于是两个口径都必须显式写出来。
+  assert.equal(computeEligibleSeqs(verdicts.slice(0, 2), { quantile: 0.5, minCandidates: 4, minCandidatesForAbsolute: 3 }).size, 0,
+    '显式把地板设成 3 时，2 条样本仍不得做整对移出')
+  assert.equal(computeEligibleSeqs(verdicts.slice(0, 2), { quantile: 0.5, minCandidates: 4 }).size, 2,
+    '默认地板=2 时，2 条样本进绝对下限模式并全选（与 DEFAULT_MIN_CANDIDATES_FOR_FLOOR 一致）')
+  assert.equal(computeEligibleSeqs(verdicts.slice(0, 1), { quantile: 0.5, minCandidates: 4 }).size, 0,
+    '1 条样本在任何配置下都不得动作（分布的下限）')
 
   // 缺任何一轴的概率都不参与
   assert.equal(computeEligibleSeqs(
@@ -751,7 +809,32 @@ const run = ({ events, cache, cfg, threshold }) => {
     )
   }
   // quantile=0 的语义是字面意义"一条不取"（此前 Math.max(1,…) 反而取 1 条）
-  assert.equal(computeEligibleSeqs(verdicts, { quantile: 0, minCandidates: 4 }).size, 0)
+  let disabledNote = ''
+  assert.equal(computeEligibleSeqs(verdicts, {
+    quantile: 0,
+    minCandidates: 4,
+    onNote: (note) => { disabledNote = note },
+  }).size, 0)
+  assert.match(disabledNote, /compactQuantile=0.*关闭/, '显式关闭不能误报成“分位交集为空”')
+  assert.equal(computeEligibleSeqs(verdicts.slice(0, 2), { quantile: 0, minCandidates: 4 }).size, 0,
+    'quantile=0 必须在小样本降级之前生效，2 条低分候选也不得被重新选中')
+
+  // 两轴各取 1 条但不是同一节点时，交集为空；严格绝对下限仍可救回两轴都很低的节点。
+  let fallbackNote = ''
+  const disjoint = computeEligibleSeqs([
+    { seq: 1, prob: 0.01, effectProb: 0.90 },
+    { seq: 2, prob: 0.90, effectProb: 0.01 },
+    { seq: 3, prob: 0.10, effectProb: 0.10 },
+    { seq: 4, prob: 0.80, effectProb: 0.80 },
+  ], { quantile: 0.25, minCandidates: 4, onNote: (note) => { fallbackNote = note } })
+  assert.deepEqual([...disjoint], [3], '相对尾部交集为空时应降级到两轴绝对下限')
+  assert.match(fallbackNote, /交集为空.*绝对下限/, '降级必须通过 onNote 对外可见')
+
+  const cached = { keep: false, prob: 0.1, effectProb: 0.1 }
+  const cache = new Map([[7, cached]])
+  assert.equal(cachedVerdictForEvent(cache, { seq: 7 }), cached, '当前 seq 直接命中优先')
+  assert.equal(cachedVerdictForEvent(cache, { seq: 70, sourceEventSeqs: [7] }), cached,
+    '第一层 replacement 必须沿 sourceEventSeqs 找回旧 seq 的判定')
 }
 
 // ---------------------------------------------------------------- 范围选择
@@ -853,6 +936,43 @@ const run = ({ events, cache, cfg, threshold }) => {
   const tiny = run({ compactMinChars: 100000 })
   assert.equal(tiny.ranges.length, 0)
   assert.equal(tiny.stats.skippedShort, 1)
+}
+
+// ---------------------------------------------------------------- replacement 来源链上的证据也必须守住
+// 第一层可能把位于正文中间的 error 截掉；第二层若只扫描 surface 上的 replacement，
+// 会误以为没有证据并把整个调用/结果对移出。
+{
+  const original = toolResult(2, 'c1', `${'a'.repeat(1200)}fatal error: hidden in middle${'b'.repeat(1200)}`)
+  const replacement = {
+    ...toolResult(3, 'c1', `${'a'.repeat(100)}${JEV_PRUNE_MARKER}${'b'.repeat(100)}`),
+    sourceEventSeqs: [2],
+  }
+  const evs = [
+    assistantWithCall(1, 'c1', 'Read', { file_path: 'hidden-error.txt' }),
+    original,
+    replacement,
+  ]
+  const at = (seq) => evs.find((event) => event.seq === seq)
+  const cache = new Map([[2, { keep: false, prob: 0.05, effectProb: 0.05, chars: 2500, tool: 'Read' }]])
+  const { ranges, stats } = selectReceiptRanges({
+    surface: [1, 3],
+    eventAt: at,
+    cache,
+    dropVerdict: () => true,
+    cfg: {
+      preserveRecent: 0,
+      compactTools: DEFAULT_COMPACT_TOOLS,
+      neverCompactTools: DEFAULT_NEVER_COMPACT_TOOLS,
+      evidenceGuard: true,
+      evidencePatterns: DEFAULT_EVIDENCE_PATTERNS,
+      maxStepTextChars: 240,
+      maxStepReasoningChars: 240,
+      compactMinChars: 10,
+    },
+  })
+  assert.equal(ranges.length, 0, '原始结果中被第一层截掉的 error 仍应阻止第二层整对移出')
+  assert.equal(stats.skippedGuard, 1, '来源链证据应计入 guard 排除，而不是 verdict/short')
+  assert.deepEqual(stats.guardHits[0]?.matches, ['error'])
 }
 
 // ---------------------------------------------------------------- blockedToolNames 诊断口径
@@ -1466,6 +1586,7 @@ const run = ({ events, cache, cfg, threshold }) => {
   // ① schemastery 层必须响亮地拒绝（不是静默 clamp）
   assert.throws(() => Config({ preserveRecent: -5 }), /expected number >= 0/,
     'Config 应对越界值抛错，而不是悄悄改掉')
+  assert.throws(() => Config({ compactPreserveRecent: -1 }), /expected number >= 0/)
   assert.throws(() => Config({ receiptMaxRatio: 5 }), /expected number <= 1/)
 
   // ② 我们的钳制层：越界 → 回落到默认值（而不是钳到边界）
@@ -1474,6 +1595,8 @@ const run = ({ events, cache, cfg, threshold }) => {
   assert.ok(neg[CONFIG_WARNINGS].some((w) => /preserveRecent/.test(w)), '钳制必须留下告警')
   assert.ok(/低于下限/.test(neg[CONFIG_WARNINGS][0]), `告警应说明原因：${neg[CONFIG_WARNINGS][0]}`)
   assert.ok(/已改为 4/.test(neg[CONFIG_WARNINGS][0]), '告警应同时给出改后的值')
+  assert.equal(resolveConfig({ compactPreserveRecent: -1 }).compactPreserveRecent, 1,
+    '第二层独立最近区的非法值应回落默认 1')
 
   // ②b 第二层永久静默失效：maxStepTextChars=-1 会让每一步都 text > -1
   assert.equal(resolveConfig({ maxStepTextChars: -1 }).maxStepTextChars, 1200)
@@ -1555,8 +1678,9 @@ const run = ({ events, cache, cfg, threshold }) => {
 
 
   // 合法值必须原样保留（钳制不能顺手改掉正常配置）
-  const ok = resolveConfig({ preserveRecent: 0, headChars: 0, maxStepTextChars: 5000, receiptMaxRatio: 1 })
+  const ok = resolveConfig({ preserveRecent: 0, compactPreserveRecent: 0, headChars: 0, maxStepTextChars: 5000, receiptMaxRatio: 1 })
   assert.equal(ok.preserveRecent, 0, '0 是合法值（不保护最近区），不得被当成缺省')
+  assert.equal(ok.compactPreserveRecent, 0, '第二层最近区也允许显式设为 0')
   assert.equal(ok.headChars, 0)
   assert.equal(ok.maxStepTextChars, 5000)
   assert.equal(ok.receiptMaxRatio, 1, '1 是上界本身，闭区间内')

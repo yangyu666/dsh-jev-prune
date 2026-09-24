@@ -6,13 +6,14 @@
  *   Jev 说「还要」      → **不裁**（哪怕它很大 —— DSH 现在会误裁这类）
  *   Jev 说「过期了」    → **裁**（哪怕它不大 —— DSH 现在完全不碰这类，纯增量）
  *   没有判定            → 退回 DSH 原来的按体积裁决（安全兜底）
- *   落在最近 preserveRecent 个节点里 / 永不裁剪工具 → 一律不碰
+ *   第一层落在最近 preserveRecent 个节点里 / 永不裁剪工具 → 一律不碰
  *
  * ── 第二层：整对调用的「回执压缩」（接管 `ctx.compaction.summarize` + `compactRegion`）
  * DSH 自带做法：让主模型读原始历史、**写一段摘要**顶替被压缩的区间。摘要会幻觉。
  * 我们改成注入一段**确定性回执** —— 工具名、命令、路径、输出字符数、seq 全部由代码算出，
  * **不可能包含模型推断**。代价是它不解释、只开收据（原始事件仍在会话日志里，可恢复）。
- * 门控（满足全部才动）：两轴相对分位取交集 + 工具白名单 + 证据守卫 + 最近区保护 + 文本长度门控。
+ * 门控（满足全部才动）：两轴相对分位取交集 + 工具白名单 + 证据守卫
+ * + 第二层独立的 compactPreserveRecent 最近区保护 + 文本长度门控。
  *
  * 判定时机：`agent/pre-step` 里**异步**预判好、缓存按 seq；
  * 因为 `pruneSession(session)` 是**同步**方法，里面不能 await；
@@ -45,6 +46,7 @@ import {
   DEFAULT_NEVER_PRUNE_TOOLS,
   DSH_READONLY_TOOLS,
   RECEIPT_MARKER,
+  cachedVerdictForEvent,
   computeEligibleSeqs,
   renderReceipt,
   selectReceiptRanges,
@@ -111,18 +113,21 @@ const dshVersionMatches = dshVersion === 'unknown'
  * 静态导入一旦解析不到，整个插件会加载失败（连带 DSH 起不来）；
  * 动态导入失败只退化成一个浅拷贝，插件照常工作。
  */
-let freezeMessageImpl = (message) => ({ ...message })
-let freezeLoaded = false
+const fallbackFreezeMessage = (message) => ({ ...message })
 
-async function loadFreeze() {
-  if (freezeLoaded) return
-  freezeLoaded = true
+/**
+ * 解析宿主的 freezeMessage；加载器可注入，令“可选依赖不存在”的降级路径可回归测试。
+ * @param {() => Promise<object>} [loadModule]
+ * @returns {Promise<(message: object) => object>}
+ */
+export async function resolveFreezeMessage(loadModule = () => import('@deepseek-ai/dsh-llm')) {
   try {
-    const mod = await import('@deepseek-ai/dsh-llm')
-    if (typeof mod?.freezeMessage === 'function') freezeMessageImpl = mod.freezeMessage
+    const mod = await loadModule()
+    if (typeof mod?.freezeMessage === 'function') return mod.freezeMessage
   } catch {
-    // 保持浅拷贝兜底
+    // 使用浅拷贝兜底
   }
+  return fallbackFreezeMessage
 }
 
 export const name = 'jev-prune'
@@ -241,6 +246,8 @@ export const Config = z.object({
   compactOn: z.string().default('pressure'),
   /** 第二层的压力门（比第一层保守：整对删除比截断风险大） */
   compactSoftLimit: z.string().default('70%'),
+  /** 第二层独立的最近区保护；整对移出已有两轴判定，默认只保留最后 1 个节点。 */
+  compactPreserveRecent: z.number().min(0).default(1),
   /**
    * 门控模式：relative（默认）| absolute。
    * **Jev 必须用 relative** —— 实测它的两轴概率都落在 0.05~0.37 的窄带里，
@@ -377,6 +384,7 @@ const CONFIG_RANGES = {
   receiptMaxRatio: [0, 1],
   // 非负（0 合法）
   preserveRecent: [0, 1e9],
+  compactPreserveRecent: [0, 1e9],
   headChars: [0, 1e9],
   tailChars: [0, 1e9],
   textHead: [0, 1e9],
@@ -485,6 +493,7 @@ export function resolveConfig(config = {}) {
     compactReceipts: config.compactReceipts ?? true,
     compactOn: config.compactOn ?? 'pressure',
     compactSoftLimit: config.compactSoftLimit ?? '70%',
+    compactPreserveRecent: clampConfigNumber('compactPreserveRecent', config.compactPreserveRecent, 1, (w) => warnings.push(w))[0],
     compactMode: config.compactMode ?? 'relative',
     compactQuantile: clampConfigNumber('compactQuantile', config.compactQuantile, 0.34, (w) => warnings.push(w))[0],
     minCandidatesForRelative: clampConfigNumber('minCandidatesForRelative', config.minCandidatesForRelative, DEFAULT_MIN_CANDIDATES_FOR_RELATIVE, (w) => warnings.push(w))[0],
@@ -550,7 +559,8 @@ export function isCompactableTool(tool, cfg) {
 /**
  * @param {object} ctx Cordis 上下文
  * @param {object} config 插件配置（schemastery 已校验）
- * @param {object} [deps] 可选的依赖注入，仅用于测试：`{ judge }` 可替换真实的 JevClient。
+ * @param {object} [deps] 可选的依赖注入，仅用于测试：`{ judge, loadFreezeModule }` 可替换
+ *   真实的 JevClient 与可选的 dsh-llm 模块加载器。
  *   DSH 只传前两个参数，所以加第三个是向后兼容的；但有了它，
  *   "预置一组概率 → 断言裁决结果"就能跑在**真实的 apply + 真实的 pruneSession 接管**上，
  *   而不是另写一份模拟逻辑。
@@ -563,7 +573,10 @@ export function apply(ctx, config, deps = {}) {
     ctx.logger?.info?.(`[jev-prune] DSH ${dshVersion} 与测试版本 ${TESTED_DSH_VERSION} 不同系列 —— 事件字段可能已漂移，建议先跑 jev_probe_shapes 核对`)
   }
 
-  void loadFreeze() // 异步取 freezeMessage，失败就退化成浅拷贝
+  // 每个 apply 实例持有自己的解析结果，避免一次测试/一次宿主加载污染其他实例。
+  // 动态导入完成前也始终有浅拷贝兜底，插件不会阻塞启动。
+  let freezeMessage = fallbackFreezeMessage
+  void resolveFreezeMessage(deps.loadFreezeModule).then((resolved) => { freezeMessage = resolved })
 
   const envKey = typeof process !== 'undefined' ? process.env?.TYPESAFE_API_KEY : undefined
   const judge = deps.judge ?? new JevClient({
@@ -752,6 +765,7 @@ export function apply(ctx, config, deps = {}) {
           on: cfg.compactOn,
           mode: cfg.compactMode,
           quantile: cfg.compactQuantile,
+          preserveRecent: cfg.compactPreserveRecent,
         },
         takeover,
         summaryHook,
@@ -816,17 +830,58 @@ export function apply(ctx, config, deps = {}) {
     const surface = [...session.surface.nodes]
     const eventAt = (seq) => session.eventAt(seq)
     const nameByCallId = buildToolNameIndex(sessionEvents(session))
-    const candidates = selectCandidates({
+    // 判定缓存供两层共用，但两层的最近区与工具规则不同：
+    //   · 第一层按 preserveRecent + neverPruneTools；
+    //   · 第二层按 compactPreserveRecent + 只读白名单/neverCompactTools。
+    // 不能简单取两个最近区的 min 后仍套第一层工具规则，否则 pwsh 等节点会落在
+    // “第一层因最近区不动、第二层因工具门不动”的死区里，却仍然花钱做 Jev 判定。
+    const candidateInput = {
       surface,
       eventAt,
       events: sessionEvents(session),
-      preserveRecent: cfg.preserveRecent,
-      neverPruneTools: cfg.neverPruneTools,
       marker: JEV_PRUNE_MARKER,
       nameByCallId,
+    }
+    const layer1Candidates = selectCandidates({
+      ...candidateInput,
+      preserveRecent: cfg.preserveRecent,
+      neverPruneTools: cfg.neverPruneTools,
     })
+    const candidatesBySeq = new Map(layer1Candidates.map((candidate) => [candidate.seq, candidate]))
+    const layer2CandidateSeqs = new Set()
+    // 选择器被显式设为 0 时，第二层数学上不可能选中任何节点。不要再扩候选或
+    // 询问 effect 轴；第一层仍可按自己的范围正常取得 result 判定。
+    // compactOn='off' 不能在这里排除：它只关闭自动 pass，jev_compact_now 会用 force
+    // 绕过这道门；若不预取两轴，手动命令会永久缺 effect verdict、实际无法使用。
+    const layer2CanSelect = cfg.compactReceipts
+      && (cfg.compactMode === 'relative' ? cfg.compactQuantile > 0 : cfg.compactThreshold > 0)
+    if (layer2CanSelect) {
+      const layer2Candidates = selectCandidates({
+        ...candidateInput,
+        preserveRecent: cfg.compactPreserveRecent,
+        // 第一层黑名单不属于第二层；第二层随后按自己的白名单 + 黑名单过滤。
+        neverPruneTools: [],
+        // decisions 是内存缓存，宿主重启/会话恢复后会丢失。第一层 replacement 虽然
+        // 带裁剪标记，第二层仍需允许重新判定，否则这些旧节点永远无法进入回执压缩。
+        includePruned: true,
+      }).filter((candidate) => isCompactableTool(candidate.tool, cfg))
+      for (const candidate of layer2Candidates) {
+        layer2CandidateSeqs.add(candidate.seq)
+        candidatesBySeq.set(candidate.seq, candidate)
+      }
+    }
+    const candidates = [...candidatesBySeq.values()].sort((a, b) => a.index - b.index)
     const cache = decisionsOf(session)
-    const fresh = candidates.filter((c) => !cache.has(c.seq))
+    // replacement 的判定可能仍挂在 sourceEventSeqs 指向的旧 seq 上；直接查新 seq 会
+    // 重复付费。缓存确实丢失时（例如重启）才重新判定当前 replacement。
+    // “有缓存项”不等于“判定完成”：服务可能只返回 result/effect 其中一轴。
+    // 第一层至少需要 result(prob)；第二层必须两轴都齐。缺轴的节点下轮继续问，
+    // 否则一次部分响应就会让它永久停在 cache 中、永远进不了第二层。
+    const fresh = candidates.filter((candidate) => {
+      const cached = cachedVerdictForEvent(cache, eventAt(candidate.seq))
+      if (!Number.isFinite(cached?.prob)) return true
+      return layer2CandidateSeqs.has(candidate.seq) && !Number.isFinite(cached?.effectProb)
+    })
     // 压力门控：不到软阈值就不花 Jev 的钱
     //
     // 失败方向（issue #32）：第一层与第二层的压力门必须**同向关闭**。
@@ -940,6 +995,18 @@ export function apply(ctx, config, deps = {}) {
       log('info', `state ≈ ${stateTokens} tokens 仍超预算 ${cfg.maxStateTokens}（行数地板 ${cfg.minHistoryLines}），本批可能被服务端拒绝`)
     }
     const questions = questionsFor(fresh, cfg.wording)
+    // 只询问当前候选真正缺失、且所在层需要的轴：
+    //   · 第一层只消费 result；
+    //   · 第二层同时消费 result + effect。
+    // 部分响应后的重试若把已有轴再问一次，不仅浪费预算，还可能用第二次采样覆盖
+    // 第一次已经得到的概率，使同一节点的裁决随重试发生无意义漂移。
+    for (const candidate of fresh) {
+      const cached = cachedVerdictForEvent(cache, eventAt(candidate.seq))
+      if (Number.isFinite(cached?.prob)) delete questions[`result_s${candidate.seq}`]
+      if (!layer2CandidateSeqs.has(candidate.seq) || Number.isFinite(cached?.effectProb)) {
+        delete questions[`effect_s${candidate.seq}`]
+      }
+    }
     const batches = judge.batch(state, questions, {
       maxRequestTokens: cfg.maxRequestTokens,
       overheadTokens: 40,
@@ -985,7 +1052,9 @@ export function apply(ctx, config, deps = {}) {
         if (candidate == null) continue
         const prob = answers[`result_s${seq}`]
         const effectProb = answers[`effect_s${seq}`]
-        const previous = cache.get(seq)
+        // 第一轮只有一轴时，第一层可能已经把该结果替换成新 seq；补第二轴时要沿
+        // sourceEventSeqs 找到旧缓存，否则会把已有轴丢掉，形成“两个 seq 各半轴”。
+        const previous = cachedVerdictForEvent(cache, eventAt(candidate.seq))
         // 局部合并：本批给出的轴覆盖，未给出的轴沿用已有值
         const merged = {
           keep: typeof prob === 'number'
@@ -997,13 +1066,22 @@ export function apply(ctx, config, deps = {}) {
           tool: candidate.tool,
         }
         cache.set(seq, merged)
+        // 补轴可能发生在第一层已经把 old seq 替换成 replacement seq 之后。
+        // 将合并结果归一到当前 seq，并移除来源 seq 的旧半条缓存，避免后续统计/查找
+        // 同时看到两个各自不完整的版本。
+        for (const sourceSeq of eventAt(candidate.seq)?.sourceEventSeqs ?? []) {
+          if (sourceSeq !== seq) cache.delete(sourceSeq)
+        }
       }
     }
-    // 结算本轮的判定条数：按**候选**去重后统计（两轴齐了才算这一条判完）。
+    // 结算本轮的判定条数：按**候选**去重后统计。第一层只需 result，第二层
+    // 必须两轴齐全；部分响应不算完成，也不会在补轴后重复计数。
     // 旧实现是"每批都遍历整个 fresh，能查到旧值就再累加一次"，条数按批数虚报。
     for (const seq of freshSeqs) {
-      const value = cache.get(seq)
-      if (value != null && (typeof value.prob === 'number' || typeof value.effectProb === 'number')) {
+      const value = cachedVerdictForEvent(cache, eventAt(seq))
+      const complete = Number.isFinite(value?.prob)
+        && (!layer2CandidateSeqs.has(seq) || Number.isFinite(value?.effectProb))
+      if (complete) {
         stats.judged += 1
         // P0-3 遥测：把概率分布记下来（这是判断"阈值是否失配"的唯一依据）
         if (typeof value.prob === 'number') {
@@ -1055,7 +1133,7 @@ export function apply(ctx, config, deps = {}) {
       cache: decisions.get(session),
       cfg: { ...cfg, marker: JEV_PRUNE_MARKER, pressureRatio: pressureRatios.get(session) ?? 0 },
       stats,
-      freeze: freezeMessageImpl,
+      freeze: freezeMessage,
       toolNameOf: (event) => toolNameOf(event, nameByCallId),
       callIdOf,
     })
@@ -1305,12 +1383,12 @@ export function apply(ctx, config, deps = {}) {
       return report
     }
     const surface = [...session.surface.nodes]
-    const onSurface = new Set(surface)
     // 分位总体必须只含**可整对移出**的节点：判定的缓存同时服务第一层（无白名单），
     // 若把白名单外/黑名单内的节点也算进总体，尾部名额会被它们占掉后被工具门白拒。
-    const verdicts = [...cache.entries()]
-      .filter(([seq, value]) => onSurface.has(seq) && isCompactableTool(value.tool, cfg))
-      .map(([seq, value]) => ({ seq, ...value }))
+    const verdicts = surface.flatMap((seq) => {
+      const value = cachedVerdictForEvent(cache, session.eventAt(seq))
+      return value != null && isCompactableTool(value.tool, cfg) ? [{ seq, ...value }] : []
+    })
     report.verdicts = verdicts.length
 
     let eligibleSeqs
@@ -1347,7 +1425,7 @@ export function apply(ctx, config, deps = {}) {
       eventAt,
       cache,
       dropVerdict: (seq) => eligibleSeqs.has(seq),
-      cfg,
+      cfg: { ...cfg, preserveRecent: cfg.compactPreserveRecent },
     })
     report.selection = selection
     report.considered = ranges.length
@@ -1408,8 +1486,12 @@ export function apply(ctx, config, deps = {}) {
         action.shadowedSeqs = result?.shadowedSeqs?.length ?? null
         action.compactionId = String(result?.compactionId ?? '')
         report.actions.push(action)
-        // surface 已经变了，这些判定不再对应任何节点 → 从缓存里清掉
-        for (const seq of spanSeqs) cache.delete(seq)
+        // surface 已经变了，这些判定不再对应任何节点 → 连同 replacement 继承的旧 key 清掉
+        for (const seq of spanSeqs) {
+          const event = session.eventAt(seq)
+          cache.delete(seq)
+          for (const sourceSeq of event?.sourceEventSeqs ?? []) cache.delete(sourceSeq)
+        }
       } catch (error) {
         stats.errors += 1
         action.error = error?.message ?? String(error)
@@ -1462,6 +1544,8 @@ export function apply(ctx, config, deps = {}) {
   ctx.effect(() => installPrunerOverride())
   ctx.effect(() => installSummaryHook())
 
+  // 判定钩子：prepend 到最前，抢在 DSH 的 compaction-basic（其 pre-step 会调 pruneSession）之前。
+  // 否则 pruneSession 读判定 cache 时 Jev 判定还没跑完 → 全部 fallback（第一层失效）。
   ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     // P0-3：判定链条的最外层计数。没有它时，"一次性零判定"无法区分
     // 「事件没触发」/「提前 return」/「门控跳过」——三者的排查方向完全不同。
@@ -1484,8 +1568,29 @@ export function apply(ctx, config, deps = {}) {
       stats.lastNote = `判定失败：${error?.message ?? String(error)}`
       log('info', stats.lastNote)
     }
+    return next()
+  }, true)
+
+  ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     try {
-      await compactPass(agent, { signal })
+      const report = await compactPass(agent, { signal })
+      // 被 skip 的 pass 此前**不写** lastCompactNote（只有成功路径 :1428 与 catch 会写），
+      // 于是心跳/状态报告里留着上一轮的旧值 —— "第二层为什么没动"恰好看不见，
+      // 而这正是最需要排查的那条路径（实测踩到：跑批端只能看到 compactSkipped=4，
+      // 不知道原因）。把 report.blocked 与 selection 的逐条排除计数一并落盘。
+      if (report?.blocked) {
+        stats.lastCompactNote = report.blocked
+        if (report.quantileNote) stats.lastCompactNote += `（${report.quantileNote}）`
+        if (report.selection) {
+          const sel = report.selection
+          const parts = []
+          for (const [k, label] of [['skippedTail', 'tail'], ['skippedTool', 'tool'], ['skippedVerdict', 'verdict'], ['skippedIncomplete', 'incomplete'], ['skippedGuard', 'guard'], ['skippedText', 'text'], ['skippedReasoning', 'reasoning'], ['skippedShort', 'short']]) {
+            if (sel[k]) parts.push(`${label}:${sel[k]}`)
+          }
+          if (sel.eligibleSteps) parts.push(`eligible:${sel.eligibleSteps}`)
+          if (parts.length) stats.lastCompactNote += ` [${parts.join(' ')}]`
+        }
+      }
     } catch (error) {
       stats.errors += 1
       stats.lastCompactNote = `回执压缩失败：${error?.message ?? String(error)}`
@@ -1569,7 +1674,8 @@ export function apply(ctx, config, deps = {}) {
         ? [`判定请求：本 pass 无重试（本会话累计重试 ${judge.retries} 次、累计请求 ${judge.requests} 次）`]
         : []),
       `第二层：summarize=${summaryHook.installed ? '已接管' : `未接管(${summaryHook.reason || '未尝试'})`}   `
-        + `compactOn=${cfg.compactOn}   ${cfg.compactMode}${cfg.compactMode === 'relative' ? `(quantile=${cfg.compactQuantile})` : `(<${cfg.compactThreshold})`}`,
+        + `compactOn=${cfg.compactOn}   preserveRecent=${cfg.compactPreserveRecent}   `
+        + `${cfg.compactMode}${cfg.compactMode === 'relative' ? `(quantile=${cfg.compactQuantile})` : `(<${cfg.compactThreshold})`}`,
       `第二层：回执压缩 ${stats.compactions} 段 / 移出 ${stats.compactedSeqs} 节点 / 省约 ${stats.compactedChars} 字符   `
         + `回执摘要被消费 ${stats.receiptSummaries} 次   压力跳过 ${stats.compactSkipped} 次`
         // 竞态计数只在非零时出现：它是异常路径，常态下不该占版面（issue #29）
