@@ -1123,6 +1123,11 @@ async function layer2Run(effectOfS2) {
     absoluteDisabled === firstLayerOnly,
     `实际判定 ${absoluteDisabled} 条（第一层自身只需 ${firstLayerOnly} 条）`)
 
+  const manualOnly = await judgedWith(true, undefined, { compactOn: 'off' })
+  check("compactOn='off' 仍预取第二层两轴，保证 jev_compact_now(force) 可用",
+    manualOnly === bothLayers,
+    `实际判定 ${manualOnly} 条（手动压缩需要 ${bothLayers} 条）`)
+
   const mixedTools = await judgedWith(true, [
     { tool: 'Read', args: { file_path: 'a.ts' }, chars: 3000 },
     { tool: 'pwsh', args: { command: 'Get-Content b.ts' }, chars: 3000 },

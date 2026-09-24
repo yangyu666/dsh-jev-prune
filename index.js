@@ -851,8 +851,9 @@ export function apply(ctx, config, deps = {}) {
     const layer2CandidateSeqs = new Set()
     // 选择器被显式设为 0 时，第二层数学上不可能选中任何节点。不要再扩候选或
     // 询问 effect 轴；第一层仍可按自己的范围正常取得 result 判定。
+    // compactOn='off' 不能在这里排除：它只关闭自动 pass，jev_compact_now 会用 force
+    // 绕过这道门；若不预取两轴，手动命令会永久缺 effect verdict、实际无法使用。
     const layer2CanSelect = cfg.compactReceipts
-      && cfg.compactOn !== 'off'
       && (cfg.compactMode === 'relative' ? cfg.compactQuantile > 0 : cfg.compactThreshold > 0)
     if (layer2CanSelect) {
       const layer2Candidates = selectCandidates({
