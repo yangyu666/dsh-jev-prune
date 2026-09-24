@@ -305,6 +305,17 @@ check('导出 name', typeof mod.name === 'string' && mod.name.length > 0, mod.na
 check('导出 inject 含 tools', Array.isArray(mod.inject) && mod.inject.includes('tools'), JSON.stringify(mod.inject))
 check('导出 apply', typeof mod.apply === 'function')
 
+// 可选的 dsh-llm 不存在时必须走可测的浅拷贝降级；恒等函数会让后续代码意外复用入参。
+{
+  const fallbackFreeze = await mod.resolveFreezeMessage(async () => {
+    throw new Error('模拟可选依赖缺失')
+  })
+  const input = { role: 'tool', content: [{ type: 'text', text: 'x' }] }
+  const output = fallbackFreeze(input)
+  check('freezeMessage 加载失败时返回浅拷贝而不是原对象',
+    output !== input && output.role === input.role && output.content === input.content)
+}
+
 const PLUGIN_CFG = {
   enabled: true,
   apiKey: 'dummy', // 有注入的假 judge，这个不会被用到

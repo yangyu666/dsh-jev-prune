@@ -113,18 +113,21 @@ const dshVersionMatches = dshVersion === 'unknown'
  * 静态导入一旦解析不到，整个插件会加载失败（连带 DSH 起不来）；
  * 动态导入失败只退化成一个浅拷贝，插件照常工作。
  */
-let freezeMessageImpl = (message) => ({ ...message })
-let freezeLoaded = false
+const fallbackFreezeMessage = (message) => ({ ...message })
 
-async function loadFreeze() {
-  if (freezeLoaded) return
-  freezeLoaded = true
+/**
+ * 解析宿主的 freezeMessage；加载器可注入，令“可选依赖不存在”的降级路径可回归测试。
+ * @param {() => Promise<object>} [loadModule]
+ * @returns {Promise<(message: object) => object>}
+ */
+export async function resolveFreezeMessage(loadModule = () => import('@deepseek-ai/dsh-llm')) {
   try {
-    const mod = await import('@deepseek-ai/dsh-llm')
-    if (typeof mod?.freezeMessage === 'function') freezeMessageImpl = mod.freezeMessage
+    const mod = await loadModule()
+    if (typeof mod?.freezeMessage === 'function') return mod.freezeMessage
   } catch {
-    // 保持浅拷贝兜底
+    // 使用浅拷贝兜底
   }
+  return fallbackFreezeMessage
 }
 
 export const name = 'jev-prune'
@@ -556,7 +559,8 @@ export function isCompactableTool(tool, cfg) {
 /**
  * @param {object} ctx Cordis 上下文
  * @param {object} config 插件配置（schemastery 已校验）
- * @param {object} [deps] 可选的依赖注入，仅用于测试：`{ judge }` 可替换真实的 JevClient。
+ * @param {object} [deps] 可选的依赖注入，仅用于测试：`{ judge, loadFreezeModule }` 可替换
+ *   真实的 JevClient 与可选的 dsh-llm 模块加载器。
  *   DSH 只传前两个参数，所以加第三个是向后兼容的；但有了它，
  *   "预置一组概率 → 断言裁决结果"就能跑在**真实的 apply + 真实的 pruneSession 接管**上，
  *   而不是另写一份模拟逻辑。
@@ -569,7 +573,10 @@ export function apply(ctx, config, deps = {}) {
     ctx.logger?.info?.(`[jev-prune] DSH ${dshVersion} 与测试版本 ${TESTED_DSH_VERSION} 不同系列 —— 事件字段可能已漂移，建议先跑 jev_probe_shapes 核对`)
   }
 
-  void loadFreeze() // 异步取 freezeMessage，失败就退化成浅拷贝
+  // 每个 apply 实例持有自己的解析结果，避免一次测试/一次宿主加载污染其他实例。
+  // 动态导入完成前也始终有浅拷贝兜底，插件不会阻塞启动。
+  let freezeMessage = fallbackFreezeMessage
+  void resolveFreezeMessage(deps.loadFreezeModule).then((resolved) => { freezeMessage = resolved })
 
   const envKey = typeof process !== 'undefined' ? process.env?.TYPESAFE_API_KEY : undefined
   const judge = deps.judge ?? new JevClient({
@@ -1120,7 +1127,7 @@ export function apply(ctx, config, deps = {}) {
       cache: decisions.get(session),
       cfg: { ...cfg, marker: JEV_PRUNE_MARKER, pressureRatio: pressureRatios.get(session) ?? 0 },
       stats,
-      freeze: freezeMessageImpl,
+      freeze: freezeMessage,
       toolNameOf: (event) => toolNameOf(event, nameByCallId),
       callIdOf,
     })
