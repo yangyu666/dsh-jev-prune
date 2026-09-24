@@ -164,6 +164,32 @@ The old behaviour was asymmetric — layer 2 skipped when it could not resolve a
 
 Note that `tokenMeter` is a **host-provided** service; if your host does not expose it, configure `softLimit` as an absolute token count (or set `judgeOn: 'always'` / `compactOn: 'always'`) rather than relying on ratio-based pressure gating.
 
+### Host compaction threshold vs. `softLimit`
+
+Layer 1 does not schedule `pruneSession` itself. The host's `compaction-basic` bundle calls it when the host reaches its own pressure threshold (`thresholdRatio`, 0.8 by default) or on context overflow. This plugin's `softLimit` controls when Jev judging starts and how large the trimming budget is; it does not replace the host threshold.
+
+In pressure mode, a layer-1 trim therefore needs both conditions:
+
+```text
+host calls pruneSession
+AND
+used tokens exceed softLimit (so the pressure-gap budget is greater than zero)
+```
+
+Keep `softLimit` at or below the host's `thresholdRatio` unless the delayed behaviour is intentional. For example, with host `thresholdRatio: 0.8` and plugin `softLimit: 90%`, host calls between 80% and 90% produce a zero plugin budget; trimming starts only after usage reaches 90%. With the default `softLimit: 55%`, judging is ready before the host's normal 80% compaction call.
+
+For `@deepseek-ai/dsh-llm-deepseek@0.1.5-rc.2`, configure a smaller context window on the matching model entry:
+
+```yaml
+- id: llm-deepseek
+  config:
+    models:
+      - id: deepseek-flash
+        contextWindow: 10000
+```
+
+Setting only `defaultContextWindow` does not override catalog models that already carry their own `contextWindow`; the model entry wins. If the plugin cannot resolve the effective window, ratio-based gates stop and report the reason instead of guessing.
+
 ### Layer 1: pressure-quantile trimming
 
 The layer-1 decision used to be a bare fixed threshold: `keep = P(keep) ≥ 0.5`. Live-host measurement broke that assumption: **every judged candidate scored below 0.5** (42/42 in a 132k-token session, 5/5 in a short one; median ≈ 0.13–0.17). Jev's probabilities live in a narrow band — the exact trap layer 2 had already escaped by switching to relative quantiles, except nobody applied the lesson to layer 1. Under the fixed threshold, the first layer's real-world behaviour was *"trim everything that was judged"*, including results the session still needed.
