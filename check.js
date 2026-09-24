@@ -568,6 +568,41 @@ const run = ({ events, cache, cfg, threshold }) => {
   assert.equal(out.pruned[0].originalSeq, 22)
 }
 
+// ⑨ 第一层 replacement 的新 seq 必须继承旧判定，且已经裁过的内容不得再次走 fallback。
+// 真实日志里出现过新 seq + chars=848 + no-verdict-fallback，根因就是这里只按新 seq 直查。
+{
+  const original = resultEvent(72, 'c10', 'j'.repeat(5000))
+  const replacement = {
+    ...resultEvent(90, 'c10', `j`.repeat(400) + marker + `j`.repeat(300)),
+    sourceEventSeqs: [72],
+  }
+  const session = fakeSession([original, replacement])
+  session.surface.nodes = [90]
+  let fallbackCalls = 0
+  const pruner = fakePruner(100)
+  const originalPruneContent = pruner.pruneContent
+  pruner.pruneContent = (...args) => {
+    fallbackCalls += 1
+    return originalPruneContent(...args)
+  }
+  const stats = freshStats()
+  const out = pruneSessionWithJev({
+    pruner,
+    session,
+    cache: new Map([[72, { keep: false, prob: 0.05, effectProb: 0.05 }]]),
+    cfg: { ...baseCfg, keepMode: 'budget', pressureRatio: 1 },
+    stats,
+    freeze: (message) => message,
+    toolNameOf: () => 'Read',
+    callIdOf: (event) => event.data.message.source.callId,
+  })
+  assert.equal(out.pruned.length, 0, '已经裁过的 replacement 不应再次裁剪')
+  assert.equal(fallbackCalls, 0, 'replacement 应沿 sourceEventSeqs 命中判定，不得走体积 fallback')
+  assert.equal(out.decisions[0]?.prob, 0.05, '第一层计划应读到旧 seq 的 Jev 概率')
+  assert.equal(out.decisions[0]?.reason, 'already-pruned')
+  assert.equal(out.plan?.selected.includes(90), false, '已裁 replacement 不得占用本轮裁剪预算')
+}
+
 // ================================================================ P0-1：压力自适应分位的裁剪选择
 // 为什么需要这一层：Jev 概率是**窄带**的（真实会话实测 42/42 条低于 0.5、P50=0.13），
 // 固定 0.5 阈值会把每一轮判定都读成"可裁"；而纯相对分位又会"每轮必裁固定比例"。

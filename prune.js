@@ -43,6 +43,18 @@ export function isToolIn(list, name) {
   return (list ?? []).some((item) => normalizeToolName(item) === needle)
 }
 
+/** Resolve a cached judgment through a replacement event's source seqs. */
+export function cachedVerdictForEvent(cache, event) {
+  if (cache == null || event == null) return null
+  const direct = cache.get(event.seq)
+  if (direct != null) return direct
+  for (const seq of event.sourceEventSeqs ?? []) {
+    const inherited = cache.get(seq)
+    if (inherited != null) return inherited
+  }
+  return null
+}
+
 /**
  * 把 blocks 的中间挖掉，保留头 headChars 与尾 tailChars，中间插入 marker。
  *
@@ -151,7 +163,7 @@ export function decideAction({ inTail, tool, neverPruneTools, verdict, charsBefo
  * 于是 `budget = 0`（没有结果超过体积阈值）→ 一条都不裁，这正是"不做无谓动作"的保证。
  *
  * @param {Array<{seq:number,index:number,tool:string,chars:number,gain:number,prob:number|null,
- *   effectProb:number|null,verdict:object|null,inTail:boolean,blacklisted:boolean}>} nodes
+ *   effectProb:number|null,verdict:object|null,inTail:boolean,blacklisted:boolean,alreadyPruned?:boolean}>} nodes
  * @param {object} cfg
  * @returns {{mode:string,selected:Set<number>,budget:number,spent:number,poolSize:number,
  *   keptByCeiling:number,note:string}|null} null = 不用预算模式（调用方退回逐节点裁决）
@@ -166,7 +178,7 @@ export function planTrims(nodes, cfg = {}) {
   // 缺失/非法一律钳到 0（失败方向：解析不出压力就不动手，与两层的门控口径一致）。
   const ratio = Math.min(1, Math.max(0, Number(cfg.pressureRatio) || 0))
 
-  const eligible = nodes.filter((n) => !n.inTail && !n.blacklisted && n.verdict != null
+  const eligible = nodes.filter((n) => !n.inTail && !n.blacklisted && !n.alreadyPruned && n.verdict != null
     && n.gain >= minGain && n.chars >= (cfg.minCharsToPrune ?? 400))
   const ceilingProtected = eligible.filter((n) => typeof n.prob === 'number' && n.prob >= keepCeiling)
   // 修 null 排序 bug：prob 缺失（result 轴批次失败）时**不进池子**，更不能被当成 0 优先裁。
@@ -241,9 +253,12 @@ export function pruneSessionWithJev({ pruner, session, cache, cfg, stats, freeze
     const marker = Array.from(cfg.marker ?? JEV_PRUNE_MARKER).length
     const gain = chars - (cfg.headChars + cfg.tailChars) - marker
     const tool = toolNameOf(event)
-    const verdict = cache?.get(seq) ?? null
+    const verdict = cachedVerdictForEvent(cache, event)
+    const alreadyPruned = Array.isArray(blocks) && blocks.some(
+      (block) => typeof block?.text === 'string' && block.text.includes(cfg.marker ?? JEV_PRUNE_MARKER),
+    )
     nodes.push({
-      seq, index, event, original, result, blocks, chars, gain, tool, verdict,
+      seq, index, event, original, result, blocks, chars, gain, tool, verdict, alreadyPruned,
       inTail: index > lastAllowed,
       blacklisted: isToolIn(cfg.neverPruneTools, tool),
       prob: typeof verdict?.prob === 'number' ? verdict.prob : null,
@@ -265,13 +280,14 @@ export function pruneSessionWithJev({ pruner, session, cache, cfg, stats, freeze
 
     let action
     let reason
-    if (planned != null) {
+    if (node.inTail) { action = 'keep'; reason = 'tail' }
+    else if (node.blacklisted) { action = 'keep'; reason = 'blacklist' }
+    else if (node.alreadyPruned) { action = 'keep'; reason = 'already-pruned' }
+    else if (planned != null) {
       // 预算模式：由全局计划裁决。
       // ⚠️ 无判定的节点**仍走 fallback**（退回 DSH 原生按体积裁决）——预算模式只改
       // "Jev 驱动的决策"，不改兜底契约。这条由 smoke 的"三条候选都走到 pruneContent"钉住。
-      if (node.inTail) { action = 'keep'; reason = 'tail' }
-      else if (node.blacklisted) { action = 'keep'; reason = 'blacklist' }
-      else if (verdict == null) { action = 'fallback'; reason = 'no-verdict-fallback' }
+      if (verdict == null) { action = 'fallback'; reason = 'no-verdict-fallback' }
       else if (charsBefore < (cfg.minCharsToPrune ?? 400)) { action = 'keep'; reason = 'too-short' }
       else if (node.gain < (cfg.minGainChars ?? 40)) { action = 'keep'; reason = 'no-gain' }
       else if (planned.has(seq)) { action = 'prune'; reason = `selected(${plan.mode})` }
@@ -298,6 +314,7 @@ export function pruneSessionWithJev({ pruner, session, cache, cfg, stats, freeze
     if (action === 'keep') {
       if (index > lastAllowed) stats.keptByTail += 1
       else if (isToolIn(cfg.neverPruneTools, tool)) stats.keptByBlacklist += 1
+      else if (node.alreadyPruned) { /* 已裁节点只跳过，不重复计入保留统计 */ }
       else if (verdict?.keep) stats.keptByJev += 1
       else if (planned != null) stats.keptByBudget = (stats.keptByBudget ?? 0) + 1
     }

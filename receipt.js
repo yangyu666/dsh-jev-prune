@@ -27,11 +27,11 @@
  * 是为了**在花钱之前**就把非法范围筛掉，而不是等 API 报错。
  */
 
-import { countChars, isToolIn, normalizeToolName } from './prune.js'
+import { cachedVerdictForEvent, countChars, isToolIn, normalizeToolName } from './prune.js'
 
 // 归一化工具在 prune.js（依赖链最底层）——两层的安全黑名单共用同一套比较。
 // 这里转出以保持既有 import 路径（check.js / 调用方）不变。
-export { isToolIn, normalizeToolName }
+export { cachedVerdictForEvent, isToolIn, normalizeToolName }
 
 /** 回执文本的识别前缀（用于判断某个 checkpoint 是不是我们写的）。 */
 export const RECEIPT_MARKER = '[已压缩 · 确定性回执]'
@@ -75,18 +75,6 @@ export const DEFAULT_FLOOR_THRESHOLD = 0.2
 
 /** 降级模式仍要求的最低样本量：低于它连"分布"都谈不上，宁可不做。 */
 export const DEFAULT_MIN_CANDIDATES_FOR_FLOOR = 2
-
-/** Resolve a cached judgment through a layer-1 replacement's source seq. */
-export function cachedVerdictForEvent(cache, event) {
-  if (cache == null || event == null) return null
-  const direct = cache.get(event.seq)
-  if (direct != null) return direct
-  for (const seq of event.sourceEventSeqs ?? []) {
-    const inherited = cache.get(seq)
-    if (inherited != null) return inherited
-  }
-  return null
-}
 
 /**
  * 证据守卫必须扫描当前结果及其完整来源链。
