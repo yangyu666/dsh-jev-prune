@@ -108,6 +108,55 @@ function makeSession(plan) {
   return session
 }
 
+/** 一个 assistant 消息并行发出 6 个 read，随后跟 6 个结果（issue #39 真实形态）。 */
+function makeBatchSession() {
+  const events = new Map()
+  let nextSeq = 1
+  const appended = []
+  const add = (type, data, options = {}) => {
+    const seq = nextSeq++
+    events.set(seq, { seq, type, data, ...options })
+    return seq
+  }
+  add('user/message', { content: [{ type: 'text', text: '批量读六个文件。' }], source: { kind: 'user' } })
+  const calls = Array.from({ length: 6 }, (_, i) => ({
+    type: 'tool-call', id: `batch-${i + 1}`, name: 'Read',
+    arguments: { file_path: `src/file-${i + 1}.js` },
+  }))
+  const head = add('assistant/message', {
+    message: { content: [{ type: 'text', text: '批量读取。' }, ...calls] },
+  })
+  const results = calls.map((call, i) => add('tool/result', {
+    message: {
+      source: { callId: call.id },
+      content: [{ type: 'tool-result', content: [{ type: 'text', text: String(i + 1).repeat(3000) }] }],
+    },
+  }))
+  add('assistant/message', { message: { content: [{ type: 'text', text: '继续。' }] } })
+  const session = {
+    seqs: Object.fromEntries(results.map((seq, i) => [`s${i + 1}`, seq])),
+    steps: [{ head, results }],
+    appended,
+    surface: { nodes: [...events.keys()] },
+    eventAt: (seq) => events.get(seq) ?? null,
+    deriveEventMessage: (event) => event.data.message,
+    append(type, data, options) {
+      const seq = add(type, data, options)
+      appended.push({ seq, type, data, options })
+      const op = options?.surfaceOp
+      if (op === 'append') session.surface.nodes.push(seq)
+      else if (op?.op === 'replace') {
+        const start = session.surface.nodes.indexOf(op.startSeq)
+        const end = session.surface.nodes.indexOf(op.endSeq)
+        if (start < 0 || end < start) throw new Error(`fake surface replace: 非法区间 ${op.startSeq}-${op.endSeq}`)
+        session.surface.nodes.splice(start, end - start + 1, seq)
+      }
+      return { seq }
+    },
+  }
+  return session
+}
+
 function makePruner() {
   let pruneContentCalls = 0
   return {
@@ -473,6 +522,59 @@ function eligibleSeqsFrom(report) {
     check('回执记录了 Glob 的 pattern 与 path', call.summary.includes('*.ts server/src'))
     check('回执写明了被移出的 seq 范围与字符数', /s\d+–s\d+/.test(call.summary) && /字符输出/.test(call.summary))
   }
+}
+
+// ---------- C1. issue #39：6 个并行 read 中 5 个合格，只替换这 5 个结果 ----------
+{
+  const pruner = makePruner()
+  const session = makeBatchSession()
+  const compaction = makeCompaction(session)
+  const ctx = makeCtx({ pruner, session, compaction })
+  const resultPreset = {}
+  const effectPreset = {}
+  const resultSeqs = Object.values(session.seqs)
+  for (const seq of resultSeqs) {
+    resultPreset[seq] = 0.05
+    effectPreset[seq] = 0.04
+  }
+  const protectedSeq = resultSeqs[2]
+  resultPreset[protectedSeq] = 0.9
+  effectPreset[protectedSeq] = 0.9
+  const judge = fakeJudge(resultPreset, effectPreset)
+  mod.apply(ctx, {
+    ...PLUGIN_CFG,
+    compactOn: 'always',
+    compactMode: 'absolute',
+    compactThreshold: 0.5,
+    compactPreserveRecent: 0,
+    compactMinChars: 1000,
+  }, { judge })
+
+  await ctx.waterfall('agent/pre-step', { agent: { session, options: {} } }, () => {})
+
+  // 部分路径使用单节点 replace，不调用要求整段平衡的 compactRegion。
+  check('批量 6-read 的部分回执不调用不支持子集的 compactRegion', compaction.calls.length === 0,
+    `实际 ${compaction.calls.length}`)
+  const surfaceResults = session.surface.nodes
+    .map((seq) => session.eventAt(seq))
+    .filter((event) => event?.type === 'tool/result')
+  const texts = surfaceResults.map((event) => event.data.message.content[0].content[0].text)
+  check('6 个结果仍全部留有配对外壳', surfaceResults.length === 6, `实际 ${surfaceResults.length}`)
+  check('其中 5 个合格结果被替换为确定性回执',
+    texts.filter((text) => text.includes('[已压缩 · 确定性回执]')).length === 5,
+    `回执数=${texts.filter((text) => text.includes('[已压缩 · 确定性回执]')).length}`)
+  check('唯一不合格结果保持原始 3000 字符正文', texts.some((text) => text === '3'.repeat(3000)))
+
+  const head = session.eventAt(session.steps[0].head)
+  const callCount = head.data.message.content.filter((block) => block.type === 'tool-call').length
+  check('assistant 的 6 个 tool-call 未被改写', callCount === 6, `实际 ${callCount}`)
+  check('最终 surface 的 call/result 数仍为 6/6，配对平衡', callCount === surfaceResults.length,
+    `${callCount}/${surfaceResults.length}`)
+
+  const statusTool = ctx.registeredTools.find((tool) => tool?.name === 'jev_prune_status')
+  const status = await statusTool.execute({}, { agent: { session, options: {} } })
+  check('部分回执计入 compactions > 0', /回执压缩 [1-9]\d* 段/.test(status), status.split('\n').find((l) => l.includes('第二层')))
+  check('部分回执计入 receiptSummaries > 0', /回执摘要被消费 [1-9]\d* 次/.test(status), status.split('\n').find((l) => l.includes('第二层')))
 }
 
 // ---------- C2. 第二层 · 手动路径：dry-run 先看，再真跑 ----------

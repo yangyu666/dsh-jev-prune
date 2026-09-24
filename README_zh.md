@@ -24,7 +24,7 @@ DSH 自带的上下文回收是**纯体积**的：工具结果超过阈值就掐
 | 层 | 接管点 | DSH 默认行为 | 本插件 |
 |---|---|---|---|
 | **1 · 结果裁剪** | `ctx.toolResultPruner.pruneSession` | 超过 `thresholdChars` 掐中间 | Jev 判定每个工具结果「接下来还要不要」，要的**再大也不裁**，过期的**再小也裁**（短于 `minCharsToPrune` 的除外）；无判定时退回 DSH 原生行为 |
-| **2 · 回执压缩** | `ctx.compaction.summarize` + `compactRegion` | 模型读原历史、写摘要 | 把已花掉的只读探查（整对 `tool-call` + `tool/result`）移出 surface，注入**确定性回执**：工具名、命令、路径、字符数、seq 全由代码算出 |
+| **2 · 回执压缩** | `ctx.compaction.summarize` + `compactRegion`；混合批次则做单结果 surface 替换 | 模型读原历史、写摘要 | 全部合格的只读步骤整段移出；并行批次只有部分结果合格时，保留全部调用/结果外壳，只把合格结果正文换成**确定性回执**。工具名、命令、路径、字符数、seq 全由代码算出 |
 
 第二层的回执长这样：
 
@@ -34,6 +34,8 @@ DSH 自带的上下文回收是**纯体积**的：工具结果超过阈值就掐
 · s27 read：C:\Users\you\project\src\state.js → 16489 字符输出
 原始事件仍完整保存在会话日志中（seqs 25–27）。需要内容时重跑相同命令/读取相同文件即可。
 ```
+
+并行工具批次按每一对 call/result 独立判定。DSH 0.1.5 只能原子替换一个 surface 节点，或替换一个配对平衡的连续区间，不能从同一条 6-call assistant 消息里一次抽走其中 5 对。因此遇到混合批次时，插件使用 DSH 原生的单节点 `replace` 协议，把每个合格 `tool/result` 的正文换成短回执；不合格及最近区结果逐字保留，assistant 头不改，每次替换前后工具配对都完整。call 与 result 按 `callId` 匹配，允许并行结果以不同顺序完成。整批全部合格时仍走 `compactRegion`，移出整个平衡步骤。
 
 ## 门控（第二层）
 

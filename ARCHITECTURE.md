@@ -32,8 +32,8 @@ The dependency direction stays toward the pure modules. Host APIs must remain in
 
 1. A prepended `agent/pre-step` hook builds the current state and asks Jev only for missing verdict axes.
 2. DSH's `compaction-basic` hook calls the synchronously overridden `toolResultPruner.pruneSession`. Layer 1 reads the verdict cache and replaces stale result bodies with head/marker/tail content.
-3. The normal second plugin hook selects balanced, contiguous read-only ranges whose result and effect verdicts are both low.
-4. `compactRegion` runs through the host engine. A one-use ownership token lets the temporary `summarize` override inject a deterministic receipt only for that transaction.
+3. The normal second plugin hook selects read-only call/result pairs whose result and effect verdicts are both low. Fully eligible steps become balanced contiguous ranges; mixed parallel batches become per-result replacements matched by `callId`.
+4. Full ranges run through `compactRegion`. A one-use ownership token lets the temporary `summarize` override inject a deterministic receipt only for that transaction. Mixed batches use DSH's single-node shadow-price + `tool/result` replacement protocol, preserving every pair envelope and every rejected result.
 5. Original events remain in the session log. The surface points to replacement or compaction events, and `jev_restore` can retrieve the shadowed text.
 
 ## State and identity
@@ -52,6 +52,6 @@ The pressure ratio is also session-scoped. `judgePass` computes it asynchronousl
 - Inject a receipt only when the active transaction owns the pending token.
 - Keep deterministic receipts factual: tool, arguments, seq, and output size; no model-generated conclusion.
 
-## Known boundary
+## Parallel batch boundary
 
-One assistant message may contain several parallel tool calls. They share one head event, so the current contiguous-range API cannot remove only a subset of their results without breaking pairing. Issue #39 tracks the required atomic event-rewrite or host-level sub-step protocol.
+One assistant message may contain several parallel tool calls. They share one head event, and DSH 0.1.5's contiguous-range API cannot remove only a subset of those pairs. Mixed batches therefore compact eligible result bodies in place; only a fully eligible batch removes its assistant head and result nodes. This keeps the surface valid without fabricating assistant messages or depending on an unsupported multi-node insertion API.

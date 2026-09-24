@@ -24,7 +24,7 @@ This plugin replaces the decision in both places with Jev's structured output (`
 | Layer | Interception point | DSH default | This plugin |
 |---|---|---|---|
 | **1 · Result trimming** | `ctx.toolResultPruner.pruneSession` | Chops the middle once `thresholdChars` is exceeded | Jev decides, per tool result, whether it will still be needed. Needed ones are **never trimmed, however large**; stale ones are trimmed **however small** (unless shorter than `minCharsToPrune`); with no judgment available it falls back to DSH's original behaviour |
-| **2 · Receipt compaction** | `ctx.compaction.summarize` + `compactRegion` | The model reads the raw history and writes a summary | Moves spent read-only probes (whole `tool-call` + `tool/result` pairs) out of the surface and injects a **deterministic receipt**: tool name, command, path, character count and seq are all computed by code |
+| **2 · Receipt compaction** | `ctx.compaction.summarize` + `compactRegion`, or a single-result surface replacement for mixed batches | The model reads the raw history and writes a summary | Moves fully eligible read-only steps out of the surface. In a parallel batch where only some results qualify, it keeps every call/result envelope and replaces only the eligible result bodies with **deterministic receipts**. Tool name, command, path, character count and seq are all computed by code |
 
 A layer-2 receipt looks like this:
 
@@ -34,6 +34,8 @@ A layer-2 receipt looks like this:
 · s27 read：C:\Users\you\project\src\state.js → 16489 字符输出
 原始事件仍完整保存在会话日志中（seqs 25–27）。需要内容时重跑相同命令/读取相同文件即可。
 ```
+
+Parallel tool batches are evaluated per call/result pair. DSH 0.1.5 can replace one surface node or one balanced contiguous region, but cannot remove five pairs from a six-call assistant message in one atomic operation. For a mixed batch, the plugin therefore replaces each eligible `tool/result` body with a short receipt through DSH's native single-node `replace` protocol; rejected and recent results remain byte-for-byte unchanged, the assistant head stays intact, and tool pairing remains valid after every replacement. Results are matched to calls by `callId`, so completion order may differ from declaration order. A fully eligible batch still uses `compactRegion` and removes the whole balanced step.
 
 > The receipt body is emitted by the plugin's own JavaScript, so its wording is Chinese today — as is the `/jev` status output. The `jev_*` tool descriptions are already English. Localizing the runtime strings is a separate change.
 
