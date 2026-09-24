@@ -22,6 +22,10 @@
     "verify_real_shapes.mjs",
     "cordis.patch.yml",
     "assets",
+    "examples",
+    "ARCHITECTURE.md",
+    "PORTING.md",
+    "CONTRIBUTING.md",
     "README.md",
     "README_zh.md",
     "LICENSE"
@@ -30,7 +34,9 @@
     "node": "^22.19.0 || >=24.0.0"
   },
   "scripts": {
-    "check": "node check.js"
+    "check": "node check.js",
+    "smoke": "node smoke_apply.mjs",
+    "coverage": "node --experimental-test-coverage --test --test-coverage-include=jev.js --test-coverage-include=prune.js --test-coverage-include=receipt.js --test-coverage-include=state.js --test-coverage-lines=90 --test-coverage-branches=75 --test-coverage-functions=75 check.js smoke_apply.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/dsh-tools": "^0.1.5-rc.2",

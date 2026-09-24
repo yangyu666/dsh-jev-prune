@@ -1,0 +1,27 @@
+name: Feature request
+description: Propose a focused change to pruning, receipts, tooling, or portability.
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the concrete workflow or failure mode, not only the proposed implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and compatibility impact
+      description: Note effects on tool pairing, evidence retention, DSH versions, and existing configuration.
+  - type: textarea
+    id: validation
+    attributes:
+      label: Suggested validation

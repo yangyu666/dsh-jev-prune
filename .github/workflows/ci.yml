@@ -10,26 +10,47 @@ jobs:
   # 用 npm ci + 提交的 lockfile 精确复现测试条件（issue #19：peer "*" + 浮动安装
   # 曾解析到 0.0.1-rc.1，"针对 0.1.5-rc.2 测试"无法复现）
   unit:
+    name: unit (${{ matrix.os }}, Node ${{ matrix.node }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [22, 24]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: Install dependencies (locked)
+        run: npm ci --no-audit --no-fund
+      - name: Assert peer versions match testedAgainst
+        run: node -e "const v = require('@deepseek-ai/dsh-tools/package.json').version; console.log('dsh-tools = ' + v); if (!/^0\.1\.5-rc/.test(v)) { console.error('dsh-tools 应在 0.1.5-rc 线，实际 ' + v); process.exit(1) }"
+      - name: Make plugin resolvable as its package name
+        run: node --input-type=module -e "import { copyFileSync, mkdirSync } from 'node:fs'; const out='node_modules/dsh-jev-prune'; mkdirSync(out,{recursive:true}); for (const f of ['index.js','jev.js','state.js','prune.js','receipt.js','package.json','cordis.patch.yml']) copyFileSync(f, out+'/'+f)"
+      - name: Pure-function checks
+        run: node check.js
+      - name: Smoke test (fake ctx, real apply)
+        run: node smoke_apply.mjs
+
+  # 原生 V8 覆盖率：复用现有断言，不引入额外测试框架。阈值低于当前基线
+  # （lines 95.88 / branches 82.84 / functions 94.69），既能阻止明显倒退，也给
+  # Node 22/24 的插桩差异留出余量。
+  coverage:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
       - name: Install dependencies (locked)
         run: npm ci --no-audit --no-fund
-      - name: Assert peer versions match testedAgainst
-        run: |
-          echo "dsh-tools = $(node -p "require('@deepseek-ai/dsh-tools/package.json').version")"
-          node -e "const v = require('@deepseek-ai/dsh-tools/package.json').version; if (!/^0\.1\.5-rc/.test(v)) { console.error('dsh-tools 应在 0.1.5-rc 线，实际 ' + v); process.exit(1) }"
       - name: Make plugin resolvable as its package name
-        run: |
-          mkdir -p node_modules/dsh-jev-prune
-          cp index.js jev.js state.js prune.js receipt.js package.json cordis.patch.yml node_modules/dsh-jev-prune/
-      - name: Pure-function checks
-        run: node check.js
-      - name: Smoke test (fake ctx, real apply)
-        run: node smoke_apply.mjs
+        run: node --input-type=module -e "import { copyFileSync, mkdirSync } from 'node:fs'; const out='node_modules/dsh-jev-prune'; mkdirSync(out,{recursive:true}); for (const f of ['index.js','jev.js','state.js','prune.js','receipt.js','package.json','cordis.patch.yml']) copyFileSync(f, out+'/'+f)"
+      - name: Core-module coverage gate
+        run: npm run coverage
 
   # 集成：装完整 DSH 依赖树。issue #20：此前该作业跑的两个脚本都不 import 任何 DSH 包，
   # "在真实宿主依赖环境下验证"名不副实——现在至少真实加载一次插件模块与 dsh-llm，

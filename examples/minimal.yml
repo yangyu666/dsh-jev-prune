@@ -1,0 +1,10 @@
+- insert:
+    - id: jev-prune
+      name: dsh-jev-prune
+      config:
+        judgeOn: pressure
+        softLimit: "55%"
+        compactReceipts: true
+        compactOn: pressure
+        compactSoftLimit: "70%"
+        dryRun: true

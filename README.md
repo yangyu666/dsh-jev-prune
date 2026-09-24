@@ -7,7 +7,7 @@ Structured judgments from [TypeSafe Jev](https://typesafe.ai) drive DSH's two-la
 
 **English** · [简体中文](README_zh.md)
 
-![license](https://img.shields.io/badge/license-MIT-blue) ![node](https://img.shields.io/badge/node%20%3E%3D22.19-339933) ![dsh](https://img.shields.io/badge/DSH-0.1.x--rc-orange) [![CI](https://github.com/yangyu666/dsh-jev-prune/actions/workflows/ci.yml/badge.svg)](https://github.com/yangyu666/dsh-jev-prune/actions/workflows/ci.yml) ![smoke checks](https://img.shields.io/badge/smoke%20checks-56%20passing-success)
+![license](https://img.shields.io/badge/license-MIT-blue) ![node](https://img.shields.io/badge/node%20%3E%3D22.19-339933) ![dsh](https://img.shields.io/badge/DSH-0.1.x--rc-orange) [![CI](https://github.com/yangyu666/dsh-jev-prune/actions/workflows/ci.yml/badge.svg)](https://github.com/yangyu666/dsh-jev-prune/actions/workflows/ci.yml) ![smoke checks](https://img.shields.io/badge/smoke%20checks-104%20passing-success)
 
 ## The problem it solves
 
@@ -80,6 +80,8 @@ The fix issues an **ownership token** (fencing token) per compaction, with three
 **Version alignment**: the peer range for `@deepseek-ai/dsh-tools` is `^0.1.5-rc.2` — the tested version `0.1.5-rc.2` sits on npm's `next` tag, not `latest`. A lockfile is committed (devDependencies pin the tested versions), so `npm ci` reproduces the exact test conditions.
 
 **Compatibility**: tested against `@deepseek-ai/dsh@0.1.5-rc.2`. DSH 0.1.x is a pre-release line, and event shapes and service names can shift between rc versions. After upgrading DSH, re-run `npm run check` and the smoke test, and call `jev_probe_shapes` once in a real session to verify the field assumptions.
+
+Project documentation: [contributing](CONTRIBUTING.md), [architecture](ARCHITECTURE.md), [porting contract](PORTING.md), and [configuration examples](examples/README.md).
 
 ## Install
 
