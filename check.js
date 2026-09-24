@@ -24,6 +24,7 @@ import {
   RECEIPT_MARKER,
   balancedAfter,
   balancedBefore,
+  cachedVerdictForEvent,
   computeCuts,
   computeEligibleSeqs,
   isToolIn,
@@ -762,6 +763,25 @@ const run = ({ events, cache, cfg, threshold }) => {
   }
   // quantile=0 的语义是字面意义"一条不取"（此前 Math.max(1,…) 反而取 1 条）
   assert.equal(computeEligibleSeqs(verdicts, { quantile: 0, minCandidates: 4 }).size, 0)
+  assert.equal(computeEligibleSeqs(verdicts.slice(0, 2), { quantile: 0, minCandidates: 4 }).size, 0,
+    'quantile=0 必须在小样本降级之前生效，2 条低分候选也不得被重新选中')
+
+  // 两轴各取 1 条但不是同一节点时，交集为空；严格绝对下限仍可救回两轴都很低的节点。
+  let fallbackNote = ''
+  const disjoint = computeEligibleSeqs([
+    { seq: 1, prob: 0.01, effectProb: 0.90 },
+    { seq: 2, prob: 0.90, effectProb: 0.01 },
+    { seq: 3, prob: 0.10, effectProb: 0.10 },
+    { seq: 4, prob: 0.80, effectProb: 0.80 },
+  ], { quantile: 0.25, minCandidates: 4, onNote: (note) => { fallbackNote = note } })
+  assert.deepEqual([...disjoint], [3], '相对尾部交集为空时应降级到两轴绝对下限')
+  assert.match(fallbackNote, /交集为空.*绝对下限/, '降级必须通过 onNote 对外可见')
+
+  const cached = { keep: false, prob: 0.1, effectProb: 0.1 }
+  const cache = new Map([[7, cached]])
+  assert.equal(cachedVerdictForEvent(cache, { seq: 7 }), cached, '当前 seq 直接命中优先')
+  assert.equal(cachedVerdictForEvent(cache, { seq: 70, sourceEventSeqs: [7] }), cached,
+    '第一层 replacement 必须沿 sourceEventSeqs 找回旧 seq 的判定')
 }
 
 // ---------------------------------------------------------------- 范围选择
@@ -1476,6 +1496,7 @@ const run = ({ events, cache, cfg, threshold }) => {
   // ① schemastery 层必须响亮地拒绝（不是静默 clamp）
   assert.throws(() => Config({ preserveRecent: -5 }), /expected number >= 0/,
     'Config 应对越界值抛错，而不是悄悄改掉')
+  assert.throws(() => Config({ compactPreserveRecent: -1 }), /expected number >= 0/)
   assert.throws(() => Config({ receiptMaxRatio: 5 }), /expected number <= 1/)
 
   // ② 我们的钳制层：越界 → 回落到默认值（而不是钳到边界）
@@ -1484,6 +1505,8 @@ const run = ({ events, cache, cfg, threshold }) => {
   assert.ok(neg[CONFIG_WARNINGS].some((w) => /preserveRecent/.test(w)), '钳制必须留下告警')
   assert.ok(/低于下限/.test(neg[CONFIG_WARNINGS][0]), `告警应说明原因：${neg[CONFIG_WARNINGS][0]}`)
   assert.ok(/已改为 4/.test(neg[CONFIG_WARNINGS][0]), '告警应同时给出改后的值')
+  assert.equal(resolveConfig({ compactPreserveRecent: -1 }).compactPreserveRecent, 1,
+    '第二层独立最近区的非法值应回落默认 1')
 
   // ②b 第二层永久静默失效：maxStepTextChars=-1 会让每一步都 text > -1
   assert.equal(resolveConfig({ maxStepTextChars: -1 }).maxStepTextChars, 1200)
@@ -1565,8 +1588,9 @@ const run = ({ events, cache, cfg, threshold }) => {
 
 
   // 合法值必须原样保留（钳制不能顺手改掉正常配置）
-  const ok = resolveConfig({ preserveRecent: 0, headChars: 0, maxStepTextChars: 5000, receiptMaxRatio: 1 })
+  const ok = resolveConfig({ preserveRecent: 0, compactPreserveRecent: 0, headChars: 0, maxStepTextChars: 5000, receiptMaxRatio: 1 })
   assert.equal(ok.preserveRecent, 0, '0 是合法值（不保护最近区），不得被当成缺省')
+  assert.equal(ok.compactPreserveRecent, 0, '第二层最近区也允许显式设为 0')
   assert.equal(ok.headChars, 0)
   assert.equal(ok.maxStepTextChars, 5000)
   assert.equal(ok.receiptMaxRatio, 1, '1 是上界本身，闭区间内')

@@ -43,7 +43,7 @@ DSH 自带的上下文回收是**纯体积**的：工具结果超过阈值就掐
 - 工具不在 `neverCompactTools`（改写类调用按硬规则永不移出）
 - **证据守卫**：结果命中 `error` / `assert` / `fail` / `todo` 等词不移出（仍可被第一层截断）
 - assistant 消息的**可见文本**超过 `maxStepTextChars`、或**思考草稿**（`reasoning`）超过 `maxStepReasoningChars` 的步骤不移出。两者**分开统计**：text 长说明这一步在交代结论（该守），reasoning 长只是模型草稿写得多（不代表有承重信息）。合并成一个预算时，光靠 reasoning 长度就能把第二层静默关掉
-- 落在最近 `preserveRecent` 个节点内不移出
+- 第二层不移出最近 `compactPreserveRecent` 个节点（第一层仍使用 `preserveRecent`）
 - 区间两端满足 DSH 的工具配对平衡；整段至少能省 `compactMinChars` 字符；回执 token 低于原内容的 `receiptMaxRatio`
 
 概率的使用方式是**相对分位**而不是固定阈值：判断型小模型的输出分布很窄，只有同一会话内的相对排序携带稳定信息。
@@ -108,13 +108,14 @@ node wire_profile.mjs <DSH_HOME> <profile名>
 | `keepFloorThreshold` / `minCandidatesForBudget` | `0.2` / `4` | `budget` 模式小样本降级：判定候选不足 4 条时，只有 `P(保留) < 0.2` 的结果可裁（与第二层同款降级形态） |
 | `budgetMinChars` | `0` | ⚠️ **已废弃**（保留仅为兼容）：同上，不再生效 |
 | `resultExcerptChars` | `240` | 第一层：写入判定 state 的每条结果摘录预算（见下文）；`0` 恢复盲判的 `ok, N chars` 行 |
-| `preserveRecent` | `4` | 最近 N 个 surface 节点两层都不碰 |
+| `preserveRecent` | `4` | 第一层不碰最近 N 个 surface 节点 |
 | `headChars` / `tailChars` | `600` / `200` | 第一层裁剪保留的头/尾字符数 |
 | `minCharsToPrune` | `400` | 第一层：短于该长度不裁 |
 | `judgeOn` / `softLimit` | `pressure` / `55%` | 第一层判定时机与压力线 |
 | `compactReceipts` / `compactOn` | `true` / `pressure` | 第二层开关与压力线（`compactSoftLimit` 默认 70%） |
 | `compactMode` | `relative` | `relative`（推荐）或 `absolute`（配 `compactThreshold`） |
 | `compactQuantile` | `0.34` | 两轴各取尾部的比例，取交集 |
+| `compactPreserveRecent` | `1` | 第二层独立的最近区保护；默认只保留最近 1 个 surface 节点 |
 | `minCandidatesForRelative` | `4` | 相对分位的**最小总体规模**；低于它则降级为绝对下限模式（见下），**不是**直接放弃 |
 | `floorThreshold` / `minCandidatesForFloor` | `0.2` / `2` | 降级模式用的绝对下限（明显严于 `compactThreshold`）与其最低样本量 |
 | `neverCompactTools` | 改写类工具 | 第二层永不移出；比较时归一化（`Edit` 与 `edit` 等价） |

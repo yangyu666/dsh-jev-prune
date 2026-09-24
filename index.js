@@ -6,13 +6,14 @@
  *   Jev 说「还要」      → **不裁**（哪怕它很大 —— DSH 现在会误裁这类）
  *   Jev 说「过期了」    → **裁**（哪怕它不大 —— DSH 现在完全不碰这类，纯增量）
  *   没有判定            → 退回 DSH 原来的按体积裁决（安全兜底）
- *   落在最近 preserveRecent 个节点里 / 永不裁剪工具 → 一律不碰
+ *   第一层落在最近 preserveRecent 个节点里 / 永不裁剪工具 → 一律不碰
  *
  * ── 第二层：整对调用的「回执压缩」（接管 `ctx.compaction.summarize` + `compactRegion`）
  * DSH 自带做法：让主模型读原始历史、**写一段摘要**顶替被压缩的区间。摘要会幻觉。
  * 我们改成注入一段**确定性回执** —— 工具名、命令、路径、输出字符数、seq 全部由代码算出，
  * **不可能包含模型推断**。代价是它不解释、只开收据（原始事件仍在会话日志里，可恢复）。
- * 门控（满足全部才动）：两轴相对分位取交集 + 工具白名单 + 证据守卫 + 最近区保护 + 文本长度门控。
+ * 门控（满足全部才动）：两轴相对分位取交集 + 工具白名单 + 证据守卫
+ * + 第二层独立的 compactPreserveRecent 最近区保护 + 文本长度门控。
  *
  * 判定时机：`agent/pre-step` 里**异步**预判好、缓存按 seq；
  * 因为 `pruneSession(session)` 是**同步**方法，里面不能 await；
@@ -45,6 +46,7 @@ import {
   DEFAULT_NEVER_PRUNE_TOOLS,
   DSH_READONLY_TOOLS,
   RECEIPT_MARKER,
+  cachedVerdictForEvent,
   computeEligibleSeqs,
   renderReceipt,
   selectReceiptRanges,
@@ -241,6 +243,8 @@ export const Config = z.object({
   compactOn: z.string().default('pressure'),
   /** 第二层的压力门（比第一层保守：整对删除比截断风险大） */
   compactSoftLimit: z.string().default('70%'),
+  /** 第二层独立的最近区保护；整对移出已有两轴判定，默认只保留最后 1 个节点。 */
+  compactPreserveRecent: z.number().min(0).default(1),
   /**
    * 门控模式：relative（默认）| absolute。
    * **Jev 必须用 relative** —— 实测它的两轴概率都落在 0.05~0.37 的窄带里，
@@ -377,6 +381,7 @@ const CONFIG_RANGES = {
   receiptMaxRatio: [0, 1],
   // 非负（0 合法）
   preserveRecent: [0, 1e9],
+  compactPreserveRecent: [0, 1e9],
   headChars: [0, 1e9],
   tailChars: [0, 1e9],
   textHead: [0, 1e9],
@@ -485,6 +490,7 @@ export function resolveConfig(config = {}) {
     compactReceipts: config.compactReceipts ?? true,
     compactOn: config.compactOn ?? 'pressure',
     compactSoftLimit: config.compactSoftLimit ?? '70%',
+    compactPreserveRecent: clampConfigNumber('compactPreserveRecent', config.compactPreserveRecent, 1, (w) => warnings.push(w))[0],
     compactMode: config.compactMode ?? 'relative',
     compactQuantile: clampConfigNumber('compactQuantile', config.compactQuantile, 0.34, (w) => warnings.push(w))[0],
     minCandidatesForRelative: clampConfigNumber('minCandidatesForRelative', config.minCandidatesForRelative, DEFAULT_MIN_CANDIDATES_FOR_RELATIVE, (w) => warnings.push(w))[0],
@@ -752,6 +758,7 @@ export function apply(ctx, config, deps = {}) {
           on: cfg.compactOn,
           mode: cfg.compactMode,
           quantile: cfg.compactQuantile,
+          preserveRecent: cfg.compactPreserveRecent,
         },
         takeover,
         summaryHook,
@@ -816,11 +823,17 @@ export function apply(ctx, config, deps = {}) {
     const surface = [...session.surface.nodes]
     const eventAt = (seq) => session.eventAt(seq)
     const nameByCallId = buildToolNameIndex(sessionEvents(session))
+    // 判定缓存供两层共用。若仍按第一层较宽的 preserveRecent 选候选，第二层即使
+    // 配了更小的 compactPreserveRecent，也永远拿不到中间那批节点的两轴判定。
+    // 这里只扩大“判定”范围；第一层真正裁剪时仍由 pruneSession 的 preserveRecent 保护。
+    const judgmentPreserveRecent = cfg.compactReceipts && cfg.compactOn !== 'off'
+      ? Math.min(cfg.preserveRecent, cfg.compactPreserveRecent)
+      : cfg.preserveRecent
     const candidates = selectCandidates({
       surface,
       eventAt,
       events: sessionEvents(session),
-      preserveRecent: cfg.preserveRecent,
+      preserveRecent: judgmentPreserveRecent,
       neverPruneTools: cfg.neverPruneTools,
       marker: JEV_PRUNE_MARKER,
       nameByCallId,
@@ -1305,12 +1318,12 @@ export function apply(ctx, config, deps = {}) {
       return report
     }
     const surface = [...session.surface.nodes]
-    const onSurface = new Set(surface)
     // 分位总体必须只含**可整对移出**的节点：判定的缓存同时服务第一层（无白名单），
     // 若把白名单外/黑名单内的节点也算进总体，尾部名额会被它们占掉后被工具门白拒。
-    const verdicts = [...cache.entries()]
-      .filter(([seq, value]) => onSurface.has(seq) && isCompactableTool(value.tool, cfg))
-      .map(([seq, value]) => ({ seq, ...value }))
+    const verdicts = surface.flatMap((seq) => {
+      const value = cachedVerdictForEvent(cache, session.eventAt(seq))
+      return value != null && isCompactableTool(value.tool, cfg) ? [{ seq, ...value }] : []
+    })
     report.verdicts = verdicts.length
 
     let eligibleSeqs
@@ -1347,7 +1360,7 @@ export function apply(ctx, config, deps = {}) {
       eventAt,
       cache,
       dropVerdict: (seq) => eligibleSeqs.has(seq),
-      cfg,
+      cfg: { ...cfg, preserveRecent: cfg.compactPreserveRecent },
     })
     report.selection = selection
     report.considered = ranges.length
@@ -1408,8 +1421,12 @@ export function apply(ctx, config, deps = {}) {
         action.shadowedSeqs = result?.shadowedSeqs?.length ?? null
         action.compactionId = String(result?.compactionId ?? '')
         report.actions.push(action)
-        // surface 已经变了，这些判定不再对应任何节点 → 从缓存里清掉
-        for (const seq of spanSeqs) cache.delete(seq)
+        // surface 已经变了，这些判定不再对应任何节点 → 连同 replacement 继承的旧 key 清掉
+        for (const seq of spanSeqs) {
+          const event = session.eventAt(seq)
+          cache.delete(seq)
+          for (const sourceSeq of event?.sourceEventSeqs ?? []) cache.delete(sourceSeq)
+        }
       } catch (error) {
         stats.errors += 1
         action.error = error?.message ?? String(error)
@@ -1592,7 +1609,8 @@ export function apply(ctx, config, deps = {}) {
         ? [`判定请求：本 pass 无重试（本会话累计重试 ${judge.retries} 次、累计请求 ${judge.requests} 次）`]
         : []),
       `第二层：summarize=${summaryHook.installed ? '已接管' : `未接管(${summaryHook.reason || '未尝试'})`}   `
-        + `compactOn=${cfg.compactOn}   ${cfg.compactMode}${cfg.compactMode === 'relative' ? `(quantile=${cfg.compactQuantile})` : `(<${cfg.compactThreshold})`}`,
+        + `compactOn=${cfg.compactOn}   preserveRecent=${cfg.compactPreserveRecent}   `
+        + `${cfg.compactMode}${cfg.compactMode === 'relative' ? `(quantile=${cfg.compactQuantile})` : `(<${cfg.compactThreshold})`}`,
       `第二层：回执压缩 ${stats.compactions} 段 / 移出 ${stats.compactedSeqs} 节点 / 省约 ${stats.compactedChars} 字符   `
         + `回执摘要被消费 ${stats.receiptSummaries} 次   压力跳过 ${stats.compactSkipped} 次`
         // 竞态计数只在非零时出现：它是异常路径，常态下不该占版面（issue #29）

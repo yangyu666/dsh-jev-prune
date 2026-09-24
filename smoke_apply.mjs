@@ -91,8 +91,17 @@ function makeSession(plan) {
     deriveEventMessage: (event) => event.data.message,
     append(type, data, options) {
       const seq = nextSeq++
-      events.set(seq, { seq, type, data })
+      events.set(seq, { seq, type, data, ...options })
       appended.push({ seq, type, data, options })
+      const op = options?.surfaceOp
+      if (op === 'append') {
+        session.surface.nodes.push(seq)
+      } else if (op?.op === 'replace') {
+        const start = session.surface.nodes.indexOf(op.startSeq)
+        const end = session.surface.nodes.indexOf(op.endSeq)
+        if (start < 0 || end < start) throw new Error(`fake surface replace: 非法区间 ${op.startSeq}-${op.endSeq}`)
+        session.surface.nodes.splice(start, end - start + 1, seq)
+      }
       return { seq }
     },
   }
@@ -975,7 +984,12 @@ async function layer2Run(effectOfS2) {
   const resultSeqs = session.surface.nodes.filter((q) => session.eventAt(q)?.type === 'tool/result')
   const probs = Object.fromEntries(resultSeqs.map((q) => [q, 0.05]))
   const judge = fakeJudge(probs, probs)
-  mod.apply(ctx, { ...PLUGIN_CFG, compactOn: 'pressure' }, { judge })
+  mod.apply(ctx, {
+    ...PLUGIN_CFG,
+    compactOn: 'always',
+    compactQuantile: 1,
+    compactPreserveRecent: 0,
+  }, { judge })
 
   const chain = ctx.handlers.get('agent/pre-step') ?? []
   // 前提：链上有 3 个监听（基线 + 判定 + 压缩）。若只有 2 个，说明判定与压缩仍是
@@ -994,6 +1008,9 @@ async function layer2Run(effectOfS2) {
   check('因此那一刻第一层确实按 Jev 裁了，而不是 fallback 到体积规则',
     (cbcObserved?.pruned?.length ?? 0) > 0,
     `pruneSession 裁了 ${cbcObserved?.pruned?.length ?? 0} 条（0 = 判定 cache 为空、已退化为体积规则）`)
+  check('第一层替换 seq 后，第二层仍能沿 sourceEventSeqs 找回判定并压缩',
+    compaction.calls.length > 0,
+    `第二层压缩 ${compaction.calls.length} 段（0 = replacement seq 使缓存失效）`)
 }
 
 // ---------- N. 第二层被 skip 时必须落盘原因（可观测缺口） ----------
@@ -1043,6 +1060,43 @@ async function layer2Run(effectOfS2) {
   const layer2b = txt2.split('\n').find((l) => /最近（第二层）/.test(l)) ?? ''
   check('极早退的 blocked 也要落盘（compactReceipts=false）',
     /compactReceipts=false/.test(layer2b), layer2b.trim() || '（没有第二层记录）')
+}
+
+// ---------- O. 两层最近区必须真正独立（compactPreserveRecent 接线回归） ----------
+// 只把配置写进 schema / 状态页还不够：判定缓存若仍按第一层 preserveRecent 截断，
+// 第二层即使配置 compactPreserveRecent=0，也永远拿不到最近节点的两轴概率。
+// 这里保持第一层最近 4 个 surface 节点（恰好挡住最后一个 tool/result），再让第二层
+// 保留 0 个；判定范围应扩到两层里更小的窗口，因此 3 条结果都要被判定。
+{
+  const judgedWith = async (compactReceipts) => {
+    const pruner = makePruner()
+    const session = makeSession()
+    const compaction = makeCompaction(session)
+    const ctx = makeCtx({ pruner, session, compaction })
+    const resultSeqs = session.surface.nodes.filter((q) => session.eventAt(q)?.type === 'tool/result')
+    const probs = Object.fromEntries(resultSeqs.map((q) => [q, 0.05]))
+    const judge = fakeJudge(probs, probs)
+    mod.apply(ctx, {
+      ...PLUGIN_CFG,
+      dryRun: true,
+      preserveRecent: 4,
+      compactReceipts,
+      compactOn: 'always',
+      compactPreserveRecent: 0,
+    }, { judge })
+    const agentRef = { agent: { session, options: {} } }
+    await ctx.waterfall('agent/pre-step', agentRef, () => {})
+    const statusTool = ctx.registeredTools.find((t) => t?.name === 'jev_prune_status')
+    const statusText = String(await statusTool.execute({}, agentRef))
+    return Number(/第一层：判定 (\d+) 次/.exec(statusText)?.[1] ?? -1)
+  }
+
+  const firstLayerOnly = await judgedWith(false)
+  const bothLayers = await judgedWith(true)
+  check('前提：第一层 preserveRecent=4 时只判定最早的 1 条结果',
+    firstLayerOnly === 1, `实际 ${firstLayerOnly}`)
+  check('compactPreserveRecent=0 会把判定范围扩到全部 3 条结果',
+    bothLayers === 3, `实际 ${bothLayers}（若仍为 2，说明配置只展示了但没有接线）`)
 }
 
 // ---------------------------------------------------------------- 汇总

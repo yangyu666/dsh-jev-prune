@@ -45,7 +45,7 @@ Moving a whole pair out of the surface is destructive, so the default is deliber
 - The tool is not in `neverCompactTools` (write-type calls are excluded by a hard rule, never by a probability)
 - **Evidence guard**: results matching `error` / `assert` / `fail` / `todo` and friends are never moved out (layer 1 may still trim them)
 - Steps whose assistant **text** exceeds `maxStepTextChars`, or whose **`reasoning`** exceeds `maxStepReasoningChars`, are never moved out. The two are measured separately on purpose: long `text` means the step is delivering a conclusion worth keeping, while long `reasoning` is just scratch work — merging them into one budget let reasoning length alone silently shut layer 2 off
-- Anything within the most recent `preserveRecent` nodes is skipped
+- Anything within the most recent `compactPreserveRecent` nodes is skipped by layer 2 (layer 1 uses `preserveRecent`)
 - Both ends of the range must satisfy DSH's tool-pairing balance; the span must save at least `compactMinChars` characters; and the receipt must stay below `receiptMaxRatio` of the original content's tokens
 
 Probabilities are consumed as **relative quantiles**, never as a fixed threshold: the output distribution of a small judge model is narrow, and only the relative ordering *within one session* carries stable information.
@@ -110,13 +110,14 @@ node wire_profile.mjs <DSH_HOME> <profile-name>
 | `keepFloorThreshold` / `minCandidatesForBudget` | `0.2` / `4` | `budget` mode small-population fallback: with fewer than 4 judged candidates, only results with `P(keep) < 0.2` are eligible (same degraded-mode shape as layer 2) |
 | `budgetMinChars` | `0` | ⚠️ **Deprecated** (kept only for compatibility): same as above, no longer takes effect |
 | `resultExcerptChars` | `240` | Layer 1: per-result excerpt budget copied into the judge's state (see below); `0` restores the blind `ok, N chars` line |
-| `preserveRecent` | `4` | The most recent N surface nodes are left alone by both layers |
+| `preserveRecent` | `4` | Layer 1 leaves the most recent N surface nodes alone |
 | `headChars` / `tailChars` | `600` / `200` | Layer 1: how many head/tail characters a trim keeps |
 | `minCharsToPrune` | `400` | Layer 1: anything shorter is never trimmed |
 | `judgeOn` / `softLimit` | `pressure` / `55%` | Layer 1: when to judge, and the pressure line |
 | `compactReceipts` / `compactOn` | `true` / `pressure` | Layer 2: switch and pressure line (`compactSoftLimit`, default 70%) |
 | `compactMode` | `relative` | `relative` (recommended) or `absolute` (with `compactThreshold`) |
 | `compactQuantile` | `0.34` | The trailing fraction taken on each of the two axes; the intersection is used |
+| `compactPreserveRecent` | `1` | Layer 2 leaves the most recent N surface nodes alone; independent from layer 1's wider recent window |
 | `minCandidatesForRelative` | `4` | Minimum population for relative quantiles; below it the mode **degrades** to an absolute floor (see below) rather than giving up |
 | `floorThreshold` / `minCandidatesForFloor` | `0.2` / `2` | Absolute floor used in the degraded mode (materially stricter than `compactThreshold`) and its minimum sample size |
 | `neverCompactTools` | write-type tools | Layer 2 never moves these out; comparison is normalized (`Edit` ≡ `edit`) |

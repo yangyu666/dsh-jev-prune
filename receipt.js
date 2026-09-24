@@ -76,6 +76,18 @@ export const DEFAULT_FLOOR_THRESHOLD = 0.2
 /** 降级模式仍要求的最低样本量：低于它连"分布"都谈不上，宁可不做。 */
 export const DEFAULT_MIN_CANDIDATES_FOR_FLOOR = 2
 
+/** Resolve a cached judgment through a layer-1 replacement's source seq. */
+export function cachedVerdictForEvent(cache, event) {
+  if (cache == null || event == null) return null
+  const direct = cache.get(event.seq)
+  if (direct != null) return direct
+  for (const seq of event.sourceEventSeqs ?? []) {
+    const inherited = cache.get(seq)
+    if (inherited != null) return inherited
+  }
+  return null
+}
+
 /**
  * 永不**整对移出**的工具（第二层黑名单）：改写型调用是承重信息
  * （第一版实测 Jev 误删过 Edit）。比较时归一化。
@@ -334,6 +346,8 @@ export function computeEligibleSeqs(verdicts, {
   if (!Number.isFinite(quantile) || quantile < 0 || quantile > 1) {
     throw new Error(`compactQuantile 非法：${quantile}（必须是 0~1 的有限数值；配置留空/解析成 null 都会走到这里）`)
   }
+  // 0 是显式关闭值；必须先于小样本降级，否则低分候选会绕过开关。
+  if (quantile === 0) return new Set()
   const usable = (verdicts ?? []).filter(
     // 必须用 Number.isFinite：typeof NaN === 'number'，用 typeof 会让 NaN 混进总体，
     // 而排序比较 (a-b) 返回 NaN 时被 V8 当作"相等"不换位 → NaN 项按**数组位置**
@@ -368,9 +382,7 @@ export function computeEligibleSeqs(verdicts, {
     return new Set(floor.map((v) => v.seq))
   }
 
-  // quantile=0 的语义是字面意义"一条不取"（issue #6：此前 Math.max(1,…) 会反而取 1 条）
-  const take = quantile === 0 ? 0 : Math.max(1, Math.floor(usable.length * quantile))
-  if (take === 0) return new Set()
+  const take = Math.max(1, Math.floor(usable.length * quantile))
   const tailOf = (key) => new Set(
     [...usable]
       .sort((a, b) => (a[key] - b[key]) || (a.seq - b.seq))
@@ -379,7 +391,12 @@ export function computeEligibleSeqs(verdicts, {
   )
   const byResult = tailOf('prob')
   const byEffect = tailOf('effectProb')
-  return new Set([...byResult].filter((seq) => byEffect.has(seq)))
+  const intersection = new Set([...byResult].filter((seq) => byEffect.has(seq)))
+  if (intersection.size > 0) return intersection
+
+  const floor = usable.filter((v) => v.prob < floorThreshold && v.effectProb < floorThreshold)
+  onNote?.(`两轴尾部交集为空 → 降级为绝对下限模式：要求两轴同时 < ${floorThreshold}，命中 ${floor.length}/${usable.length} 条`)
+  return new Set(floor.map((v) => v.seq))
 }
 
 // ---------------------------------------------------------------- 范围选择
@@ -487,7 +504,7 @@ export function selectReceiptRanges({ surface, eventAt, cache, dropVerdict, cfg 
     }
     if (reason == null) {
       for (const seq of resultSeqs) {
-        const verdict = cache?.get(seq)
+        const verdict = cachedVerdictForEvent(cache, eventAt(seq))
         if (verdict == null || !dropVerdict(seq, verdict)) {
           reason = 'verdict'
           break
