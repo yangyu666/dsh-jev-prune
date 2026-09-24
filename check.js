@@ -731,9 +731,19 @@ const run = ({ events, cache, cfg, threshold }) => {
 
   // 小总体分支（issue #27 修复）：此前样本不足**直接返回空集** → 第二层在只读占比低的
   // 会话里静默不工作。现在改为降级到绝对下限模式，但下限阈值明显更严（0.2）。
-  // 这里样本=2（三条里取两条），低于 minCandidatesForFloor(3) → 仍然不做。
-  assert.equal(computeEligibleSeqs(verdicts.slice(0, 2), { quantile: 0.5, minCandidates: 4 }).size, 0,
-    '样本低于 minCandidatesForFloor 时仍不得做整对移出（1~2 条谈不上分布）')
+  //
+  // ⚠️ 这里必须分成**两个口径**测。原断言只用默认配置测 k=2 → 期望 0，而
+  // `computeEligibleSeqs` 的默认参数曾是硬编码字面量 `3` / `0.2`，与导出的
+  // `DEFAULT_MIN_CANDIDATES_FOR_FLOOR` / `DEFAULT_FLOOR_THRESHOLD` **分叉**：
+  // 常量改成 2 之后插件实体（走 resolveConfig，读常量）行为已变，而这行断言吃的是旧字面量、
+  // 依然全绿 —— 它测的是一个真实配置路径上不存在的数。现在默认值引用常量，
+  // 于是两个口径都必须显式写出来。
+  assert.equal(computeEligibleSeqs(verdicts.slice(0, 2), { quantile: 0.5, minCandidates: 4, minCandidatesForAbsolute: 3 }).size, 0,
+    '显式把地板设成 3 时，2 条样本仍不得做整对移出')
+  assert.equal(computeEligibleSeqs(verdicts.slice(0, 2), { quantile: 0.5, minCandidates: 4 }).size, 2,
+    '默认地板=2 时，2 条样本进绝对下限模式并全选（与 DEFAULT_MIN_CANDIDATES_FOR_FLOOR 一致）')
+  assert.equal(computeEligibleSeqs(verdicts.slice(0, 1), { quantile: 0.5, minCandidates: 4 }).size, 0,
+    '1 条样本在任何配置下都不得动作（分布的下限）')
 
   // 缺任何一轴的概率都不参与
   assert.equal(computeEligibleSeqs(

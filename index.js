@@ -1491,7 +1491,24 @@ export function apply(ctx, config, deps = {}) {
 
   ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     try {
-      await compactPass(agent, { signal })
+      const report = await compactPass(agent, { signal })
+      // 被 skip 的 pass 此前**不写** lastCompactNote（只有成功路径 :1428 与 catch 会写），
+      // 于是心跳/状态报告里留着上一轮的旧值 —— "第二层为什么没动"恰好看不见，
+      // 而这正是最需要排查的那条路径（实测踩到：跑批端只能看到 compactSkipped=4，
+      // 不知道原因）。把 report.blocked 与 selection 的逐条排除计数一并落盘。
+      if (report?.blocked) {
+        stats.lastCompactNote = report.blocked
+        if (report.quantileNote) stats.lastCompactNote += `（${report.quantileNote}）`
+        if (report.selection) {
+          const sel = report.selection
+          const parts = []
+          for (const [k, label] of [['skippedTail', 'tail'], ['skippedTool', 'tool'], ['skippedVerdict', 'verdict'], ['skippedIncomplete', 'incomplete'], ['skippedGuard', 'guard'], ['skippedText', 'text'], ['skippedReasoning', 'reasoning'], ['skippedShort', 'short']]) {
+            if (sel[k]) parts.push(`${label}:${sel[k]}`)
+          }
+          if (sel.eligibleSteps) parts.push(`eligible:${sel.eligibleSteps}`)
+          if (parts.length) stats.lastCompactNote += ` [${parts.join(' ')}]`
+        }
+      }
     } catch (error) {
       stats.errors += 1
       stats.lastCompactNote = `回执压缩失败：${error?.message ?? String(error)}`

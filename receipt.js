@@ -74,7 +74,7 @@ export const DEFAULT_MIN_CANDIDATES_FOR_RELATIVE = 4
 export const DEFAULT_FLOOR_THRESHOLD = 0.2
 
 /** 降级模式仍要求的最低样本量：低于它连"分布"都谈不上，宁可不做。 */
-export const DEFAULT_MIN_CANDIDATES_FOR_FLOOR = 3
+export const DEFAULT_MIN_CANDIDATES_FOR_FLOOR = 2
 
 /**
  * 永不**整对移出**的工具（第二层黑名单）：改写型调用是承重信息
@@ -322,8 +322,13 @@ export function scanEvidence(text, patterns) {
  */
 export function computeEligibleSeqs(verdicts, {
   quantile, minCandidates,
-  minCandidatesForAbsolute = 3,
-  floorThreshold = 0.2,
+  // ⚠️ 必须引用导出常量，不能写字面量。此前这里是硬编码的 `3` / `0.2`，
+  // 于是改 DEFAULT_MIN_CANDIDATES_FOR_FLOOR 时**这个函数的默认值不会跟着变** ——
+  // 插件实体走 resolveConfig（读常量，行为会变），而直接调本函数的地方（含 check.js）
+  // 吃的是旧字面量，两边悄悄分叉。实测：常量改成 2 后 check.js 仍全绿，
+  // 因为它绕开了配置路径，测的是另一个数。
+  minCandidatesForAbsolute = DEFAULT_MIN_CANDIDATES_FOR_FLOOR,
+  floorThreshold = DEFAULT_FLOOR_THRESHOLD,
   onNote,
 } = {}) {
   if (!Number.isFinite(quantile) || quantile < 0 || quantile > 1) {

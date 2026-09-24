@@ -48,7 +48,7 @@ DSH 自带的上下文回收是**纯体积**的：工具结果超过阈值就掐
 
 概率的使用方式是**相对分位**而不是固定阈值：判断型小模型的输出分布很窄，只有同一会话内的相对排序携带稳定信息。
 
-**小总体降级。** 只读工具在写/执行密集的会话里常常只占少数（实测只读 1/6），此时分位总体可能只有两三条——排序没有意义。这种情况**不是直接放弃**，而是降级为绝对下限模式：要求两轴**同时**低于 `floorThreshold`（默认 `0.2`，比 `compactThreshold` 明显更严，用来补偿"没有相对信息"这个缺口）。若样本连 `minCandidatesForFloor`（默认 3）都不到，则仍然不做——一两条谈不上分布。降级发生时会在报告与心跳里给出说明，不会静默发生。
+**小总体降级。** 只读工具在写/执行密集的会话里常常只占少数（实测只读 1/6），此时分位总体可能只有两三条——排序没有意义。这种情况**不是直接放弃**，而是降级为绝对下限模式：要求两轴**同时**低于 `floorThreshold`（默认 `0.2`，比 `compactThreshold` 明显更严，用来补偿"没有相对信息"这个缺口）。若样本连 `minCandidatesForFloor`（默认 2）都不到，则仍然不做——单条谈不上分布。该默认值由 3 降为 2，是为了让批量读会话实际产生的"两条候选"不再被整体跳过；单条仍然永不动作。降级发生时会在报告与心跳里给出说明，不会静默发生。
 
 ## 回执归属（fence）
 
@@ -116,7 +116,7 @@ node wire_profile.mjs <DSH_HOME> <profile名>
 | `compactMode` | `relative` | `relative`（推荐）或 `absolute`（配 `compactThreshold`） |
 | `compactQuantile` | `0.34` | 两轴各取尾部的比例，取交集 |
 | `minCandidatesForRelative` | `4` | 相对分位的**最小总体规模**；低于它则降级为绝对下限模式（见下），**不是**直接放弃 |
-| `floorThreshold` / `minCandidatesForFloor` | `0.2` / `3` | 降级模式用的绝对下限（明显严于 `compactThreshold`）与其最低样本量 |
+| `floorThreshold` / `minCandidatesForFloor` | `0.2` / `2` | 降级模式用的绝对下限（明显严于 `compactThreshold`）与其最低样本量 |
 | `neverCompactTools` | 改写类工具 | 第二层永不移出；比较时归一化（`Edit` 与 `edit` 等价） |
 | `neverPruneTools` | `Write` / `NotebookEdit` | **第一层**永不移出。比上一行**窄**：第一层只截断（可逆、原文仍在日志里），所以差异型编辑工具（`Edit`/`ApplyPatch`…）的参数可以裁；第二层是整对移出，所以那批工具仍然全守 |
 | `compactTools` | 只读工具集 | 白名单，**默认非空**（`DSH_READONLY_TOOLS`：`read`/`glob`/`grep`/`list`/`fetch`…，含 PowerShell 的 `getchilditem`/`selectstring` 等只读命令）；配成 `[]` 会**放宽**为只受黑名单约束——shell 调用也会被整对移出，属显式 opt-in 的不安全模式 |
@@ -258,7 +258,7 @@ cp smoke_apply.mjs <某目录>/ && cd <某目录>/ && node smoke_apply.mjs
 
 测试脚本与辅助工具（`check.js` / `smoke_apply.mjs` / `inspect_session.mjs` / `verify_real_shapes.mjs` / `wire_profile.mjs`）都随 npm 包发布，装好的包内可直接 `npm run check`。CI（`.github/workflows/ci.yml`）跑两组作业：仅 peer 依赖的快速冒烟 + 完整 DSH 依赖树的集成验证。
 
-覆盖：两个接入点的接管、两层完整裁决路径、append 协议、回执注入与**归属（fence）**、并发压缩竞态、门控分支（含反事实对照）、**文本/思考两轴分离**、**小总体降级**、**越界配置钳制**、**判定请求重试与批级容错**（含"本次"与"累计"两种计数口径）、**批次记账不重复**、**压力门同向关闭但在绝对阈值下仍照常动作**、**token 标定在留出集上的精度**、**压缩配额**、**`alwaysTrimRatio` 真的在改变预算**（含"确实走了预算路径而非小总体降级"的前提断言）、**session 缺失时优雅退出而非抛错**、**判定钩子被 prepend 到基线束 `compaction-basic` 之前**（在 `pruneSession` 被调用的那一刻读判定计数）、**shell 类工具默认排除**（`pwsh Remove-Item` 回归用例）。
+覆盖：两个接入点的接管、两层完整裁决路径、append 协议、回执注入与**归属（fence）**、并发压缩竞态、门控分支（含反事实对照）、**文本/思考两轴分离**、**小总体降级**、**越界配置钳制**、**判定请求重试与批级容错**（含"本次"与"累计"两种计数口径）、**批次记账不重复**、**压力门同向关闭但在绝对阈值下仍照常动作**、**token 标定在留出集上的精度**、**压缩配额**、**`alwaysTrimRatio` 真的在改变预算**（含"确实走了预算路径而非小总体降级"的前提断言）、**session 缺失时优雅退出而非抛错**、**判定钩子被 prepend 到基线束 `compaction-basic` 之前**（在 `pruneSession` 被调用的那一刻读判定计数）、**第二层被 skip 时落盘原因**（blocked 原因 + 各条排除计数——此前只有成功路径写 note，最该排查的那条路径恰好是唯一不说话的）、**降级地板在两个口径上分别钉住**（机制：显式传地板值；默认：导出常量成为唯一真相源，不再与 `computeEligibleSeqs` 自身的默认值悄悄分叉）、**shell 类工具默认排除**（`pwsh Remove-Item` 回归用例）。
 
 `smoke_apply.mjs` 里的假 `ctx` 复刻的是 cordis 的**监听器模型**，不只是方法名：同一事件多个监听、`prepend`、以及 `waterfall` 顺序——**不调用 `next()` 即否决**后续链路（含宿主内建行为）。此前它只是"一个事件一个 handler"的 Map，完全掩盖了顺序契约：第二个监听会静默覆盖第一个，`prepend` 标志被直接忽略。
 

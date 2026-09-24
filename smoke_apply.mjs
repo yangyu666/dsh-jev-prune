@@ -996,6 +996,55 @@ async function layer2Run(effectOfS2) {
     `pruneSession 裁了 ${cbcObserved?.pruned?.length ?? 0} 条（0 = 判定 cache 为空、已退化为体积规则）`)
 }
 
+// ---------- N. 第二层被 skip 时必须落盘原因（可观测缺口） ----------
+// 此前只有**成功**路径与 catch 会写 stats.lastCompactNote，被 skip 的 pass 一律不写
+// → 心跳与状态报告里留着上一轮的旧值，"第二层为什么没动"恰好是唯一看不见的东西。
+// 跑批端实测踩到：只能看到 compactSkipped=4，不知道原因。两条路径都要钉住：
+//   ① 有 selection 的 blocked（带逐条排除计数）
+//   ② 无 selection 的 blocked（极早退）
+{
+  // ① compactMinChars 设成不可能达到的值 → 所有范围都被 skippedShort 掉 → ranges 为空
+  const pruner = makePruner()
+  const session = makeSession()
+  const compaction = makeCompaction(session)
+  const ctx = makeCtx({ pruner, session, compaction })
+  const resultSeqs = session.surface.nodes.filter((q) => session.eventAt(q)?.type === 'tool/result')
+  const probs = Object.fromEntries(resultSeqs.map((q) => [q, 0.05]))
+  const judge = fakeJudge(probs, probs)
+  mod.apply(ctx, {
+    ...PLUGIN_CFG,
+    compactOn: 'always',
+    compactQuantile: 1,
+    minCandidatesForRelative: 3,
+    compactMinChars: 999999, // 任何范围都达不到 → 全被 skippedShort
+  }, { judge })
+  const agentRef = { agent: { session, options: {} } }
+  await ctx.waterfall('agent/pre-step', agentRef, () => {})
+  const statusTool = ctx.registeredTools.find((t) => t?.name === 'jev_prune_status')
+  const txt = String(await statusTool.execute({}, agentRef))
+  const layer2 = txt.split('\n').find((l) => /最近（第二层）/.test(l)) ?? ''
+
+  check('第二层被 skip 时原因必须落盘（此前只在成功路径写）',
+    /没有合格的连续只读步骤段/.test(layer2), layer2.trim() || '（没有第二层记录 = 又回到静默）')
+  check('blocked 时还要带上 selection 的逐条排除计数与合格步数',
+    /short:1/.test(layer2) && /eligible:3/.test(layer2),
+    layer2.trim() || '（缺排除计数）')
+
+  // ② 极早退（compactReceipts=false，selection 为 null）同样要留痕
+  const pruner2 = makePruner()
+  const session2 = makeSession()
+  const compaction2 = makeCompaction(session2)
+  const ctx2 = makeCtx({ pruner: pruner2, session: session2, compaction: compaction2 })
+  const judge2 = fakeJudge({}, {})
+  mod.apply(ctx2, { ...PLUGIN_CFG, compactReceipts: false }, { judge: judge2 })
+  const agentRef2 = { agent: { session: session2, options: {} } }
+  await ctx2.waterfall('agent/pre-step', agentRef2, () => {})
+  const txt2 = String(await ctx2.registeredTools.find((t) => t?.name === 'jev_prune_status').execute({}, agentRef2))
+  const layer2b = txt2.split('\n').find((l) => /最近（第二层）/.test(l)) ?? ''
+  check('极早退的 blocked 也要落盘（compactReceipts=false）',
+    /compactReceipts=false/.test(layer2b), layer2b.trim() || '（没有第二层记录）')
+}
+
 // ---------------------------------------------------------------- 汇总
 console.log()
 for (const r of results) console.log(`${r.ok ? '  ✅' : '  ❌'} ${r.name}${r.detail ? `  — ${r.detail}` : ''}`)
