@@ -238,6 +238,7 @@ node wire_profile.mjs <DSH_HOME> <profile名>
 - **结构判断交代码，语义判断交模型**：改写类调用必留、最近区必留由硬规则保证，不交给概率
 - **shadow-price 协议逐字对齐** DSH 的 `compaction/prune` + `surfaceOp: replace`，纯消费者的 token 账本可直接复用
 - **按 Unicode 码点切片**，不劈代理对；token 估算用逐词校正算法（中英文混合可用）
+- **钩子顺序是承重的**：判定钩子用 `prepend`（`ctx.on(..., true)`）注册，必须跑在**基线束的 `compaction-basic` 之前**。全依赖树里 `pruner.pruneSession` 的调用点**只有它**（`:888` context-overflow、`:902` pressure 两处），所以那也是第一层裁决唯一被消费的地方。若按默认顺序注册，pruneSession 读到的会是**上一轮**的判定 cache，本轮新结果全部 fallback 到体积规则——第一层静默失效，且任何地方都不报错。`smoke_apply.mjs` **M 块**通过在 `pruneSession` 被调用的那一刻读判定计数，把这个不变量钉住。
 
 ## 测试
 
@@ -257,7 +258,9 @@ cp smoke_apply.mjs <某目录>/ && cd <某目录>/ && node smoke_apply.mjs
 
 测试脚本与辅助工具（`check.js` / `smoke_apply.mjs` / `inspect_session.mjs` / `verify_real_shapes.mjs` / `wire_profile.mjs`）都随 npm 包发布，装好的包内可直接 `npm run check`。CI（`.github/workflows/ci.yml`）跑两组作业：仅 peer 依赖的快速冒烟 + 完整 DSH 依赖树的集成验证。
 
-覆盖：两个接入点的接管、两层完整裁决路径、append 协议、回执注入与**归属（fence）**、并发压缩竞态、门控分支（含反事实对照）、**文本/思考两轴分离**、**小总体降级**、**越界配置钳制**、**判定请求重试与批级容错**（含"本次"与"累计"两种计数口径）、**批次记账不重复**、**压力门同向关闭但在绝对阈值下仍照常动作**、**token 标定在留出集上的精度**、**压缩配额**、**`alwaysTrimRatio` 真的在改变预算**（含"确实走了预算路径而非小总体降级"的前提断言）、**session 缺失时优雅退出而非抛错**、**shell 类工具默认排除**（`pwsh Remove-Item` 回归用例）。
+覆盖：两个接入点的接管、两层完整裁决路径、append 协议、回执注入与**归属（fence）**、并发压缩竞态、门控分支（含反事实对照）、**文本/思考两轴分离**、**小总体降级**、**越界配置钳制**、**判定请求重试与批级容错**（含"本次"与"累计"两种计数口径）、**批次记账不重复**、**压力门同向关闭但在绝对阈值下仍照常动作**、**token 标定在留出集上的精度**、**压缩配额**、**`alwaysTrimRatio` 真的在改变预算**（含"确实走了预算路径而非小总体降级"的前提断言）、**session 缺失时优雅退出而非抛错**、**判定钩子被 prepend 到基线束 `compaction-basic` 之前**（在 `pruneSession` 被调用的那一刻读判定计数）、**shell 类工具默认排除**（`pwsh Remove-Item` 回归用例）。
+
+`smoke_apply.mjs` 里的假 `ctx` 复刻的是 cordis 的**监听器模型**，不只是方法名：同一事件多个监听、`prepend`、以及 `waterfall` 顺序——**不调用 `next()` 即否决**后续链路（含宿主内建行为）。此前它只是"一个事件一个 handler"的 Map，完全掩盖了顺序契约：第二个监听会静默覆盖第一个，`prepend` 标志被直接忽略。
 
 **测试边界**（哪些是 CI 真正验证过的）：纯函数逻辑、假 ctx 下的接管与 append 协议、以及 integration 作业里的"真实依赖树下模块可加载 + freezeMessage 可用"。**没有**被 CI 覆盖的：真实 DSH 宿主内的服务接管、rc 版本间的事件形状漂移——这些只能在真实会话里用 `jev_probe_shapes` 校对。
 

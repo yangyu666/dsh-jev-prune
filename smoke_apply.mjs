@@ -216,7 +216,33 @@ function makeCtx({ pruner, session, compaction }) {
     commands: services.get('commands'),
     tokenMeter,
     compaction,
-    on: (evt, fn) => { handlers.set(evt, fn) },
+    // 与 cordis 同构：同一事件可以有**多个**监听器，第三个参数（或 options.prepend）
+    // 决定插入队首还是队尾。此前这里只是 Map<event, fn> —— 第二个监听会**覆盖**第一个，
+    // 而且 prepend 被完全忽略。于是"判定钩子 prepend 到 compaction-basic 之前"这条
+    // 真实语义在测试里根本不存在（拆成两个监听后 30/72 项直接失败）。
+    // 假对象必须复刻宿主这个形状，否则测的是一套不存在的语义。
+    on: (evt, fn, options) => {
+      const prepend = typeof options === 'object' && options !== null
+        ? options.prepend === true
+        : options === true
+      const list = handlers.get(evt) ?? []
+      if (prepend) list.unshift(fn)
+      else list.push(fn)
+      handlers.set(evt, list)
+    },
+    /**
+     * 忠实复刻 cordis 的 waterfall（`agent/pre-step` 正是这类事件）：
+     * 最外层先跑，最后一个参数是内层 next；监听器**不调用 next() 即否决**后续链路
+     * （含宿主内建行为）。所以测试里不能"取一个 handler 直接调"——链上有几个监听、
+     * 谁先谁后，恰恰是这次要验证的东西。
+     */
+    waterfall: (name, ...args) => {
+      const cbs = [...(handlers.get(name) ?? [])]
+      const inner = args.pop()
+      const next = () => (cbs.shift() ?? inner)(...args)
+      args.push(next)
+      return next()
+    },
     effect: (fn) => fn(),
     logger: { info: () => {}, debug: () => {}, warn: () => {}, error: () => {} },
   }
@@ -301,7 +327,10 @@ const PLUGIN_CFG = {
   } catch (error) {
     bad('apply(ctx, config, {judge}) 未抛错', error?.message ?? String(error))
   }
-  check('注册了 agent/pre-step 钩子', ctx.handlers.has('agent/pre-step'))
+  // 拆成两个监听是有意的：判定必须 **prepend**（抢在 compaction-basic 调 pruneSession
+  // 之前），压缩保持 append。数量与顺序都要钉住，否则"拆开"这个动作本身没有测试保护。
+  const preStepHooks = ctx.handlers.get('agent/pre-step') ?? []
+  check('pre-step 注册了判定 + 压缩两个监听', preStepHooks.length === 2, `实际 ${preStepHooks.length}`)
   const toolNames = ctx.registeredTools.map((t) => t?.name).filter(Boolean)
   for (const name of ['jev_prune_status', 'jev_prune_now', 'jev_compact_now', 'jev_restore', 'jev_probe_shapes']) {
     check(`注册了 ${name} 工具`, toolNames.includes(name), toolNames.join(', '))
@@ -337,11 +366,13 @@ const PLUGIN_CFG = {
     compactReceipts: false,
   }, { judge })
 
-  const handler = ctx.handlers.get('agent/pre-step')
-  check('agent/pre-step 处理器存在', typeof handler === 'function')
-  if (typeof handler === 'function') {
+  const preStepHooks = ctx.handlers.get('agent/pre-step') ?? []
+  check('agent/pre-step 处理器存在', preStepHooks.length > 0, `实际 ${preStepHooks.length} 个`)
+  if (preStepHooks.length > 0) {
     try {
-      await handler({ agent: { session, options: {} } }, () => {})
+      // 走 waterfall 而不是取单个 handler 直接调：链上有判定 + 压缩两个监听，
+      // 真实宿主链上还有 compaction-basic，只调一个测不出顺序问题
+      await ctx.waterfall('agent/pre-step', { agent: { session, options: {} } }, () => {})
       ok('判定 pass 已执行')
     } catch (error) {
       bad('判定 pass 已执行', error?.message ?? String(error))
@@ -401,7 +432,7 @@ function eligibleSeqsFrom(report) {
   }, { judge })
 
   const agentRef = { agent: { session, options: {} } }
-  await ctx.handlers.get('agent/pre-step')(agentRef, () => {})
+  await ctx.waterfall('agent/pre-step', agentRef, () => {})
   check('判定 pass 拿到了两轴概率', judge.requests >= 1, `requests=${judge.requests}`)
 
   // 关键：**不需要手动触发** —— pre-step 的自动路径已经压缩了
@@ -442,7 +473,7 @@ function eligibleSeqsFrom(report) {
     compactMinChars: 1000,
   }, { judge })
   const agentRef = { agent: { session, options: {} } }
-  await ctx.handlers.get('agent/pre-step')(agentRef, () => {})
+  await ctx.waterfall('agent/pre-step', agentRef, () => {})
   check('压力未知时自动路径保守跳过（不做破坏性动作）', compaction.calls.length === 0, `实际 ${compaction.calls.length}`)
 
   const compactTool = ctx.registeredTools.find((t) => t?.name === 'jev_compact_now')
@@ -497,7 +528,7 @@ async function layer2Run(effectOfS2) {
     compactMinChars: 100,
   }, { judge })
   const agentRef = { agent: { session, options: {} } }
-  await ctx.handlers.get('agent/pre-step')(agentRef, () => {})
+  await ctx.waterfall('agent/pre-step', agentRef, () => {})
   const tool = ctx.registeredTools.find((t) => t?.name === 'jev_compact_now')
   const dry = await tool.execute({ dryRun: true }, agentRef)
   const dryEligible = eligibleSeqsFrom(dry)
@@ -563,7 +594,7 @@ async function layer2Run(effectOfS2) {
   }, { judge })
 
   const agentRef = { agent: { session, options: {} } }
-  await ctx.handlers.get('agent/pre-step')(agentRef, () => {})
+  await ctx.waterfall('agent/pre-step', agentRef, () => {})
 
   // 以插件自己的账本为准（外面包一层会漏记我们注入的那次：我们的钩子会直接 return，
   // 不走 original，所以包装 `baseSummarize` 观察不到注入）
@@ -594,7 +625,7 @@ async function layer2Run(effectOfS2) {
   const judge = fakeJudge({ [session.seqs.s1]: 0.05, [session.seqs.s2]: 0.05, [session.seqs.s3]: 0.05 },
     { [session.seqs.s1]: 0.05, [session.seqs.s2]: 0.05, [session.seqs.s3]: 0.05 })
   mod.apply(ctx, { ...PLUGIN_CFG, judgeOn: 'pressure' }, { judge })
-  await ctx.handlers.get('agent/pre-step')({ agent: { session, options: {} } }, () => {})
+  await ctx.waterfall('agent/pre-step', { agent: { session, options: {} } }, () => {})
   check('压力未知时第一层不发 Jev 请求（与第二层同向关闭）',
     judge.requests === 0,
     `实际发出 ${judge.requests} 次`)
@@ -608,7 +639,7 @@ async function layer2Run(effectOfS2) {
   const judge2 = fakeJudge({ [session2.seqs.s1]: 0.05, [session2.seqs.s2]: 0.05, [session2.seqs.s3]: 0.05 },
     { [session2.seqs.s1]: 0.05, [session2.seqs.s2]: 0.05, [session2.seqs.s3]: 0.05 })
   mod.apply(ctx2, { ...PLUGIN_CFG, judgeOn: 'pressure' }, { judge: judge2 })
-  await ctx2.handlers.get('agent/pre-step')({ agent: { session: session2, options: {} } }, () => {})
+  await ctx2.waterfall('agent/pre-step', { agent: { session: session2, options: {} } }, () => {})
   check('meter 抛错时第一层也不发 Jev 请求（旧实现会放行）',
     judge2.requests === 0,
     `实际发出 ${judge2.requests} 次`)
@@ -622,7 +653,7 @@ async function layer2Run(effectOfS2) {
   const judge3 = fakeJudge({ [session3.seqs.s1]: 0.05, [session3.seqs.s2]: 0.05, [session3.seqs.s3]: 0.05 },
     { [session3.seqs.s1]: 0.05, [session3.seqs.s2]: 0.05, [session3.seqs.s3]: 0.05 })
   mod.apply(ctx3, { ...PLUGIN_CFG, judgeOn: 'pressure', softLimit: 999999 }, { judge: judge3 })
-  await ctx3.handlers.get('agent/pre-step')({ agent: { session: session3, options: {} } }, () => {})
+  await ctx3.waterfall('agent/pre-step', { agent: { session: session3, options: {} } }, () => {})
   check('用量低于绝对阈值时第一层不发请求', judge3.requests === 0, `实际发出 ${judge3.requests} 次`)
 
   // G4（PR #28 review 回归）：绝对阈值 + meter 缺失 → **必须照常判定**。
@@ -644,7 +675,7 @@ async function layer2Run(effectOfS2) {
       { [s.seqs.s1]: 0.05, [s.seqs.s2]: 0.05, [s.seqs.s3]: 0.05 },
     )
     mod.apply(cx, { ...PLUGIN_CFG, judgeOn: 'pressure', softLimit: 1 }, { judge: j })
-    await cx.handlers.get('agent/pre-step')({ agent: { session: s, options: {} } }, () => {})
+    await cx.waterfall('agent/pre-step', { agent: { session: s, options: {} } }, () => {})
     check('绝对阈值下 meter 缺失时第一层仍照常判定（不因拿不到用量而关闭功能）',
       j.requests > 0,
       `实际发出 ${j.requests} 次（0 表示功能被静默关掉了）`)
@@ -657,7 +688,7 @@ async function layer2Run(effectOfS2) {
   const judge4 = fakeJudge({ [session4.seqs.s1]: 0.05, [session4.seqs.s2]: 0.05, [session4.seqs.s3]: 0.05 },
     { [session4.seqs.s1]: 0.05, [session4.seqs.s2]: 0.05, [session4.seqs.s3]: 0.05 })
   mod.apply(ctx4, { ...PLUGIN_CFG, judgeOn: 'pressure', softLimit: 1 }, { judge: judge4 })
-  await ctx4.handlers.get('agent/pre-step')({ agent: { session: session4, options: {} } }, () => {})
+  await ctx4.waterfall('agent/pre-step', { agent: { session: session4, options: {} } }, () => {})
   check('用量高于绝对阈值时第一层正常发请求', judge4.requests > 0, `实际发出 ${judge4.requests} 次`)
 }
 
@@ -691,7 +722,7 @@ async function layer2Run(effectOfS2) {
   }, { judge })
 
   const agentRef = { agent: { session, options: {} } }
-  await ctx.handlers.get('agent/pre-step')(agentRef, () => {})
+  await ctx.waterfall('agent/pre-step', agentRef, () => {})
   check('配额 ≥2 时一次 pass 压掉多段（旧默认 1 只能压一段）',
     compaction.calls.length >= 2,
     `实际压了 ${compaction.calls.length} 段`)
@@ -713,7 +744,7 @@ async function layer2Run(effectOfS2) {
     compactMinChars: 1000,
     maxCompactionsPerPass: 1,
   }, { judge: judge2 })
-  await ctx2.handlers.get('agent/pre-step')({ agent: { session: session2, options: {} } }, () => {})
+  await ctx2.waterfall('agent/pre-step', { agent: { session: session2, options: {} } }, () => {})
   check('配额=1 时严格只压一段（配额不得被无视）',
     compaction2.calls.length === 1,
     `实际压了 ${compaction2.calls.length} 段`)
@@ -757,7 +788,7 @@ async function layer2Run(effectOfS2) {
   }, { judge })
 
   const agentRef = { agent: { session, options: {} } }
-  await ctx.handlers.get('agent/pre-step')(agentRef, () => {})
+  await ctx.waterfall('agent/pre-step', agentRef, () => {})
 
   const statusTool = ctx.registeredTools.find((t) => t?.name === 'jev_prune_status')
   const statusText = String(await statusTool.execute({}, agentRef))
@@ -792,7 +823,7 @@ async function layer2Run(effectOfS2) {
   )
   mod.apply(ctx, { ...PLUGIN_CFG, dryRun: true }, { judge })
   const agentRef = { agent: { session, options: {} } }
-  await ctx.handlers.get('agent/pre-step')(agentRef, () => {})
+  await ctx.waterfall('agent/pre-step', agentRef, () => {})
 
   const statusTool = ctx.registeredTools.find((t) => t?.name === 'jev_prune_status')
   const statusText = String(await statusTool.execute({}, agentRef))
@@ -834,7 +865,7 @@ async function layer2Run(effectOfS2) {
   mod.apply(ctx, { ...PLUGIN_CFG }, { judge })
 
   // agent 没有 session —— 第一道早退条件为真
-  await ctx.handlers.get('agent/pre-step')({ agent: {}, options: {} }, () => {})
+  await ctx.waterfall('agent/pre-step', { agent: {}, options: {} }, () => {})
 
   const statusTool = ctx.registeredTools.find((t) => t?.name === 'jev_prune_status')
   const text = String(await statusTool.execute({}, { agent: { session, options: {} } }))
@@ -883,7 +914,7 @@ async function layer2Run(effectOfS2) {
     const judge = fakeJudge(probs, probs)
     mod.apply(ctx, { ...PLUGIN_CFG, judgeOn: 'always', compactOn: 'pressure', alwaysTrimRatio: ratio }, { judge })
     const agentRef = { agent: { session, options: {} } }
-    await ctx.handlers.get('agent/pre-step')(agentRef, () => {})
+    await ctx.waterfall('agent/pre-step', agentRef, () => {})
     // 直接走 DSH 每步真正调用、且已被插件接管的那个接缝
     const out = pruner.pruneSession(session)
     const statusTool = ctx.registeredTools.find((t) => t?.name === 'jev_prune_status')
@@ -912,6 +943,57 @@ async function layer2Run(effectOfS2) {
   check('alwaysTrimRatio=1 裁满全池（6 条）',
     r1.out.pruned.length === plan6.length,
     `实际 ${r1.out.pruned.length} / 期望 ${plan6.length}`)
+}
+
+// ---------- M. 判定钩子必须 prepend 到 compaction-basic 之前（顺序回归） ----------
+// 为什么这条必须存在：真正调用 `pruner.pruneSession` 的**只有** DSH 的
+// `dsh-compaction-basic`（全依赖树仅两处，都在该文件里：:888 context-overflow、
+// :902 pressure），而它是在**自己的** `agent/pre-step` 里调的。我们的第一层判定结果
+// 正是在那次调用里被消费。所以：
+//   · 判定钩子若排在 compaction-basic **之后** → pruneSession 读到的 cache 还是上一轮的
+//     → 本轮新结果全部 fallback 到体积规则 → **第一层静默失效**（不是报错，是悄悄不生效）。
+//   · 这就是为什么判定钩子要用 `ctx.on(..., true)` **prepend**：抢在基线束之前。
+//
+// 复刻真实装载顺序：基线束先加载（监听先注册），插件后加载但 prepend。
+// 断言点选在"compaction-basic 调 pruneSession 的那一刻"——那一刻 judge 是否已经跑完，
+// 就是这条修复的全部内容。
+{
+  const pruner = makePruner()
+  const session = makeSession()
+  const compaction = makeCompaction(session)
+  const ctx = makeCtx({ pruner, session, compaction })
+
+  // 假 compaction-basic：位置等价于基线束的 pre-step，内部调用 pruneSession
+  let cbcObserved = null
+  let judgeRequestsAtCbc = null
+  ctx.on('agent/pre-step', async ({ agent }, next) => {
+    judgeRequestsAtCbc = judge.requests
+    cbcObserved = pruner.pruneSession(agent.session)
+    return next()
+  })
+
+  const resultSeqs = session.surface.nodes.filter((q) => session.eventAt(q)?.type === 'tool/result')
+  const probs = Object.fromEntries(resultSeqs.map((q) => [q, 0.05]))
+  const judge = fakeJudge(probs, probs)
+  mod.apply(ctx, { ...PLUGIN_CFG, compactOn: 'pressure' }, { judge })
+
+  const chain = ctx.handlers.get('agent/pre-step') ?? []
+  // 前提：链上有 3 个监听（基线 + 判定 + 压缩）。若只有 2 个，说明判定与压缩仍是
+  // 同一个监听、或基线监听没挂上——两种情况下这条测试都测不到顺序问题。
+  check('前提：pre-step 链上有基线 + 判定 + 压缩三个监听（否则本测试无意义）',
+    chain.length === 3, `实际 ${chain.length}`)
+
+  await ctx.waterfall('agent/pre-step', { agent: { session, options: {} } }, () => {})
+
+  check('前提：compaction-basic 的位置确实调用了 pruneSession',
+    cbcObserved != null,
+    cbcObserved == null ? '未观察到 pruneSession 调用' : `观察到了，裁了 ${cbcObserved.pruned.length} 条`)
+  check('compaction-basic 调 pruneSession 时本轮判定已完成（判定钩子确实 prepend 了）',
+    judgeRequestsAtCbc === 1,
+    `那一刻 judge.requests=${judgeRequestsAtCbc}（应为 1；为 0 说明判定跑在基线之后）`)
+  check('因此那一刻第一层确实按 Jev 裁了，而不是 fallback 到体积规则',
+    (cbcObserved?.pruned?.length ?? 0) > 0,
+    `pruneSession 裁了 ${cbcObserved?.pruned?.length ?? 0} 条（0 = 判定 cache 为空、已退化为体积规则）`)
 }
 
 // ---------------------------------------------------------------- 汇总

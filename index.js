@@ -1462,6 +1462,8 @@ export function apply(ctx, config, deps = {}) {
   ctx.effect(() => installPrunerOverride())
   ctx.effect(() => installSummaryHook())
 
+  // 判定钩子：prepend 到最前，抢在 DSH 的 compaction-basic（其 pre-step 会调 pruneSession）之前。
+  // 否则 pruneSession 读判定 cache 时 Jev 判定还没跑完 → 全部 fallback（第一层失效）。
   ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     // P0-3：判定链条的最外层计数。没有它时，"一次性零判定"无法区分
     // 「事件没触发」/「提前 return」/「门控跳过」——三者的排查方向完全不同。
@@ -1484,6 +1486,10 @@ export function apply(ctx, config, deps = {}) {
       stats.lastNote = `判定失败：${error?.message ?? String(error)}`
       log('info', stats.lastNote)
     }
+    return next()
+  }, true)
+
+  ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     try {
       await compactPass(agent, { signal })
     } catch (error) {
