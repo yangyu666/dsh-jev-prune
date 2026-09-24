@@ -13,7 +13,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { JevClient, JevError, estimateTokens } from './jev.js'
-import { countChars, decideAction, parseLimit, pruneSessionWithJev, sliceWithBudget } from './prune.js'
+import { countChars, decideAction, parseLimit, planTrims, pruneSessionWithJev, sliceWithBudget } from './prune.js'
 import {
   DEFAULT_COMPACT_TOOLS,
   DEFAULT_EVIDENCE_PATTERNS,
@@ -42,6 +42,7 @@ import {
   questionsFor,
   recentGoal,
   resultChars,
+  resultExcerpt,
   selectCandidates,
   sessionEvents,
   toolNameOf,
@@ -217,9 +218,42 @@ assert.match(built.state, /【上下文】/)
 assert.match(built.state, /【任务目标】/, 'state 必须带任务目标 —— 缺它会让概率悬在阈值附近')
 assert.match(built.state, /【history】/)
 assert.match(built.state, /\[s1\]\[user\]/)
-// tool/result 只给注记与体积，不给全文
+// tool/result 只给注记、体积与**有界摘录**——不给全文。
+// P0-2 起不变量变了：从"正文一律不进 state"改为"正文只能以 ≤ resultExcerptChars 的摘录出现"。
+// 判盲的代价是实测过的（Claude 版 256 条无一过阈值、我们 42/42 判过期），所以摘录默认开启。
 assert.match(built.state, /\[s3\]\[tool_result\] ok, 5000 chars/)
-assert.equal(/x{100}/.test(built.state), false, '工具结果正文不应进 state')
+assert.match(built.state, /摘录: /, 'P0-2：结果应带关键摘录（判盲缓解）')
+assert.equal(/x{1000}/.test(built.state), false, '工具结果正文不得整段进 state（只允许有界摘录）')
+assert.equal(/x{200}/.test(built.state), false, '单行超长正文只允许取头部一小段（摘录受预算截断）')
+
+// P0-2：摘录要带**对的线索**——头几行 + 命中证据词的行（报错/失败**往往在结果中段**，
+// 正是"掐中间"策略会丢掉的位置）
+{
+  const body = [
+    'Step 2/7 : RUN apt-get update && apt-get install -y curl',
+    ...Array.from({ length: 40 }, (_, i) => `filler line ${i} lorem ipsum dolor sit amet`),
+    'ERROR E2001_BASE_IMAGE: base image node:18-broken does not exist; use node:20-alpine instead',
+    ...Array.from({ length: 40 }, (_, i) => `tail filler ${i}`),
+  ].join('\n')
+  const ev = {
+    type: 'tool/result',
+    data: { message: { source: { callId: 'cX' }, content: [{ type: 'tool-result', content: [{ type: 'text', text: body }] }] } },
+  }
+  const excerpt = resultExcerpt(ev, 240)
+  assert.match(excerpt, /Step 2\/7/, '头行应进摘录（"这是什么文件/命令"）')
+  assert.match(excerpt, /E2001_BASE_IMAGE/, '中段的证据行应进摘录（这是掐中间会丢的那一段）')
+  assert.equal(excerpt.includes('tail filler 39'), false, '尾部无证据的填充不该占摘录预算')
+  assert.ok(Array.from(excerpt).length <= 240, `摘录必须受预算约束，实际 ${Array.from(excerpt).length}`)
+  assert.equal(resultExcerpt(ev, 0), '', '预算 0 = 关闭摘录')
+  // 关闭时必须回到旧行为（可配置回退，别把判盲当成不可逆）
+  const off = buildJevState({
+    surface,
+    eventAt,
+    goal,
+    options: { textHead: 400, textTail: 150, maxStateTokens: 25000, inputChars: 300, resultExcerptChars: 0 },
+  })
+  assert.equal(/x{100}/.test(off.state), false, 'resultExcerptChars=0 时必须回到"只给体积"的旧行为')
+}
 
 // 预算压制：预算很紧时应从最老开始丢行，但保留行数地板，并如实报告是否装下
 const squeezed = buildJevState({
@@ -531,6 +565,108 @@ const run = ({ events, cache, cfg, threshold }) => {
   const { out } = run({ events, cache: new Map([[22, { keep: false, prob: 0.05 }]]) })
   assert.equal(out.pruned.length, 1, '只有结构完整的那条被处理')
   assert.equal(out.pruned[0].originalSeq, 22)
+}
+
+// ================================================================ P0-1：压力自适应分位的裁剪选择
+// 为什么需要这一层：Jev 概率是**窄带**的（真实会话实测 42/42 条低于 0.5、P50=0.13），
+// 固定 0.5 阈值会把每一轮判定都读成"可裁"；而纯相对分位又会"每轮必裁固定比例"。
+// 所以拆成正交的两件事：**裁多少**由压力缺口比例定（ratio × 池子总增益）、**裁哪些**由概率排序定。
+{
+  const node = (seq, chars, prob, extra = {}) => ({
+    seq, index: seq, tool: 'read', chars,
+    gain: chars - 50 - 30 - 6, // 与 baseCfg 的 head/tail 一致（marker=' MARK ' 6 字符）
+    prob, effectProb: prob, verdict: { keep: prob >= 0.5, prob }, inTail: false, blacklisted: false,
+    ...extra,
+  })
+
+  // ① 压力缺口为 0（ratio=0）→ **一条都不裁**
+  const small = [node(1, 800, 0.05), node(2, 900, 0.06), node(3, 1000, 0.07), node(4, 1100, 0.08)]
+  const zeroPlan = planTrims(small, { keepMode: 'budget', pressureRatio: 0 })
+  assert.equal(zeroPlan.mode, 'budget')
+  assert.equal(zeroPlan.budget, 0, '无压力缺口时预算应为 0')
+  assert.equal(zeroPlan.selected.length, 0, '预算为 0 时一条都不裁')
+
+  // ② ratio=0.5 → 预算 = 池子总增益的一半；按概率升序裁，裁够就停
+  const mixed = [
+    node(10, 12000, 0.09),
+    node(11, 900, 0.03),   // 概率最低
+    node(12, 900, 0.04),
+    node(13, 900, 0.20),
+  ]
+  const plan = planTrims(mixed, { keepMode: 'budget', pressureRatio: 0.5 })
+  assert.equal(plan.mode, 'budget')
+  const totalGain = mixed.reduce((s, n) => s + n.gain, 0)
+  assert.equal(plan.budget, totalGain * 0.5, '预算应为池子总增益 × 压力比例')
+  // 顺序即设计：按概率升序裁，先裁低概率的小结果，省不够预算时必须动到那条大的（10）
+  assert.deepEqual(plan.selected, [11, 12, 10], '按概率升序裁，裁到省够预算为止')
+  assert.ok(plan.spent >= plan.budget, '裁完必须至少省到预算量')
+
+  // ③ 保护上限：prob ≥ keepThreshold 的一律不进候选池
+  const protectedSet = [node(20, 12000, 0.9), node(21, 900, 0.05), node(22, 900, 0.06), node(23, 900, 0.07)]
+  const guarded = planTrims(protectedSet, { keepMode: 'budget', pressureRatio: 0.5 })
+  assert.equal(guarded.keptByCeiling, 1, 'prob 0.9 的应计入保护上限')
+  assert.equal(guarded.selected.includes(20), false, '保护上限之上的结果绝不能被选中')
+
+  // ④ 小样本（< minCandidatesForBudget）→ 降级绝对下限，只裁 prob < floorThreshold 的
+  const tiny = [node(30, 12000, 0.05), node(31, 12000, 0.30)]
+  const floored = planTrims(tiny, { keepMode: 'budget', pressureRatio: 0.5 })
+  assert.equal(floored.mode, 'floor', '候选太少应降级为绝对下限')
+  assert.deepEqual(floored.selected, [30], '降级模式只裁 prob < 0.2 的')
+
+  // ⑤ keepMode 不是 budget 时返回 null（调用方退回逐节点 absolute 裁决，旧行为不变）
+  assert.equal(planTrims(mixed, { keepMode: 'absolute' }), null)
+  assert.equal(planTrims(mixed, undefined), null, '缺省时不得改变旧行为')
+
+  // ⑤b 修 null 排序 bug：prob=null 的节点（result 轴批次失败）不得进 selected，更不该被当成 0 优先裁
+  {
+    const withNull = [node(60, 12000, null), node(61, 900, 0.05), node(62, 900, 0.06), node(63, 900, 0.07)]
+    const p = planTrims(withNull, { keepMode: 'budget', pressureRatio: 0.5 })
+    assert.equal(p.selected.includes(60), false, 'prob=null 的节点不得进 selected（失败方向：未知不裁）')
+  }
+
+  // ⑥ 整链：budget 模式下按 ratio 只裁"预算内"的那条，其余如实记为"预算用尽"
+  {
+    const events = [
+      resultEvent(40, 'c1', 'x'.repeat(12000)),
+      resultEvent(41, 'c2', 'y'.repeat(5000)),
+      resultEvent(42, 'c3', 'z'.repeat(900)),
+      resultEvent(43, 'c4', 'w'.repeat(900)),
+    ]
+    const { out, stats } = run({
+      events,
+      cache: new Map([
+        [40, { keep: false, prob: 0.05 }], [41, { keep: false, prob: 0.06 }],
+        [42, { keep: false, prob: 0.07 }], [43, { keep: false, prob: 0.08 }],
+      ]),
+      cfg: { keepMode: 'budget', pressureRatio: 0.25 },
+    })
+    assert.equal(out.pruned.length, 1, '只裁预算内的那一条')
+    assert.equal(out.pruned[0].originalSeq, 40)
+    assert.equal(stats.prunedByJev, 1)
+    assert.equal(stats.keptByBudget, 3, '概率同样低但预算已用尽的那三条应记入 keptByBudget')
+    assert.equal(out.plan.mode, 'budget')
+    assert.equal(out.decisions[0].reason, 'selected(budget)')
+    assert.equal(out.decisions[1].reason, 'budget-exhausted')
+  }
+
+  // ⑦ 对照：`absolute` 模式（旧行为）下四条都会被裁 —— 证明省下来的是"分位"在起作用
+  {
+    const events = [
+      resultEvent(50, 'c1', 'x'.repeat(12000)),
+      resultEvent(51, 'c2', 'y'.repeat(5000)),
+      resultEvent(52, 'c3', 'z'.repeat(900)),
+      resultEvent(53, 'c4', 'w'.repeat(900)),
+    ]
+    const { out } = run({
+      events,
+      cache: new Map([
+        [50, { keep: false, prob: 0.05 }], [51, { keep: false, prob: 0.06 }],
+        [52, { keep: false, prob: 0.07 }], [53, { keep: false, prob: 0.08 }],
+      ]),
+      cfg: { keepMode: 'absolute' },
+    })
+    assert.equal(out.pruned.length, 4, 'absolute 模式会四条都裁（这是被替换掉的旧行为）')
+  }
 }
 
 // ================================================================ 第二层：回执压缩
@@ -1374,6 +1510,49 @@ const run = ({ events, cache, cfg, threshold }) => {
     assert.equal(clamped, false, `${String(unset)} 是"没配"而不是"配错"，不该告警`)
   }
   assert.equal(resolveConfig({})[CONFIG_WARNINGS].length, 0, '全部合法的配置不得产生告警')
+
+  // keepMode 白名单（review 修复）：拼错的模式必须回落 budget 并留痕，不得静默穿过
+  {
+    const bad = resolveConfig({ keepMode: 'budgt' })
+    assert.equal(bad.keepMode, 'budget', '拼错的 keepMode 应回落 budget')
+    assert.ok(bad[CONFIG_WARNINGS].some((w) => w.includes('keepMode')), 'keepMode 回落必须留下 configWarnings')
+    const good = resolveConfig({ keepMode: 'absolute' })
+    assert.equal(good.keepMode, 'absolute')
+    assert.equal(good[CONFIG_WARNINGS].length, 0, '合法 keepMode 不告警')
+  }
+
+  // 废弃键的运行时信号（review 反馈）：显式配置 volumeBudgetThresholdChars / budgetMinChars
+  // 必须推 configWarnings，否则用户配了却静默空转（与 keepMode 的留痕约定一致）。
+  //
+  // ⚠️ 必须走**宿主的真实取配置路径**：cordis 会先用 Config schema 校验用户配置、把默认值
+  // 填进去，再把结果交给 apply()（`resolveConfig(runtime, config).value`）。直接调
+  // `resolveConfig({...})` 传的是**没有默认值**的裸对象，测不到那个差异 ——
+  // 第一版断言就是这么写的，于是"空配置也被报废弃"这个回归它完全看不见。
+  const viaHost = (userCfg) => {
+    const r = Config['~standard'].validate(userCfg)
+    assert.ok(!r.issues, `schema 不应拒绝 ${JSON.stringify(userCfg)}`)
+    return resolveConfig(r.value)
+  }
+  {
+    // ① 关键回归：用户什么都没配 → 不得告警（schema 填的默认值不是"用户配置"）
+    const none = viaHost({})
+    assert.equal(none[CONFIG_WARNINGS].length, 0,
+      `空配置不得报废弃键（宿主已填默认值，实测会误报）：${JSON.stringify(none[CONFIG_WARNINGS])}`)
+    // ② 配了无关的键 → 同样不得告警
+    const unrelated = viaHost({ dryRun: true })
+    assert.equal(unrelated[CONFIG_WARNINGS].length, 0, '只配无关键不得报废弃键')
+    // ③ 真的改了废弃键的值 → 必须留痕
+    const changed1 = viaHost({ volumeBudgetThresholdChars: 5000 })
+    assert.ok(changed1[CONFIG_WARNINGS].some((w) => w.includes('volumeBudgetThresholdChars')),
+      '改了 volumeBudgetThresholdChars 必须留痕')
+    const changed2 = viaHost({ budgetMinChars: 100 })
+    assert.ok(changed2[CONFIG_WARNINGS].some((w) => w.includes('budgetMinChars')),
+      '改了 budgetMinChars 必须留痕')
+    // ④ 显式写成默认值 = 空操作，不告警（代价可接受，注释里写明）
+    const asDefault = viaHost({ volumeBudgetThresholdChars: 8192, budgetMinChars: 0 })
+    assert.equal(asDefault[CONFIG_WARNINGS].length, 0, '显式写成默认值属空操作，不告警')
+  }
+
 
   // 合法值必须原样保留（钳制不能顺手改掉正常配置）
   const ok = resolveConfig({ preserveRecent: 0, headChars: 0, maxStepTextChars: 5000, receiptMaxRatio: 1 })

@@ -1,0 +1,9 @@
+{
+  "name": "dsh-host-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Locked DSH host tree for CI integration (see ci.yml). Regenerate from a machine that ran: npm install @deepseek-ai/dsh@<TESTED_DSH_VERSION>",
+  "dependencies": {
+    "@deepseek-ai/dsh": "^0.1.5-rc.2"
+  }
+}
