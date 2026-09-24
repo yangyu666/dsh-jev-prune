@@ -1114,6 +1114,106 @@ async function layer2Run(effectOfS2) {
     `实际判定 ${layerSpecificBlacklist} 条（期望 3；为 0 说明两层黑名单仍耦合）`)
 }
 
+// ---------- P. 会话恢复后，已裁 replacement 仍可重新进入第二层 ----------
+// decisions 是 WeakMap 内存缓存；插件/宿主重启后缓存为空，但 session 日志和 surface 会恢复。
+// 若第二层沿用第一层的“带裁剪标记就不再判定”，这些旧 replacement 将永久失去 verdict。
+{
+  const session = makeSession()
+
+  // 第一实例先完成判定与第一层裁剪，制造带 sourceEventSeqs 的 replacement。
+  const pruner1 = makePruner()
+  const compaction1 = makeCompaction(session)
+  const ctx1 = makeCtx({ pruner: pruner1, session, compaction: compaction1 })
+  const originalResults = session.surface.nodes.filter((seq) => session.eventAt(seq)?.type === 'tool/result')
+  const firstProbs = Object.fromEntries(originalResults.map((seq) => [seq, 0.05]))
+  mod.apply(ctx1, { ...PLUGIN_CFG, compactReceipts: false }, { judge: fakeJudge(firstProbs, firstProbs) })
+  const agentRef1 = { agent: { session, options: {} } }
+  await ctx1.waterfall('agent/pre-step', agentRef1, () => {})
+  pruner1.pruneSession(session)
+  const replacements = session.surface.nodes.filter((seq) =>
+    (session.eventAt(seq)?.sourceEventSeqs?.length ?? 0) > 0
+    && session.eventAt(seq)?.type === 'tool/result')
+  check('前提：第一实例已产生带 sourceEventSeqs 的裁剪 replacement',
+    replacements.length > 0, `实际 ${replacements.length}`)
+
+  // 第二实例模拟重启：新的 apply() 拥有全新的 decisions WeakMap。
+  const pruner2 = makePruner()
+  const compaction2 = makeCompaction(session)
+  const ctx2 = makeCtx({ pruner: pruner2, session, compaction: compaction2 })
+  const currentResults = session.surface.nodes.filter((seq) => session.eventAt(seq)?.type === 'tool/result')
+  const secondProbs = Object.fromEntries(currentResults.map((seq) => [seq, 0.05]))
+  const judge2 = fakeJudge(secondProbs, secondProbs)
+  mod.apply(ctx2, {
+    ...PLUGIN_CFG,
+    compactOn: 'always',
+    compactQuantile: 1,
+    compactPreserveRecent: 0,
+  }, { judge: judge2 })
+  await ctx2.waterfall('agent/pre-step', { agent: { session, options: {} } }, () => {})
+
+  check('重启后会重新判定已裁 replacement（缓存为空也不会永久跳过）',
+    judge2.requests > 0, `实际请求 ${judge2.requests} 次`)
+  check('重启后已裁 replacement 能继续进入第二层回执压缩',
+    compaction2.calls.length > 0, `实际压缩 ${compaction2.calls.length} 段`)
+}
+
+// ---------- Q. 部分判定缓存不得让缺失轴永久饿死 ----------
+// 第一次只返回 result 轴，cache 已有 entry 但 effectProb=null；第二次必须继续问。
+// 旧逻辑只看 cache.has(seq)，会从此把它当成 fresh=false，第二层永远拿不到两轴交集。
+{
+  const pruner = makePruner()
+  const session = makeSession()
+  const compaction = makeCompaction(session)
+  const ctx = makeCtx({ pruner, session, compaction })
+  // 复刻 compaction-basic：判定后立刻调用第一层，使两轮之间发生 old seq → replacement seq。
+  ctx.on('agent/pre-step', async ({ agent }, next) => {
+    pruner.pruneSession(agent.session)
+    return next()
+  })
+  const judge = {
+    ready: true,
+    requests: 0,
+    asked: [],
+    retries: 0,
+    lastRetries: 0,
+    lastError: '',
+    usage: { input_tokens: 0, output_tokens: 0 },
+    batch: (_state, questions) => [questions],
+    async ask(_state, questions) {
+      this.requests += 1
+      this.asked.push(Object.keys(questions))
+      const out = {}
+      for (const id of Object.keys(questions)) {
+        if (this.requests === 1 && id.startsWith('result_s')) out[id] = 0.05
+        if (this.requests >= 2 && id.startsWith('effect_s')) out[id] = 0.05
+      }
+      return out
+    },
+  }
+  mod.apply(ctx, {
+    ...PLUGIN_CFG,
+    compactOn: 'always',
+    compactQuantile: 1,
+    compactPreserveRecent: 0,
+  }, { judge })
+  const agentRef = { agent: { session, options: {} } }
+  await ctx.waterfall('agent/pre-step', agentRef, () => {})
+  check('前提：第一轮只有单轴时第二层不能压缩',
+    compaction.calls.length === 0, `实际压缩 ${compaction.calls.length} 段`)
+  check('前提：两轮之间第一层确实把结果替换成了新 seq',
+    session.surface.nodes.some((seq) => (session.eventAt(seq)?.sourceEventSeqs?.length ?? 0) > 0),
+    'surface 上没有 replacement，测不到跨 seq 补轴')
+  await ctx.waterfall('agent/pre-step', agentRef, () => {})
+  check('缺失 effect 轴的缓存项会在下一轮继续请求',
+    judge.requests === 2, `实际请求 ${judge.requests} 次`)
+  check('补轴请求只问缺失的 effect，不重复询问已有 result',
+    judge.asked[1]?.length > 0
+      && judge.asked[1].every((id) => id.startsWith('effect_s')),
+    `第二轮题号 ${JSON.stringify(judge.asked[1] ?? [])}`)
+  check('补齐第二轴后第二层可以继续压缩',
+    compaction.calls.length > 0, `实际压缩 ${compaction.calls.length} 段`)
+}
+
 // ---------------------------------------------------------------- 汇总
 console.log()
 for (const r of results) console.log(`${r.ok ? '  ✅' : '  ❌'} ${r.name}${r.detail ? `  — ${r.detail}` : ''}`)

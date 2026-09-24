@@ -179,6 +179,18 @@ assert.equal(seqs.includes(9), false, '最近区不应进候选')
 // 已经裁过的节点要能识别
 assert.equal(looksPruned(eventAt(10), '已裁剪'), true)
 assert.equal(looksPruned(eventAt(3), '已裁剪'), false)
+const layer2Candidates = selectCandidates({
+  surface,
+  eventAt,
+  events,
+  preserveRecent: 0,
+  neverPruneTools: [],
+  marker: '已裁剪',
+  nameByCallId: nameIndex,
+  includePruned: true,
+})
+assert.equal(layer2Candidates.some((candidate) => candidate.seq === 10), true,
+  '第二层必须能在缓存丢失后重新判定已裁 replacement')
 
 // ---------------------------------------------------------------- 问题措辞
 const questions = questionsFor(candidates)

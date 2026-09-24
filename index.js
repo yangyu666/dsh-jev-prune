@@ -841,18 +841,34 @@ export function apply(ctx, config, deps = {}) {
       neverPruneTools: cfg.neverPruneTools,
     })
     const candidatesBySeq = new Map(layer1Candidates.map((candidate) => [candidate.seq, candidate]))
+    const layer2CandidateSeqs = new Set()
     if (cfg.compactReceipts && cfg.compactOn !== 'off') {
       const layer2Candidates = selectCandidates({
         ...candidateInput,
         preserveRecent: cfg.compactPreserveRecent,
         // 第一层黑名单不属于第二层；第二层随后按自己的白名单 + 黑名单过滤。
         neverPruneTools: [],
+        // decisions 是内存缓存，宿主重启/会话恢复后会丢失。第一层 replacement 虽然
+        // 带裁剪标记，第二层仍需允许重新判定，否则这些旧节点永远无法进入回执压缩。
+        includePruned: true,
       }).filter((candidate) => isCompactableTool(candidate.tool, cfg))
-      for (const candidate of layer2Candidates) candidatesBySeq.set(candidate.seq, candidate)
+      for (const candidate of layer2Candidates) {
+        layer2CandidateSeqs.add(candidate.seq)
+        candidatesBySeq.set(candidate.seq, candidate)
+      }
     }
     const candidates = [...candidatesBySeq.values()].sort((a, b) => a.index - b.index)
     const cache = decisionsOf(session)
-    const fresh = candidates.filter((c) => !cache.has(c.seq))
+    // replacement 的判定可能仍挂在 sourceEventSeqs 指向的旧 seq 上；直接查新 seq 会
+    // 重复付费。缓存确实丢失时（例如重启）才重新判定当前 replacement。
+    // “有缓存项”不等于“判定完成”：服务可能只返回 result/effect 其中一轴。
+    // 第一层至少需要 result(prob)；第二层必须两轴都齐。缺轴的节点下轮继续问，
+    // 否则一次部分响应就会让它永久停在 cache 中、永远进不了第二层。
+    const fresh = candidates.filter((candidate) => {
+      const cached = cachedVerdictForEvent(cache, eventAt(candidate.seq))
+      if (!Number.isFinite(cached?.prob)) return true
+      return layer2CandidateSeqs.has(candidate.seq) && !Number.isFinite(cached?.effectProb)
+    })
     // 压力门控：不到软阈值就不花 Jev 的钱
     //
     // 失败方向（issue #32）：第一层与第二层的压力门必须**同向关闭**。
@@ -966,6 +982,18 @@ export function apply(ctx, config, deps = {}) {
       log('info', `state ≈ ${stateTokens} tokens 仍超预算 ${cfg.maxStateTokens}（行数地板 ${cfg.minHistoryLines}），本批可能被服务端拒绝`)
     }
     const questions = questionsFor(fresh, cfg.wording)
+    // 只询问当前候选真正缺失、且所在层需要的轴：
+    //   · 第一层只消费 result；
+    //   · 第二层同时消费 result + effect。
+    // 部分响应后的重试若把已有轴再问一次，不仅浪费预算，还可能用第二次采样覆盖
+    // 第一次已经得到的概率，使同一节点的裁决随重试发生无意义漂移。
+    for (const candidate of fresh) {
+      const cached = cachedVerdictForEvent(cache, eventAt(candidate.seq))
+      if (Number.isFinite(cached?.prob)) delete questions[`result_s${candidate.seq}`]
+      if (!layer2CandidateSeqs.has(candidate.seq) || Number.isFinite(cached?.effectProb)) {
+        delete questions[`effect_s${candidate.seq}`]
+      }
+    }
     const batches = judge.batch(state, questions, {
       maxRequestTokens: cfg.maxRequestTokens,
       overheadTokens: 40,
@@ -1011,7 +1039,9 @@ export function apply(ctx, config, deps = {}) {
         if (candidate == null) continue
         const prob = answers[`result_s${seq}`]
         const effectProb = answers[`effect_s${seq}`]
-        const previous = cache.get(seq)
+        // 第一轮只有一轴时，第一层可能已经把该结果替换成新 seq；补第二轴时要沿
+        // sourceEventSeqs 找到旧缓存，否则会把已有轴丢掉，形成“两个 seq 各半轴”。
+        const previous = cachedVerdictForEvent(cache, eventAt(candidate.seq))
         // 局部合并：本批给出的轴覆盖，未给出的轴沿用已有值
         const merged = {
           keep: typeof prob === 'number'
@@ -1023,13 +1053,22 @@ export function apply(ctx, config, deps = {}) {
           tool: candidate.tool,
         }
         cache.set(seq, merged)
+        // 补轴可能发生在第一层已经把 old seq 替换成 replacement seq 之后。
+        // 将合并结果归一到当前 seq，并移除来源 seq 的旧半条缓存，避免后续统计/查找
+        // 同时看到两个各自不完整的版本。
+        for (const sourceSeq of eventAt(candidate.seq)?.sourceEventSeqs ?? []) {
+          if (sourceSeq !== seq) cache.delete(sourceSeq)
+        }
       }
     }
-    // 结算本轮的判定条数：按**候选**去重后统计（两轴齐了才算这一条判完）。
+    // 结算本轮的判定条数：按**候选**去重后统计。第一层只需 result，第二层
+    // 必须两轴齐全；部分响应不算完成，也不会在补轴后重复计数。
     // 旧实现是"每批都遍历整个 fresh，能查到旧值就再累加一次"，条数按批数虚报。
     for (const seq of freshSeqs) {
-      const value = cache.get(seq)
-      if (value != null && (typeof value.prob === 'number' || typeof value.effectProb === 'number')) {
+      const value = cachedVerdictForEvent(cache, eventAt(seq))
+      const complete = Number.isFinite(value?.prob)
+        && (!layer2CandidateSeqs.has(seq) || Number.isFinite(value?.effectProb))
+      if (complete) {
         stats.judged += 1
         // P0-3 遥测：把概率分布记下来（这是判断"阈值是否失配"的唯一依据）
         if (typeof value.prob === 'number') {

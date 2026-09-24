@@ -296,17 +296,18 @@ export function recentGoal(events, limit = 3, maxChars = 500) {
  * 挑出候选工具结果节点。
  *
  * 排除：最近 preserveRecent 个 surface 节点（含正在进行的调用）、
- *       永不裁剪工具、已裁过的、以及索引解析不出的。
+ *       永不裁剪工具、以及索引解析不出的。已裁过的默认排除；第二层在缓存丢失后
+ *       可用 includePruned 重新判定 replacement，以便恢复/重启后的会话仍能做回执压缩。
  * @returns {Array<{seq:number, index:number, chars:number, callId:string|null, tool:string}>}
  */
-export function selectCandidates({ surface, eventAt, events, preserveRecent, neverPruneTools, marker, nameByCallId }) {
+export function selectCandidates({ surface, eventAt, events, preserveRecent, neverPruneTools, marker, nameByCallId, includePruned = false }) {
   const lastAllowed = surface.length - 1 - preserveRecent
   const out = []
   for (let index = 0; index <= lastAllowed; index += 1) {
     const seq = surface[index]
     const event = eventAt(seq)
     if (event?.type !== 'tool/result') continue
-    if (looksPruned(event, marker)) continue
+    if (!includePruned && looksPruned(event, marker)) continue
     const tool = toolNameOf(event, nameByCallId)
     // 归一化比较（issue #1/#2）：字面 includes 对小写工具名永远不命中
     if (isToolIn(neverPruneTools, tool)) continue
