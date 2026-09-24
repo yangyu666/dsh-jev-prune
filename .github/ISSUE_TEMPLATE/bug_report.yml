@@ -1,0 +1,56 @@
+name: Bug report
+description: Report incorrect pruning, compaction, host integration, or observability.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Redact API keys and private session content before posting.
+  - type: input
+    id: dsh-version
+    attributes:
+      label: DSH version
+      placeholder: "0.1.5-rc.2"
+    validations:
+      required: true
+  - type: input
+    id: node-version
+    attributes:
+      label: Node and operating system
+      placeholder: "Node 24.1.0 on Windows 11"
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant plugin configuration
+      description: Remove secrets. Include pressure and layer-2 settings involved in the failure.
+      render: yaml
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Include relevant `jev_prune_status`, heartbeat, or `jev_probe_shapes` output.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I tested against the latest `main` or identified the exact released commit.
+          required: true
+        - label: I removed API keys and private session content.
+          required: true

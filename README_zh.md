@@ -7,7 +7,7 @@
 
 [English](README.md) · **简体中文**
 
-![license](https://img.shields.io/badge/license-MIT-blue) ![node](https://img.shields.io/badge/node%20%3E%3D22.19-339933) ![dsh](https://img.shields.io/badge/DSH-0.1.x--rc-orange) [![CI](https://github.com/yangyu666/dsh-jev-prune/actions/workflows/ci.yml/badge.svg)](https://github.com/yangyu666/dsh-jev-prune/actions/workflows/ci.yml) ![smoke checks](https://img.shields.io/badge/smoke%20checks-56%20passing-success)
+![license](https://img.shields.io/badge/license-MIT-blue) ![node](https://img.shields.io/badge/node%20%3E%3D22.19-339933) ![dsh](https://img.shields.io/badge/DSH-0.1.x--rc-orange) [![CI](https://github.com/yangyu666/dsh-jev-prune/actions/workflows/ci.yml/badge.svg)](https://github.com/yangyu666/dsh-jev-prune/actions/workflows/ci.yml) ![smoke checks](https://img.shields.io/badge/smoke%20checks-104%20passing-success)
 
 ## 它解决什么问题
 
@@ -78,6 +78,8 @@ DSH 自带的上下文回收是**纯体积**的：工具结果超过阈值就掐
 **版本对齐**：`@deepseek-ai/dsh-tools` 的 peer 范围为 `^0.1.5-rc.2`——测试版本 `0.1.5-rc.2` 在 npm 的 `next` 标签上而非 `latest`，仓库内提交了 lockfile（devDependencies 钉住实测版本），`npm ci` 可精确复现测试条件。
 
 **兼容性**：针对 `@deepseek-ai/dsh@0.1.5-rc.2` 测试。DSH 0.1.x 为预发布版本，事件形状与服务名在小版本间可能变动；升级 DSH 后请重跑 `npm run check` 与冒烟测试，并在真实会话里调用一次 `jev_probe_shapes` 校对字段。
+
+项目文档：[贡献指南](CONTRIBUTING.md)、[架构说明](ARCHITECTURE.md)、[移植契约](PORTING.md)和[配置示例](examples/README.md)。
 
 ## 安装
 

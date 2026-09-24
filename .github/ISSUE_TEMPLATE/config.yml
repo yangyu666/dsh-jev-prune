@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Porting guide
+    url: https://github.com/yangyu666/dsh-jev-prune/blob/main/PORTING.md
+    about: Check the host contract before reporting a new DSH/runtime integration.
