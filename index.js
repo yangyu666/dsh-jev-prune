@@ -20,8 +20,9 @@
  * 而 `compactRegion` 是异步的、且要求处在打开的 turn 内（`agent/pre-step` 满足）。
  *
  * shadow-price 协议（compaction/prune 事件 + tool/result replace）与 DSH 自带实现逐字一致，
- * 保证纯消费者能按同一套账本扣减 token。第二层则完全交给 `compactRegion` 的
- * `compaction/summary` + 替换 user/message 那套既有协议，不自己 append。
+ * 保证纯消费者能按同一套账本扣减 token。第二层的完整步骤交给 `compactRegion`；
+ * 并行批次只有部分结果合格时，复用同一 shadow-price 协议逐结果替换正文，
+ * 保留 assistant/tool-call 与全部 tool/result 外壳，避免破坏工具配对。
  *
  * @module dsh-jev-prune
  */
@@ -48,6 +49,7 @@ import {
   RECEIPT_MARKER,
   cachedVerdictForEvent,
   computeEligibleSeqs,
+  renderPartialResultReceipt,
   renderReceipt,
   selectReceiptRanges,
 } from './receipt.js'
@@ -1438,8 +1440,17 @@ export function apply(ctx, config, deps = {}) {
     let done = 0
     for (const range of ranges) {
       if (done >= cfg.maxCompactionsPerPass) break
-      const spanSeqs = surface.slice(range.startIdx, range.endIdx + 1)
-      const receipt = renderReceipt(range, { eventAt, argChars: cfg.receiptArgChars })
+      const isPartial = range.kind === 'partial'
+      const pairs = isPartial ? range.steps.flatMap((step) => step.pairs ?? []) : []
+      const spanSeqs = isPartial
+        ? pairs.map((pair) => pair.seq)
+        : surface.slice(range.startIdx, range.endIdx + 1)
+      const partialReceipts = isPartial
+        ? pairs.map((pair) => renderPartialResultReceipt(pair, { argChars: cfg.receiptArgChars }))
+        : []
+      const receipt = isPartial
+        ? partialReceipts.join('\n')
+        : renderReceipt(range, { eventAt, argChars: cfg.receiptArgChars })
       const receiptTokens = estimateTokens(receipt)
       const shadowedTokens = spanTokens(agent, spanSeqs)
       const action = {
@@ -1451,6 +1462,7 @@ export function apply(ctx, config, deps = {}) {
         receiptTokens,
         shadowedTokens,
         receipt,
+        partial: isPartial,
       }
       if (shadowedTokens != null && receiptTokens > shadowedTokens * cfg.receiptMaxRatio) {
         action.skipped = `回执 ${receiptTokens} tokens 相对原内容 ${shadowedTokens} 太大（上限 ${(cfg.receiptMaxRatio * 100).toFixed(0)}%）`
@@ -1461,6 +1473,78 @@ export function apply(ctx, config, deps = {}) {
         action.dryRun = true
         report.actions.push(action)
         done += 1
+        continue
+      }
+
+      if (isPartial) {
+        // DSH 0.1.5 的 replace 一次只能插入一个 surface 节点，compactRegion 又要求
+        // 区间两端配对平衡，因此不能从一个多调用 assistant 消息中直接抽走部分 pair。
+        // 单独替换合格 result 的正文是宿主原生支持的安全协议：call/result 外壳不动，
+        // 同批次不合格结果原样保留；逐项提交时即使中途失败，surface 仍始终合法。
+        let applied = 0
+        let appliedChars = 0
+        try {
+          const meter = ctx.get?.('tokenMeter')
+          for (let offset = 0; offset < pairs.length; offset += 1) {
+            const pair = pairs[offset]
+            const event = session.eventAt(pair.seq)
+            if (event?.type !== 'tool/result' || !session.surface.nodes.includes(pair.seq)) {
+              throw new Error(`批量步骤的结果 s${pair.seq} 在回执替换前已离开 surface`)
+            }
+            const original = event.data?.message
+            const blocks = original?.content
+            if (!Array.isArray(blocks)) throw new Error(`tool/result s${pair.seq} 缺少 message.content`)
+            const result = blocks.find((block) => block?.type === 'tool-result')
+            if (result == null) throw new Error(`tool/result s${pair.seq} 缺少 tool-result block`)
+            const text = partialReceipts[offset]
+            const message = freezeMessage({
+              ...original,
+              content: blocks.map((block) => block === result
+                ? { ...result, content: [{ type: 'text', text }] }
+                : block),
+            })
+            const shadowedTokenCount = typeof meter?.estimateMessage === 'function'
+              ? meter.estimateMessage(original)
+              : estimateTokens(JSON.stringify(original))
+            session.append('compaction/prune', {
+              shadowedRange: { start: pair.seq, end: pair.seq },
+              shadowedSeqs: [pair.seq],
+              shadowedTokenCount,
+            })
+            session.append('tool/result', { ...event.data, message }, {
+              surfaceOp: { op: 'replace', startSeq: pair.seq, endSeq: pair.seq },
+              sourceEventSeqs: [pair.seq],
+            })
+            cache.delete(pair.seq)
+            for (const sourceSeq of event.sourceEventSeqs ?? []) cache.delete(sourceSeq)
+            applied += 1
+            appliedChars += pair.chars
+          }
+          done += 1
+          stats.compactions += 1
+          stats.compactedSeqs += applied
+          stats.compactedChars += appliedChars
+          stats.receiptSummaries += applied
+          action.ok = true
+          action.shadowedSeqs = applied
+          action.partialResults = applied
+          report.actions.push(action)
+        } catch (error) {
+          if (applied > 0) {
+            done += 1
+            stats.compactions += 1
+            stats.compactedSeqs += applied
+            stats.compactedChars += appliedChars
+            stats.receiptSummaries += applied
+            action.partialResults = applied
+            action.resultChars = appliedChars
+            action.ok = true
+            action.incomplete = true
+          }
+          stats.errors += 1
+          action.error = error?.message ?? String(error)
+          report.actions.push(action)
+        }
         continue
       }
 
@@ -1508,7 +1592,7 @@ export function apply(ctx, config, deps = {}) {
     const okCount = report.actions.filter((a) => a.ok).length
     const dry = report.actions.filter((a) => a.dryRun).length
     stats.lastCompactNote = okCount > 0
-      ? `回执压缩 ${okCount} 段：移出 ${report.actions.reduce((sum, a) => sum + (a.nodes ?? 0), 0)} 个节点、省约 ${report.actions.reduce((sum, a) => sum + (a.resultChars ?? 0), 0)} 字符`
+      ? `回执压缩 ${okCount} 段：处理 ${report.actions.reduce((sum, a) => sum + (a.nodes ?? 0), 0)} 个节点、省约 ${report.actions.reduce((sum, a) => sum + (a.resultChars ?? 0), 0)} 字符`
       : (dry > 0 ? `dry-run：${dry} 段可压（未执行）` : (report.blocked || '未执行'))
     log('debug', stats.lastCompactNote)
     writeHeartbeat({
@@ -1526,6 +1610,9 @@ export function apply(ctx, config, deps = {}) {
           skippedReasoning: report.selection.skippedReasoning,
           skippedIncomplete: report.selection.skippedIncomplete,
           skippedShort: report.selection.skippedShort,
+          skippedReceipt: report.selection.skippedReceipt,
+          partialSteps: report.selection.partialSteps,
+          partialResults: report.selection.partialResults,
           // 工具名如实落盘：这是"白名单没配上"唯一能自查的证据
           blockedToolNames: report.selection.blockedToolNames,
           allowedToolNames: report.selection.allowedToolNames,
@@ -1533,7 +1620,9 @@ export function apply(ctx, config, deps = {}) {
         actions: report.actions.map((a) => ({
           start: a.start, end: a.end, ok: a.ok ?? null, dryRun: a.dryRun ?? null,
           calls: a.calls, resultChars: a.resultChars, receiptTokens: a.receiptTokens,
-          shadowedTokens: a.shadowedTokens, error: a.error ?? null, skipped: a.skipped ?? null,
+          shadowedTokens: a.shadowedTokens, partial: a.partial ?? false,
+          partialResults: a.partialResults ?? null, incomplete: a.incomplete ?? false,
+          error: a.error ?? null, skipped: a.skipped ?? null,
         })),
       },
     })
@@ -1676,7 +1765,7 @@ export function apply(ctx, config, deps = {}) {
       `第二层：summarize=${summaryHook.installed ? '已接管' : `未接管(${summaryHook.reason || '未尝试'})`}   `
         + `compactOn=${cfg.compactOn}   preserveRecent=${cfg.compactPreserveRecent}   `
         + `${cfg.compactMode}${cfg.compactMode === 'relative' ? `(quantile=${cfg.compactQuantile})` : `(<${cfg.compactThreshold})`}`,
-      `第二层：回执压缩 ${stats.compactions} 段 / 移出 ${stats.compactedSeqs} 节点 / 省约 ${stats.compactedChars} 字符   `
+      `第二层：回执压缩 ${stats.compactions} 段 / 处理 ${stats.compactedSeqs} 节点 / 省约 ${stats.compactedChars} 字符   `
         + `回执摘要被消费 ${stats.receiptSummaries} 次   压力跳过 ${stats.compactSkipped} 次`
         // 竞态计数只在非零时出现：它是异常路径，常态下不该占版面（issue #29）
         + (stats.receiptFenceMisses > 0
@@ -1716,7 +1805,10 @@ export function apply(ctx, config, deps = {}) {
       const s = report.selection
       lines.push(`排除计数：最近区 ${s.skippedTail} / 工具不允许 ${s.skippedTool} / 判定不通过 ${s.skippedVerdict}`
         + ` / 证据守卫 ${s.skippedGuard} / 结论文本过长 ${s.skippedText} / 思考草稿过长 ${s.skippedReasoning}`
-        + ` / 配对不完整 ${s.skippedIncomplete} / 省得太少 ${s.skippedShort}`)
+        + ` / 配对不完整 ${s.skippedIncomplete} / 已是回执 ${s.skippedReceipt ?? 0} / 省得太少 ${s.skippedShort}`)
+      if ((s.partialSteps ?? 0) > 0) {
+        lines.push(`并行批次部分回执：${s.partialSteps} 批 / ${s.partialResults} 个结果`)
+      }
       // 工具名如实列出：白名单不命中时，这里能一眼看出"是名字没配上"而不是"模型判断不对"
       const allow = Object.entries(s.allowedToolNames ?? {})
       const block = Object.entries(s.blockedToolNames ?? {})

@@ -938,6 +938,73 @@ const run = ({ events, cache, cfg, threshold }) => {
   assert.equal(tiny.stats.skippedShort, 1)
 }
 
+// ---------------------------------------------------------------- 并行批量读的合格子集（issue #39）
+{
+  const calls = Array.from({ length: 6 }, (_, i) => ({
+    type: 'tool-call', id: `batch-${i + 1}`, name: 'read',
+    arguments: JSON.stringify({ file_path: `src/file-${i + 1}.js` }),
+  }))
+  const evs = [{
+    seq: 1,
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text: '批量读取。' }, ...calls] } },
+  }]
+  for (let i = 0; i < calls.length; i += 1) {
+    evs.push(toolResult(i + 2, calls[i].id, String(i + 1).repeat(1200)))
+  }
+  // 模拟并行完成顺序与 call 声明顺序不同；selector 必须按 callId 配，而非按 offset 猜。
+  ;[evs[1], evs[2]] = [evs[2], evs[1]]
+  const at = (seq) => evs.find((event) => event.seq === seq)
+  const cache = new Map(evs.slice(1).map((event) => [event.seq, {
+    keep: false, prob: 0.05, effectProb: 0.04, chars: 1200, tool: 'read',
+  }]))
+  // 第 3 个结果不合格；旧实现要求 6/6 全部合格，因此整批 ranges=0。
+  cache.set(4, { keep: true, prob: 0.9, effectProb: 0.9, chars: 1200, tool: 'read' })
+  const selected = selectReceiptRanges({
+    surface: evs.map((event) => event.seq),
+    eventAt: at,
+    cache,
+    dropVerdict: (seq) => seq !== 4,
+    cfg: {
+      preserveRecent: 0,
+      compactTools: DEFAULT_COMPACT_TOOLS,
+      neverCompactTools: DEFAULT_NEVER_COMPACT_TOOLS,
+      evidenceGuard: false,
+      evidencePatterns: DEFAULT_EVIDENCE_PATTERNS,
+      maxStepTextChars: 240,
+      maxStepReasoningChars: 4000,
+      compactMinChars: 1000,
+    },
+  })
+  assert.equal(selected.ranges.length, 1, '6 个并行 read 中 5 个合格时必须产生一个部分回执动作')
+  assert.equal(selected.ranges[0].kind, 'partial')
+  assert.deepEqual(selected.ranges[0].steps[0].resultSeqs, [3, 2, 5, 6, 7],
+    '只选择 5 个合格结果，不得把不合格的 s4 混入')
+  assert.equal(selected.ranges[0].steps[0].calls.length, 5)
+  assert.equal(selected.stats.partialSteps, 1)
+  assert.equal(selected.stats.partialResults, 5)
+  assert.equal(selected.stats.skippedVerdict, 1)
+
+  // 最近区同样按 result 粒度保护：最后一个结果留原文，前 5 个仍可处理。
+  const tail = selectReceiptRanges({
+    surface: evs.map((event) => event.seq), eventAt: at, cache,
+    dropVerdict: () => true,
+    cfg: {
+      preserveRecent: 1,
+      compactTools: DEFAULT_COMPACT_TOOLS,
+      neverCompactTools: DEFAULT_NEVER_COMPACT_TOOLS,
+      evidenceGuard: false,
+      evidencePatterns: DEFAULT_EVIDENCE_PATTERNS,
+      maxStepTextChars: 240,
+      maxStepReasoningChars: 4000,
+      compactMinChars: 1000,
+    },
+  })
+  assert.equal(tail.ranges[0].kind, 'partial')
+  assert.deepEqual(tail.ranges[0].steps[0].resultSeqs, [3, 2, 4, 5, 6])
+  assert.equal(tail.stats.skippedTail, 1)
+}
+
 // ---------------------------------------------------------------- replacement 来源链上的证据也必须守住
 // 第一层可能把位于正文中间的 error 截掉；第二层若只扫描 surface 上的 replacement，
 // 会误以为没有证据并把整个调用/结果对移出。

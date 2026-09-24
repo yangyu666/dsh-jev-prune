@@ -197,6 +197,14 @@ function toolCallsOf(event) {
   return content.filter((block) => block?.type === 'tool-call')
 }
 
+function toolCallIdOf(block) {
+  return block?.id ?? block?.callId ?? block?.toolCallId ?? null
+}
+
+function resultCallIdOf(event) {
+  return event?.data?.message?.source?.callId ?? event?.data?.callId ?? null
+}
+
 /**
  * 按块类型分别统计 assistant 消息的字符数。
  *
@@ -431,7 +439,22 @@ function readStep(surface, eventAt, headIdx) {
     }
     resultIdx.push(idx)
   }
-  return { headIdx, headSeq, head, calls, resultIdx, complete: true }
+  const callIds = calls.map(toolCallIdOf)
+  const resultIds = resultIdx.map((idx) => resultCallIdOf(eventAt(surface[idx])))
+  const anyId = [...callIds, ...resultIds].some((id) => id != null)
+  let pairedResultIdx = [...resultIdx]
+  if (anyId) {
+    if (callIds.some((id) => id == null) || resultIds.some((id) => id == null)
+      || new Set(callIds).size !== callIds.length || new Set(resultIds).size !== resultIds.length) {
+      return { headIdx, headSeq, head, calls, resultIdx, pairedResultIdx: [], complete: false }
+    }
+    const resultByCallId = new Map(resultIds.map((id, offset) => [id, resultIdx[offset]]))
+    pairedResultIdx = callIds.map((id) => resultByCallId.get(id))
+    if (pairedResultIdx.some((idx) => idx == null)) {
+      return { headIdx, headSeq, head, calls, resultIdx, pairedResultIdx: [], complete: false }
+    }
+  }
+  return { headIdx, headSeq, head, calls, resultIdx, pairedResultIdx, complete: true }
 }
 
 /**
@@ -475,6 +498,12 @@ export function selectReceiptRanges({ surface, eventAt, cache, dropVerdict, cfg 
     skippedReasoning: 0,
     skippedIncomplete: 0,
     skippedShort: 0,
+    /** 同一 assistant 批次里仅部分 result 合格时，安全降级为逐结果回执的批次数。 */
+    partialSteps: 0,
+    /** 逐结果回执实际选中的 tool/result 数。 */
+    partialResults: 0,
+    /** 已经是确定性回执的结果，防止低阈值配置下重复压缩。 */
+    skippedReceipt: 0,
     guardHits: [],
   }
   const cuts = computeCuts(surface, eventAt)
@@ -498,17 +527,14 @@ export function selectReceiptRanges({ surface, eventAt, cache, dropVerdict, cfg 
   }
 
   const eligible = []
+  const partial = []
   for (const step of steps) {
     const lastResultIdx = step.resultIdx[step.resultIdx.length - 1] ?? step.headIdx
-    const resultSeqs = step.resultIdx.map((idx) => surface[idx])
+    const resultSeqs = (step.pairedResultIdx ?? step.resultIdx).map((idx) => surface[idx])
     let reason = null
 
     if (!step.complete) reason = 'incomplete'
     else if (!balancedBefore(cuts, step.headIdx) || !balancedAfter(cuts, lastResultIdx)) reason = 'incomplete'
-    else if (lastResultIdx > lastAllowed || step.headIdx > lastAllowed) reason = 'tail'
-    else if (cfg.compactTools.length > 0
-      && step.calls.some((call) => !isToolIn(cfg.compactTools, call.name))) reason = 'tool'
-    else if (step.calls.some((call) => isToolIn(cfg.neverCompactTools, call.name))) reason = 'tool'
     else {
       // 两轴分开判（issue #26）：text = 结论/说明（长则守），reasoning = 草稿（长则守）。
       // 拆开的重点是**阈值各自标定**——合并累加会让 reasoning 的分布盖住 text 的语义。
@@ -516,24 +542,86 @@ export function selectReceiptRanges({ surface, eventAt, cache, dropVerdict, cfg 
       if (text > cfg.maxStepTextChars) reason = 'text'
       else if (reasoning > cfg.maxStepReasoningChars) reason = 'reasoning'
     }
-    if (reason == null) {
-      for (const seq of resultSeqs) {
-        const verdict = cachedVerdictForEvent(cache, eventAt(seq))
-        if (verdict == null || !dropVerdict(seq, verdict)) {
-          reason = 'verdict'
-          break
-        }
-      }
-    }
     let hits = []
-    if (reason == null && cfg.evidenceGuard) {
-      for (const seq of resultSeqs) {
-        const scan = scanEvidence(resultEvidenceText(eventAt, seq), cfg.evidencePatterns)
-        if (scan.hit) {
-          hits = scan.matches
-          reason = 'guard'
-          break
+
+    // 完整性和 assistant 文本门是整批属性；通过后，其余规则逐调用判断。
+    // 这样一个 6-read 批次中 5 条合格、1 条不合格时，5 条仍可各自替换为回执。
+    const pairs = reason == null
+      ? step.calls.map((call, offset) => {
+          const resultIdx = (step.pairedResultIdx ?? step.resultIdx)[offset]
+          const seq = surface[resultIdx]
+          const event = eventAt(seq)
+          let pairReason = null
+          if (resultIdx > lastAllowed) pairReason = 'tail'
+          else if ((cfg.compactTools.length > 0 && !isToolIn(cfg.compactTools, call.name))
+            || isToolIn(cfg.neverCompactTools, call.name)) pairReason = 'tool'
+          else if (resultText(event).includes(RECEIPT_MARKER)) pairReason = 'receipt'
+          else {
+            const verdict = cachedVerdictForEvent(cache, event)
+            if (verdict == null || !dropVerdict(seq, verdict)) pairReason = 'verdict'
+          }
+          let pairHits = []
+          if (pairReason == null && cfg.evidenceGuard) {
+            const scan = scanEvidence(resultEvidenceText(eventAt, seq), cfg.evidencePatterns)
+            if (scan.hit) {
+              pairHits = scan.matches
+              pairReason = 'guard'
+            }
+          }
+          return { call, resultIdx, seq, event, chars: resultCharsOf(event), reason: pairReason, hits: pairHits }
+        })
+      : []
+
+    if (reason == null) {
+      const selected = pairs.filter((pair) => pair.reason == null)
+      const rejected = pairs.filter((pair) => pair.reason != null)
+      if (selected.length === pairs.length && step.headIdx <= lastAllowed) {
+        // 原路径：整批合格，交给 compactRegion 一次移出 assistant + 全部 results。
+      } else if (selected.length > 0) {
+        const selectedInSurfaceOrder = [...selected].sort((a, b) => a.resultIdx - b.resultIdx)
+        const selectedStep = {
+          ...step,
+          calls: selectedInSurfaceOrder.map((pair) => pair.call),
+          resultIdx: selectedInSurfaceOrder.map((pair) => pair.resultIdx),
+          resultSeqs: selectedInSurfaceOrder.map((pair) => pair.seq),
+          pairs: selectedInSurfaceOrder,
+          lastResultIdx: selectedInSurfaceOrder[selectedInSurfaceOrder.length - 1].resultIdx,
         }
+        const chars = selected.reduce((sum, pair) => sum + pair.chars, 0)
+        partial.push({
+          kind: 'partial',
+          startIdx: selectedInSurfaceOrder[0].resultIdx,
+          endIdx: selectedInSurfaceOrder[selectedInSurfaceOrder.length - 1].resultIdx,
+          start: selectedInSurfaceOrder[0].seq,
+          end: selectedInSurfaceOrder[selectedInSurfaceOrder.length - 1].seq,
+          steps: [selectedStep],
+          chars,
+        })
+        stats.eligibleSteps += 1
+        stats.partialSteps += 1
+        stats.partialResults += selected.length
+        for (const pair of selected) {
+          const name = pair.call.name ?? 'unknown'
+          stats.allowedToolNames[name] = (stats.allowedToolNames[name] ?? 0) + 1
+        }
+        for (const pair of rejected) {
+          if (pair.reason === 'tail') stats.skippedTail += 1
+          else if (pair.reason === 'verdict') stats.skippedVerdict += 1
+          else if (pair.reason === 'guard') {
+            stats.skippedGuard += 1
+            stats.guardHits.push({ headSeq: step.headSeq, resultSeq: pair.seq, matches: pair.hits })
+          } else if (pair.reason === 'receipt') stats.skippedReceipt += 1
+          else if (pair.reason === 'tool') {
+            stats.skippedTool += 1
+            const name = pair.call.name ?? 'unknown'
+            if (name === 'unknown' || name === '') stats.skippedToolUnknown += 1
+            stats.blockedToolNames[name] = (stats.blockedToolNames[name] ?? 0) + 1
+          }
+        }
+        continue
+      } else {
+        reason = pairs[0]?.reason ?? (step.headIdx > lastAllowed ? 'tail' : 'verdict')
+        hits = pairs.find((pair) => pair.reason === 'guard')?.hits ?? []
       }
     }
 
@@ -554,6 +642,7 @@ export function selectReceiptRanges({ surface, eventAt, cache, dropVerdict, cfg 
           stats.blockedToolNames[name] = (stats.blockedToolNames[name] ?? 0) + 1
         }
       } else if (reason === 'verdict') stats.skippedVerdict += 1
+      else if (reason === 'receipt') stats.skippedReceipt += 1
       else if (reason === 'guard') {
         stats.skippedGuard += 1
         stats.guardHits.push({ headSeq: step.headSeq, matches: hits })
@@ -569,6 +658,7 @@ export function selectReceiptRanges({ surface, eventAt, cache, dropVerdict, cfg 
       stats.allowedToolNames[name] = (stats.allowedToolNames[name] ?? 0) + 1
     }
     eligible.push({
+      kind: 'full',
       ...step,
       resultSeqs,
       lastResultIdx,
@@ -589,6 +679,7 @@ export function selectReceiptRanges({ surface, eventAt, cache, dropVerdict, cfg 
       continue
     }
     merged.push({
+      kind: 'full',
       startIdx: step.headIdx,
       endIdx: step.lastResultIdx,
       start: surface[step.headIdx],
@@ -600,7 +691,7 @@ export function selectReceiptRanges({ surface, eventAt, cache, dropVerdict, cfg 
 
   // 省得不够多的范围不值得开一次压缩事务
   const ranges = []
-  for (const range of merged) {
+  for (const range of [...merged, ...partial].sort((a, b) => a.startIdx - b.startIdx)) {
     if (range.chars < cfg.compactMinChars) {
       stats.skippedShort += 1
       continue
@@ -657,4 +748,20 @@ export function renderReceipt(range, { eventAt, argChars = 120 } = {}) {
     + '需要内容时重跑相同命令/读取相同文件即可；本回执不含对内容的解释。',
   )
   return lines.join('\n')
+}
+
+/**
+ * 为批量步骤中的单个合格结果生成短回执。
+ *
+ * 这里不删除 assistant/tool-call 外壳，只替换对应 tool/result 的正文。因此同批次
+ * 其他不合格结果可以原样留在 surface，且每次单节点 replace 前后都保持配对完整。
+ */
+export function renderPartialResultReceipt(pair, { argChars = 120 } = {}) {
+  const call = pair?.call ?? {}
+  const seq = pair?.seq ?? pair?.event?.seq ?? '?'
+  const chars = resultCharsOf(pair?.event)
+  const args = renderCallArgs(call, argChars)
+  return `${RECEIPT_MARKER} s${seq} ${call.name ?? 'unknown'}${args ? `：${args}` : ''}`
+    + ` 的 ${chars} 字符输出已从当前上下文移出；原始事件仍保存在会话日志中，`
+    + '需要内容时请重跑相同命令或重新读取相同文件。本回执不含对内容的解释。'
 }
