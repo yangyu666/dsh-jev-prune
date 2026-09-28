@@ -28,7 +28,8 @@
     "CONTRIBUTING.md",
     "README.md",
     "README_zh.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "engines": {
     "node": "^22.19.0 || >=24.0.0"

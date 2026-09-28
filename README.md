@@ -101,7 +101,10 @@ Project documentation: [contributing](CONTRIBUTING.md), [architecture](ARCHITECT
 ## Install
 
 ```bash
-# Install from a local directory (the repo directory name matches the package name)
+# Install from npm
+dsh plugin --profile web add dsh-jev-prune
+
+# Local development: link a clone instead of the published package
 dsh plugin --profile web add link:/absolute/path/to/dsh-jev-prune
 
 # Confirm it made it into the config tree

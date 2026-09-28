@@ -99,7 +99,10 @@ DSH 自带的上下文回收是**纯体积**的：工具结果超过阈值就掐
 ## 安装
 
 ```bash
-# 从本地目录安装（仓库目录名与包名一致：dsh-jev-prune）
+# 从 npm 安装
+dsh plugin --profile web add dsh-jev-prune
+
+# 本地开发：改为链接一个克隆
 dsh plugin --profile web add link:/绝对路径/dsh-jev-prune
 
 # 确认已进入配置树
